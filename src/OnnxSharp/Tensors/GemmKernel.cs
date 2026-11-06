@@ -136,7 +136,13 @@ internal static class GemmKernel
                     int width = n - j0 < nb ? n - j0 : nb;
                     PackColumns(b + j0, k, n, width, pack);
 
-                    for (int row = row0; row < row1; row++)
+                    // 4 行一起算：同一次 B 的 load 供 4 行复用，L1 的 load 端口不再
+                    // 被「每行各自把 B 拉一遍」占满。剩下不足 4 行的用单行内核收尾。
+                    int row = row0;
+                    for (; row + 4 <= row1; row += 4)
+                        Multiply4Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc);
+
+                    for (; row < row1; row++)
                         MultiplyRow(a + (long)row * k, pack, c + (long)row * ldc + j0, k, width, width);
                 }
             }
@@ -147,20 +153,120 @@ internal static class GemmKernel
         }
     }
 
-    /// <summary>把 <c>b[t, 0..width)</c>（行步长 <paramref name="srcStride"/>）打包成连续的 <c>[k, width]</c>。</summary>
+    /// <summary>
+    /// 把 <c>b[t, 0..width)</c>（行步长 <paramref name="srcStride"/>）打包成连续的 <c>[k, width]</c>。
+    /// <para>
+    /// 列块只有 16 列（64 字节），用 <c>CopyBlockUnaligned</c> 的话调用开销远大于拷贝本身
+    /// （每行块要打 500 多次包），所以这里直接按 8-lane 向量搬。
+    /// </para>
+    /// </summary>
     private static unsafe void PackColumns(float* b, int k, int srcStride, int width, float* pack)
     {
-        uint bytes = (uint)(width * sizeof(float));
+        int j = 0;
 
-        for (int t = 0; t < k; t++)
-            Unsafe.CopyBlockUnaligned(pack + (long)t * width, b + (long)t * srcStride, bytes);
+        for (; j + 8 <= width; j += 8)
+        {
+            for (int t = 0; t < k; t++)
+                Avx.Store(pack + (long)t * width + j, Avx.LoadVector256(b + (long)t * srcStride + j));
+        }
+
+        for (; j < width; j++)
+        {
+            for (int t = 0; t < k; t++)
+                pack[(long)t * width + j] = b[(long)t * srcStride + j];
+        }
     }
 
     /// <summary>
-    /// 列块宽度。取 64（8 个 AVX 向量）：Zen 4 的 FMA 延迟 4~5 拍、每拍能发 2 条，
-    /// 4 条累加器链只能填到 1 条/拍，必须 8 条才能真正跑满。
+    /// 4 行共享一次 B 加载的微内核（一次 2 个 <see cref="Vector256{T}"/>，即 16 列）。
+    /// <para>
+    /// 单行 8 向量版本每个 k 需要 8 条 B load + 1 条 A 广播 = 9 条 load，而 Zen 4 每拍只发 2 条 load，
+    /// 光 load 就要 4.5 拍 —— 已经超过 8 条 FMA 所需的 4 拍，等于被 load 端口卡住。
+    /// 4 行共享时每条 B load 喂 4 条 FMA，load 指令数降到 2 + 4 条广播 = 6 条，
+    /// 反过来让 8 条 FMA（4 拍）重新成为瓶颈。
+    /// </para>
     /// </summary>
-    private static int SelectColumnBlock(int n) => n < 64 ? n : 64;
+    private static unsafe void Multiply4Rows(
+        float* a,
+        int aStride,
+        float* b,
+        float* c,
+        int k,
+        int width,
+        int bStride,
+        int ldc)
+    {
+        float* a1 = a + aStride;
+        float* a2 = a + 2 * aStride;
+        float* a3 = a + 3 * aStride;
+
+        float* c1 = c + ldc;
+        float* c2 = c + 2 * ldc;
+        float* c3 = c + 3 * ldc;
+
+        int j = 0;
+
+        for (; j + 16 <= width; j += 16)
+        {
+            var c00 = Vector256<float>.Zero;
+            var c01 = Vector256<float>.Zero;
+            var c10 = Vector256<float>.Zero;
+            var c11 = Vector256<float>.Zero;
+            var c20 = Vector256<float>.Zero;
+            var c21 = Vector256<float>.Zero;
+            var c30 = Vector256<float>.Zero;
+            var c31 = Vector256<float>.Zero;
+
+            float* brow = b + j;
+            for (int t = 0; t < k; t++, brow += bStride)
+            {
+                var b0 = Avx.LoadVector256(brow);
+                var b1 = Avx.LoadVector256(brow + 8);
+
+                var va = Vector256.Create(a[t]);
+                c00 = Fma.MultiplyAdd(va, b0, c00);
+                c01 = Fma.MultiplyAdd(va, b1, c01);
+
+                va = Vector256.Create(a1[t]);
+                c10 = Fma.MultiplyAdd(va, b0, c10);
+                c11 = Fma.MultiplyAdd(va, b1, c11);
+
+                va = Vector256.Create(a2[t]);
+                c20 = Fma.MultiplyAdd(va, b0, c20);
+                c21 = Fma.MultiplyAdd(va, b1, c21);
+
+                va = Vector256.Create(a3[t]);
+                c30 = Fma.MultiplyAdd(va, b0, c30);
+                c31 = Fma.MultiplyAdd(va, b1, c31);
+            }
+
+            Avx.Store(c + j, c00);
+            Avx.Store(c + j + 8, c01);
+            Avx.Store(c1 + j, c10);
+            Avx.Store(c1 + j + 8, c11);
+            Avx.Store(c2 + j, c20);
+            Avx.Store(c2 + j + 8, c21);
+            Avx.Store(c3 + j, c30);
+            Avx.Store(c3 + j + 8, c31);
+        }
+
+        // 不足 16 列的尾巴：交回单行内核（只覆盖各自的列区间，不会和上面重叠）
+        int rest = width - j;
+        if (rest <= 0)
+            return;
+
+        MultiplyRow(a, b + j, c + j, k, rest, bStride);
+        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride);
+        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride);
+        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride);
+    }
+
+    /// <summary>
+    /// 列块宽度。取 16（2 个 AVX 向量）：打包后的 B 面板是 <c>k×nb×4</c> 字节，
+    /// k=256 时正好 16 KB，能整块待在 32 KB 的 L1 里；取 64 的话面板 64 KB 落到 L2，
+    /// 每条 FMA 都要等 L2 带宽，实测只有峰值的一半。
+    /// </summary>
+    private static int SelectColumnBlock(int n) => n < 16 ? n : 16;
 
     /// <summary>行块高度：任务数至少是线程数的 2 倍，块高不小于 8 行且对齐到 8。</summary>
     private static int SelectRowBlock(int m, int threads)
@@ -285,6 +391,35 @@ internal static class GemmKernel
             Avx.Store(c + j + vw, c1);
             Avx.Store(c + j + 2 * vw, c2);
             Avx.Store(c + j + 3 * vw, c3);
+        }
+
+        // 列块宽度 16 时只会走到这里（2 个向量一组）
+        for (; j + 2 * vw <= width; j += 2 * vw)
+        {
+            var c0 = Vector256<float>.Zero;
+            var c1 = Vector256<float>.Zero;
+
+            for (int t = 0; t < k; t++)
+            {
+                var av = Vector256.Create(a[t]);
+                float* brow = b + (long)t * bStride + j;
+
+                c0 = Fma.MultiplyAdd(av, Avx.LoadVector256(brow), c0);
+                c1 = Fma.MultiplyAdd(av, Avx.LoadVector256(brow + vw), c1);
+            }
+
+            Avx.Store(c + j, c0);
+            Avx.Store(c + j + vw, c1);
+        }
+
+        for (; j + vw <= width; j += vw)
+        {
+            var c0 = Vector256<float>.Zero;
+
+            for (int t = 0; t < k; t++)
+                c0 = Fma.MultiplyAdd(Vector256.Create(a[t]), Avx.LoadVector256(b + (long)t * bStride + j), c0);
+
+            Avx.Store(c + j, c0);
         }
 
         return j;
