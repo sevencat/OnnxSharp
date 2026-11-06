@@ -12,4 +12,9 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- 测试需要访问 internal 的 protobuf/importer 细节，避免为测试扩大公开 API -->
+    <InternalsVisibleTo Include="OnnxSharp.Tests" />
+  </ItemGroup>
+
 </Project>

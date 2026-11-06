@@ -6,7 +6,7 @@ using OnnxSharp.Tensors;
 
 var impl = new NetImpl();
 
-var x = impl.NewArg("x", ArgKind.Input);
+var x = impl.Declare("x", ArgKind.Input);
 var graph = impl.NewGraph("main", new[] { x }, isMain: true);
 
 var bias = impl.NewConstArg("bias", Tensor.FromArray(new float[] { 0.5f, 0.5f, -1f }, new TensorShape(3)));
@@ -14,13 +14,13 @@ var bias = impl.NewConstArg("bias", Tensor.FromArray(new float[] { 0.5f, 0.5f, -
 var add = LayerRegistry.Create("Add", new LayerParams { Type = "Add", Name = "add" });
 add.Inputs.Add(x);
 add.Inputs.Add(bias);
-var y = impl.NewArg("y", ArgKind.Temp);
+var y = impl.Declare("y", ArgKind.Temp);
 add.Outputs.Add(y);
 graph.Append(add);
 
 var relu = LayerRegistry.Create("Relu", new LayerParams { Type = "Relu", Name = "relu" });
 relu.Inputs.Add(y);
-var z = impl.NewArg("z", ArgKind.Temp);
+var z = impl.Declare("z", ArgKind.Temp);
 relu.Outputs.Add(z);
 graph.Append(relu);
 

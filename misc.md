@@ -569,10 +569,28 @@ print("1:1 激活内存 %.1f MB, 未推断张量 %d" % (total / 1048576, unknown
 
 ```powershell
 cd F:\code\OnnxSharp
-dotnet build
+
+# 编译（双目标 net8.0 + net10.0）
+dotnet build OnnxSharp.slnx
+
+# 测试（零依赖运行器；退出码 0 = 全通过）
+dotnet run --project tests/OnnxSharp.Tests
+
+# CLI 冒烟 / 后续子命令
 dotnet run --project tools/OnnxSharp.Cli -- dump-graph F:\ai\models\yolo\yolo11n.onnx
 dotnet run --project tools/OnnxSharp.Cli -- run F:\ai\models\yolo\yolo11n.onnx --input test.bin
 dotnet run --project tools/OnnxSharp.Cli -- bench F:\ai\rfdetr\onnx_model\rfdetr-small.onnx --iters 20
+```
+
+M0.5 完成时的实测输出：
+
+```
+$ dotnet build OnnxSharp.slnx
+已成功生成。0 个警告 0 个错误
+
+$ dotnet run --project tests/OnnxSharp.Tests
+running 16 test(s)
+... 16/16 passed, 0 failed
 ```
 
 ---
@@ -585,45 +603,61 @@ dotnet run --project tools/OnnxSharp.Cli -- bench F:\ai\rfdetr\onnx_model\rfdetr
 
 ---
 
-## 9. 当前代码结构（实测，M0）
+## 9. 当前代码结构（实测，M0 + M0.5 完成）
 
 ```
 F:\code\OnnxSharp\
 ├─ plan.md / misc.md / .gitignore
-├─ OnnxSharp.sln
+├─ upstream.lock                         上游 OpenCV dnn 版本锁（JSON）
+├─ OnnxSharp.slnx                        src / tests / tools 三个 Folder
 ├─ src\OnnxSharp\OnnxSharp.csproj        net8.0;net10.0, AllowUnsafeBlocks, Nullable
 │  ├─ Tensors\DType.cs                   元素类型 + SizeOf/IsInteger/IsFloat
+│  ├─ Tensors\Layout.cs                  Layout 枚举（仅 NCHW，接口预留）        [M0.5]
 │  ├─ Tensors\TensorShape.cs             形状（值类型，params int[]）
-│  ├─ Tensors\Tensor.cs                  张量（Fit 复用 / AsSpan<T> / Clone）
+│  ├─ Tensors\Tensor.cs                  张量（Fit 复用 / AsSpan<T> / Clone / Layout）
 │  ├─ Tensors\TensorOps.cs               广播 + 逐元素（F32）
-│  ├─ Core\Arg.cs                        Arg / ArgKind / ArgData（含运行期 Tensor 槽）
-│  ├─ Core\Graph.cs                      prog 线性表 + Inputs/Outputs
-│  ├─ Core\LayerInfo.cs                  LayerInfo + Layer（执行器）
+│  ├─ Core\Arg.cs                        Arg / ArgKind / ArgData（+ Layout / BufferIndex）
+│  ├─ Core\Graph.cs                      prog 线性表 + Version + Reset/RemoveAll   [M0.5]
+│  ├─ Core\LayerInfo.cs                  LayerInfo + Layer + Net 反查 + In() + GetLayouts [M0.5]
 │  ├─ Core\LayerParams.cs                参数集合
 │  ├─ Core\DictValue.cs                  属性值（int/float/string/数组/tensor）
-│  ├─ Core\LayerRegistry.cs              算子工厂表 + EnsureBuiltins
-│  ├─ Core\Interpreter.cs                解释循环
-│  ├─ Core\NetImpl.cs                    Arg 表 + 图管理 + Forward
+│  ├─ Core\LayerRegistry.cs              显式字典注册（无反射，AOT 友好）
+│  ├─ Core\Interpreter.cs                解释循环 + 动态形状分支 + 类型签名         [M0.5]
+│  ├─ Core\NetImpl.cs                    Arg 表 + 槽/池 + Declare/Require + PrepareForGraph [M0.5]
 │  ├─ Core\Net.cs                        门面（ReadModel 待 M1）
 │  ├─ Core\OnnxSharpException.cs
+│  ├─ Engine\BufferAllocator.cs          生命周期区间着色，共享缓冲槽             [M0.5]
 │  ├─ Threading\ParallelRange.cs         parallel_for_ 等价物
 │  ├─ Ops\NaryEltwiseLayer.cs            Add/Sub/Mul/Div/Max/Min
 │  └─ Ops\ActivationLayer.cs             Relu/Sigmoid/Sqrt/Exp/Neg/Abs
-└─ tools\OnnxSharp.Cli\                  冒烟测试（当前：手工建图 Add+Relu）
+├─ tests\OnnxSharp.Tests\                零依赖测试运行器；16 个用例（net10.0） [M0.5]
+│  ├─ Harness.cs                         TestCase / Assert / RunAll
+│  ├─ ArgTableTests.cs                   Declare/Require/TryGetArg/常量元信息
+│  ├─ BufferAllocatorTests.cs            槽复用、并发分支、图输出存活、保守策略
+│  ├─ EngineTests.cs                     常量驱动形状、temp 池、动态形状、图变更
+│  └─ TestLayers.cs                      ReadConstShapeLayer / DynamicFillLayer
+└─ tools\OnnxSharp.Cli\                  冒烟测试（手工建图 Add+Relu）
 ```
 
 命名空间约定：`OnnxSharp.Tensors` / `OnnxSharp.Core` / `OnnxSharp.Ops` / `OnnxSharp.Threading`。
 （注意：**不要**用 `OnnxSharp.Graph` 作命名空间，会与 `Graph` 类型名冲突。）
 
-**M0.5 必须改动的现有文件（复核结论）**
+**M0.5 改动清单（✅ 已完成 2026-11-07）**
 
-| 文件 | 现状问题 | 改法 |
+| 文件 | 原问题 | 落地改法 |
 |---|---|---|
-| `Core\LayerInfo.cs` | `GetMemoryShapes` 只有 shapes，读不到常量值 | 加 `internal NetImpl? Net` 回填 + `Tensor In(int)`；或形参改张量 |
-| `Core\Interpreter.cs` | ① 无 `DynamicOutputShapes()` 分支；② 每次 forward `Tensor.Allocate` 临时张量；③ 重 finalize 只比 shapes 不比 types | 补动态分支（不预 fit）、改用全局 temp 池、判据加 `inpTypes` |
-| `Core\NetImpl.cs` | `GetArg(name)` 对未知名字静默新建 Temp Arg（拼错名字不报错） | 拆 `Declare` / `Require`；补 `BufferAllocator` 挂载点 |
-| `Core\Graph.cs` | `Prog` 无法删除节点 / 重建 | 支持折叠后重建 + `UpdateGraphOfs` |
-| `Tensors\Tensor.cs` | `Strides` 永远为 null，与「视图」目标不符；`Count`(long)→`ByteLength`(int) 有溢出路径 | 明确首版只做别名 + 生命周期约束；加溢出检查 |
+| `Core\LayerInfo.cs` | `GetMemoryShapes` 只有 shapes，读不到常量值 | ✅ `public NetImpl? Net { get; internal set; }` + `In(int)` + `IsConstInput(int)` |
+| `Core\Interpreter.cs` | ① 无动态形状分支；② 每次 forward 新建临时张量；③ 重 finalize 只比 shapes | ✅ 补动态分支（不预 fit）、改用 `FitTemps` 全局池、判据加 `inpTypes` |
+| `Core\NetImpl.cs` | `GetArg` 对未知名字静默新建 Temp Arg | ✅ 拆 `Declare` / `Require` / `TryGetArg`；接 `BufferAllocator` + 槽池 |
+| `Core\Graph.cs` | `Prog` 无法删除节点 / 重建 | ✅ `Reset()` / `RemoveAll()` / `Version`（驱动缓冲重算） |
+| `Tensors\Tensor.cs` | `Strides` 恒 null；`long→int` 有溢出路径 | ✅ 明确首版只做「紧凑 + 别名」；`Fit` 溢出检查带字节数 |
+| `Engine\BufferAllocator.cs` | 不存在 | ✅ 生命周期区间着色（`Analyze` + `Assign`），槽只增不减 |
+| `Tensors\Layout.cs` | 不存在 | ✅ 仅 `Layout.NCHW`，纯接口预留 |
+
+**已知取舍**
+
+- 分配器采用**严格 `<`** 判定：某 Arg 的「最后读」与其后 Arg 的「首次写」落在同一 op 时不复用，避免任何「先写输出再读输入」的算子破坏输入；代价是峰值多一代张量。
+- 测试运行器是**零第三方依赖**的控制台程序（xunit 未在本地 nuget 缓存、且离线），后续需要时再迁移到 `dotnet test`。
 
 冒烟测试输出：
 
@@ -647,6 +681,8 @@ SMOKE TEST: PASS
 | 2026-11-07 | 新增 **§2.5 SimdYolo 源码地图**（约 90 个 .cs 按 5 组分类 + 行数 + 移植关系）与 **§2.6 偏离点**；关键结论：**42 个算子中 35 个可直接参考 SimdYolo，需自写的 7 个（`And/Not/Erf/Sin/Cos/GridSample/LayerNormalization`）全部只出现在 RF-DETR**；`plan.md` 增 §1.5 参考优先级与 §12.1 待拍板 Q8~Q11，M0.5 增布局接口预留任务 |
 | 2026-11-07 | 新增 **§11 上游 OpenCV 5 dnn 变更跟踪**：基线 `5.x @ 43f8b1f5`（2026-11-06）、实测变更规模（6 个月 333 条 / 30 天 99 条）、只读 fetch 命令集、路径→本项目模块映射表、改动分类处理规则、跟踪记录模板，并完成首批 4 条评估（含 `resize2_layer` 的 `step = 1/scale` 修复） |
 | 2026-11-07 | §11.1 升级为**跟踪版本台账（单一事实源）**：当前跟踪提交 + 提交日期/主题 + 校验命令（`rev-parse` / `log 43f8b1f5..origin/5.x`）+ **版本推进记录表（只增不改）**；`plan.md §13.1` 改为引用该台账 |
+| 2026-11-07 | 新增仓库根 **`upstream.lock`**（JSON：remote/branch/commit/scope/verify 命令/history），与 §11.1 互为镜像 |
+| 2026-11-07 | **M0.5 落地完成**：`Engine/BufferAllocator.cs`（生命周期着色）、`LayerInfo.Net` + `In()/IsConstInput()`、`Graph.Version/Reset/RemoveAll`、`NetImpl` 槽池 + `FitTemps` + `Declare/Require/TryGetArg`、`Interpreter` 动态形状分支 + 类型签名、`Tensors/Layout.cs` 预留、`tests/OnnxSharp.Tests`（零依赖 16 用例）。`dotnet build` 0 警告 0 错误，16/16 PASS |
 
 ---
 
@@ -658,6 +694,7 @@ SMOKE TEST: PASS
 ### 11.1 跟踪版本台账（**单一事实源**）
 
 本项目「跟到了哪个版本」**只记在这一节**，其它文档一律引用本节，不重复写 commit 号。
+机器可读的同一份记录在仓库根的 **`upstream.lock`**（JSON，供脚本/CI 读取）；两处必须同步，冲突时以本节为准。
 
 **当前跟踪版本**
 

@@ -1,0 +1,50 @@
+{
+  "$comment": "上游 OpenCV 5 dnn 的跟踪版本锁。机器可读版本；人类可读说明见 misc.md §11.1（同一份记录）。",
+  "schema": 1,
+  "recordedAt": "2026-11-07",
+  "project": "OnnxSharp",
+
+  "upstream": {
+    "name": "opencv",
+    "url": "https://github.com/opencv/opencv.git",
+    "localPath": "F:\\code\\opencv",
+    "branch": "5.x",
+    "trackingRef": "origin/5.x",
+    "commit": "43f8b1f5dacd967e5f632dd4a45109f182d41dce",
+    "short": "43f8b1f5",
+    "commitDate": "2026-11-06",
+    "subject": "Merge pull request #30701 from Kumataro:bump_release_to_5.1_and_update_version_dropdown",
+    "scope": [
+      "modules/dnn/src/layers",
+      "modules/dnn/src/onnx",
+      "modules/dnn/src/layers/cpu_kernels",
+      "modules/dnn/src/net_impl2.cpp",
+      "modules/dnn/src/net_impl.hpp",
+      "modules/dnn/src/graph_const_fold.cpp",
+      "modules/dnn/src/graph_const_args.cpp",
+      "modules/dnn/src/graph_buffer_allocator.cpp"
+    ]
+  },
+
+  "policy": {
+    "readOnly": true,
+    "baselineIsSemantic": true,
+    "note": "42 个算子的行为、shape 推断与属性解析以 commit 为准；之后每个提交按 misc.md §11.5 分类，采纳项写入 §11.6。"
+  },
+
+  "verify": {
+    "recordedHead": "git -C F:\\code\\opencv rev-parse HEAD",
+    "behindCount": "git -C F:\\code\\opencv --no-pager log --oneline 43f8b1f5..origin/5.x -- modules/dnn | Measure-Object -Line"
+  },
+
+  "history": [
+    {
+      "date": "2026-11-07",
+      "from": null,
+      "to": "43f8b1f5dacd967e5f632dd4a45109f182d41dce",
+      "dnnCommits": null,
+      "adopted": 0,
+      "note": "建立基线；首批评估 4 条（490dc835 / 4f4d6125 / ee27ba20 / 43f8b1f5），见 misc.md §11.6。"
+    }
+  ]
+}

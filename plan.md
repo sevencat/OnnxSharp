@@ -3,8 +3,9 @@
 > 纯 C# 的 ONNX 推理运行时，以 OpenCV 5 dnn 新版 graph 引擎为参考实现。
 > 首版目标：跑通 YOLOv11 检测 与 RF-DETR。
 >
-> **当前状态：M0 骨架可跑**（`dotnet build` 0 警告；`SmokeTest` PASS）
-> 最后更新：2026-11-07（第二轮评审修订）
+> **当前状态：M0 + M0.5 已完成**（`dotnet build OnnxSharp.slnx` 0 警告 0 错误；`tests` 16/16 PASS；CLI 冒烟 PASS）
+> 下一步：M1（ONNX 加载）
+> 最后更新：2026-11-07
 
 ---
 
@@ -149,30 +150,31 @@ OpenCV 5.2 的 `modules/dnn` 内含两套引擎：
 F:\code\OnnxSharp\
 ├─ plan.md                     本文件
 ├─ misc.md                     杂项：实测数据、源码地图、环境、坑
+├─ upstream.lock               上游 OpenCV dnn 跟踪版本锁（机器可读）
 ├─ OnnxSharp.slnx
 ├─ src\
 │  └─ OnnxSharp\               产品库（零第三方依赖）
 │     ├─ Tensors\
-│     │  ├─ Tensor.cs          多维张量（紧凑布局 + Fit 复用）
+│     │  ├─ Tensor.cs          多维张量（紧凑布局 + Fit 复用 + Layout）  [M0.5 已加 Layout]
 │     │  ├─ TensorShape.cs     MatShape 等价物
 │     │  ├─ TensorOps.cs       广播 / 逐元素运算
-│     │  ├─ DType.cs
-│     │  └─ BufferPool.cs      （M0.5）ArrayPool 封装
+│     │  ├─ Layout.cs          Layout 枚举（仅 NCHW，接口预留）          [M0.5 新增]
+│     │  └─ DType.cs
 │     ├─ Core\
-│     │  ├─ Arg.cs             Arg / ArgData / ArgKind        [完成]
-│     │  ├─ Graph.cs           prog 线性表（M0.5 改为可重建）  [完成→改]
-│     │  ├─ LayerInfo.cs       LayerInfo + Layer（执行器）     [完成]
+│     │  ├─ Arg.cs             Arg / ArgData / ArgKind + 槽号            [M0.5 已改]
+│     │  ├─ Graph.cs           prog 线性表 + Version/Reset/RemoveAll     [M0.5 已改]
+│     │  ├─ LayerInfo.cs       LayerInfo + Layer；Net 反查 + In() + GetLayouts [M0.5 已改]
 │     │  ├─ LayerParams.cs     [完成]
 │     │  ├─ DictValue.cs       [完成]
-│     │  ├─ LayerRegistry.cs   [完成]
-│     │  ├─ Interpreter.cs     [完成→M0.5 补动态形状/temp 池]
-│     │  ├─ NetImpl.cs         [完成→M0.5 补 BufferAllocator]
+│     │  ├─ LayerRegistry.cs   显式字典注册（无反射）                    [完成]
+│     │  ├─ Interpreter.cs     解释循环 + 动态形状分支 + temp 池          [M0.5 已改]
+│     │  ├─ NetImpl.cs         Arg 表 + 槽/池 + Declare/Require           [M0.5 已改]
 │     │  └─ Net.cs             门面（ReadModel 在 M1）
 │     ├─ Threading\
-│     │  └─ ParallelRange.cs   parallel_for_ 等价物             [完成]
+│     │  └─ ParallelRange.cs   parallel_for_ 等价物                      [完成]
 │     ├─ Engine\
-│     │  ├─ ConstFolder.cs     （M3）常量折叠 / Shape 链
-│     │  └─ BufferAllocator.cs （M0.5）冲突图缓冲复用
+│     │  ├─ BufferAllocator.cs 生命周期区间着色，共享缓冲槽              [M0.5 完成]
+│     │  └─ ConstFolder.cs     （M3）常量折叠 / Shape 链
 │     ├─ Onnx\
 │     │  ├─ Proto\             protobuf 读取（M1，移植 SimdYolo Proto）
 │     │  ├─ OnnxImporter.cs    通用骨架：graph/value_info/initializer/属性
@@ -187,8 +189,8 @@ F:\code\OnnxSharp\
 ├─ tools\
 │  └─ OnnxSharp.Cli\           run / dump-graph / bench（+ letterbox 参考实现）
 └─ tests\
-   ├─ OnnxSharp.Tests\         单元 + 端到端（M0.5 建立）
-   └─ OnnxSharp.GoldenGen\     引用 Microsoft.ML.OnnxRuntime 生成 golden（不进产品）
+   ├─ OnnxSharp.Tests\         零依赖测试运行器 + 16 用例                 [M0.5 建立]
+   └─ OnnxSharp.GoldenGen\     引用 Microsoft.ML.OnnxRuntime 生成 golden（M1）
 ```
 
 ---
@@ -213,28 +215,33 @@ F:\code\OnnxSharp\
 
 **验收**：`tools/OnnxSharp.Cli` 手工建图 `Input[2,3] → Add(const[3]) → Relu` 输出 `1.5, 0, 2, 4.5, 0, 5` —— **已通过**；`dotnet build` 0 警告 0 错误。
 
-### M0.5 — 引擎能力补全（**新增，M1 之前必须完成**）
+### M0.5 — 引擎能力补全（**已完成 2026-11-07**）
 
-这一批是 M1/M2/M3 的硬前置，做完之前不要动 importer。
+这一批是 M1/M2/M3 的硬前置。
 
 **任务**
-- [ ] **常量输入反查**：`LayerInfo` 增加 `NetImpl` 回填（等价 `getNetImpl`），或把 `GetMemoryShapes` 形参改为 `IReadOnlyList<Tensor>`，使 Shape 类算子能读到常量**值**（见 §5.3）
-- [ ] `Graph.Prog` 可重建 + `UpdateGraphOfs`（常量折叠后要删节点）
-- [ ] `BufferAllocator`（冲突图）：`useCount` / lifetime 区间 → 复用同一 buffer（见 §5.7）；**优先照搬 SimdYolo `OnnxExecutionPlan` 的 `remaining`+`Live` 存活集合与 `CpuTensorPool` 的边界扫描**（`misc.md §2.5`）
-- [ ] **布局接口预留（Q7 层 2 的代价最小化）**：
-  - `Tensor.Layout`（`Layout.NCHW` 唯一取值）
-  - `ArgData.Layout`
-  - `LayerInfo.GetLayouts(inLayouts, outLayouts, ...)`，全实现恒返回 NCHW
-  - 不写 `TransformLayout` 算子、不写 `useBlockLayout()` pass
-- [ ] **AOT 友好约定落地检查**：全库无 `dynamic`/`Emit`/反射式注册（`LayerRegistry` 用显式 switch 或 `Dictionary<string, Func<...>>`）
-- [ ] 全局 temp 池（对齐 `globalTemps`），取消 `Interpreter` 每次 forward `new` 临时张量
-- [ ] `Interpreter` 补 `DynamicOutputShapes()` 分支：此类 op **不预 fit**，输出 Tensor 交给 layer 自己 fit（见 §5.4）
-- [ ] `Interpreter` 重 finalize 判据补 `inpTypes`（现只比 shapes）
-- [ ] `NetImpl.GetArg` 拆成 `Declare`（新建）/ `Require`（存在或报错），避免 importer 拼错名字被静默吞掉
-- [ ] 建 `tests/OnnxSharp.Tests`（xunit）与 `tests/OnnxSharp.GoldenGen`
-- [ ] `Tensor.Fit` 的 `Count/Total` 溢出路径检查（`long` → `int` 截断）
+- [x] **常量输入反查**：`LayerInfo.Net` 回填（等价 `getNetImpl`）+ `In(int)` / `IsConstInput(int)` 便捷方法
+- [x] `Graph.Prog` 可重建：`Graph.Reset(ops)` / `RemoveAll(pred)` / `Version`（结构变更递增，驱动缓冲槽重算）
+- [x] `BufferAllocator`（生命周期区间着色）：`Engine/BufferAllocator.cs`，`Analyze` + `Assign`，槽只增不减
+- [x] **布局接口预留**：`Tensor.Layout`、`ArgData.Layout`、`LayerInfo.GetLayouts`（恒返回 NCHW），无 `TransformLayout`
+- [x] **AOT 友好约定**：`LayerRegistry` 为显式 `Dictionary<string, Func<...>>` 注册，全库无反射 / `dynamic` / `Emit`
+- [x] 全局 temp 池（`NetImpl.FitTemps`，对齐 `globalTemps`），取消每次 forward `new`
+- [x] `Interpreter` 动态形状分支：此类 op **不预 fit**，输出 Tensor 交给 layer 自己 fit
+- [x] `Interpreter` 重 finalize 判据补 `inpTypes`
+- [x] `NetImpl` 拆出 `Declare`（新建）/ `Require`（存在或报错）/ `TryGetArg`
+- [x] 建 `tests/OnnxSharp.Tests`：**零第三方依赖**的控制台运行器（xunit 未缓存且离线，后续可迁移）+ 16 个用例
+- [x] `Tensor.Fit` 溢出路径检查（错误信息带上字节数）
+- [ ] `tests/OnnxSharp.GoldenGen` → 推迟到 M1（依赖 ORT + python 改图）
 
-**验收**：手工建图跑「常量 shape 驱动 Reshape/Slice」；`BufferAllocator` 单测证明 4 个不重叠 Arg 共用 1 块缓冲；连续两次 `Forward` 的 GC 分配量 < 1 MB。
+**验收（已通过）**
+- `dotnet build OnnxSharp.slnx`：0 警告 0 错误（net8.0 + net10.0）
+- `dotnet run --project tests/OnnxSharp.Tests`：**16/16 PASS**
+  - 常量 shape 驱动输出形状（模拟 `Reshape`/`Slice`）
+  - 动态 op 自 Fit 输出（`Where/Expand` 路径）
+  - temp 张量对象跨 forward 复用（`TempCount == 1`）
+  - 共享槽数跨 forward 稳定；图追加算子后槽自动重算
+  - 分配器：链式 4 个 Arg 用 2 槽、并发分支不共享、图输出不被覆盖、常量/输入无槽
+- CLI 冒烟：`SMOKE TEST: PASS`
 
 ### M1 — ONNX 加载（dump 与参考对齐）
 
@@ -615,13 +622,13 @@ onnx.save(m, sys.argv[2])
 | 里程碑 | 内容 | 估时 |
 |---|---|---|
 | M0 | 骨架 + 图 + 广播逐元素 | ~~2~3 周~~ **已完成** |
-| **M0.5** | 引擎能力补全（反查/Allocator/temp 池/动态形状/测试工程） | **1 周** |
+| **M0.5** | 引擎能力补全（反查/Allocator/temp 池/动态形状/测试工程） | ~~1 周~~ **已完成（2026-11-07）** |
 | M1 | ONNX 加载 + dump/形状对齐（protobuf 现成） | 1 ~ 2 周 |
 | M2 | YOLOv11 跑通 | 3 ~ 4 周 |
 | M3 | RF-DETR 跑通（含内存达标） | 3 ~ 4 周 |
 | M4 | 性能优化（移植 SimdYolo kernel） | 3 ~ 4 周 |
 | M5 | 工程化 + 打包 | 1 周 |
-| **合计（剩余）** | | **约 12 ~ 16 周** |
+| **合计（剩余）** | | **约 11 ~ 15 周** |
 
 ---
 

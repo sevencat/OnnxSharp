@@ -12,6 +12,12 @@ public sealed class Tensor
 
     public DType DType { get; private set; } = DType.F32;
 
+    /// <summary>
+    /// 存储布局。首版恒为 <see cref="Tensors.Layout.NCHW"/>；
+    /// 保留该属性是为了将来图级 blocked layout 不必改 API。
+    /// </summary>
+    public Layout Layout { get; private set; } = Layout.NCHW;
+
     /// <summary>底层缓冲（可能大于实际使用长度，供复用）。</summary>
     public byte[] Buffer { get; private set; } = Array.Empty<byte>();
 
@@ -57,7 +63,8 @@ public sealed class Tensor
     {
         long need = checked(shape.Total() * dtype.SizeOf());
         if (need > int.MaxValue)
-            throw new NotSupportedException($"tensor too large: {shape}");
+            throw new NotSupportedException(
+                $"tensor too large: {shape} {dtype} needs {need} bytes, max {int.MaxValue}");
 
         if (!reuse || DType != dtype || Buffer.Length < need)
         {
@@ -65,6 +72,7 @@ public sealed class Tensor
             DType = dtype;
         }
 
+        Layout = Layout.NCHW;
         Shape = shape;
         ByteOffset = 0;
         ByteLength = (int)need;

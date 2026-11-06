@@ -2,6 +2,9 @@
   <Folder Name="/src/">
     <Project Path="src/OnnxSharp/OnnxSharp.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/OnnxSharp.Tests/OnnxSharp.Tests.csproj" />
+  </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/OnnxSharp.Cli/OnnxSharp.Cli.csproj" />
   </Folder>
