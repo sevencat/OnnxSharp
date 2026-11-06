@@ -1,3 +1,4 @@
+using System.Buffers;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 using OnnxSharp.Threading;
@@ -5,14 +6,293 @@ using OnnxSharp.Threading;
 namespace OnnxSharp.Kernels;
 
 /// <summary>
-/// NCHW 直接卷积（含 group / stride / dilation / padding）。
-/// <para>
-/// M2 版本以**正确**为第一目标：不做 im2col、不做 SIMD，靠「按输出通道并行」拿到多核。
-/// M4 再替换为 im2col+GEMM / Winograd（见 plan.md）。
-/// </para>
+/// NCHW 卷积实现（含 group / stride / dilation / padding）。
+/// <list type="bullet">
+/// <item><see cref="Im2Col"/>：主路径，按输出行分块做 im2col，再交给
+/// <see cref="GemmKernel"/> 做矩阵乘（对照 OpenCV <c>conv_im2col</c>）。</item>
+/// <item><see cref="Direct"/>：保留的参考实现，正确但慢，用于对照与兜底。</item>
+/// </list>
 /// </summary>
 internal static class ConvKernels
 {
+    /// <summary>im2col 每次处理的输出行数：太小则 GEMM 效率低，太大则列缓冲挤爆 cache。</summary>
+    private const int BlockRows = 8;
+
+    /// <summary>
+    /// im2col + GEMM：把卷积化成
+    /// <c>W[outPerGroup, K] · col[K, 输出块像素]</c>，其中 <c>K = inPerGroup*kh*kw</c>。
+    /// 大矩阵由 GEMM 内核向量化，外层按「batch × group × 输出行块」并行。
+    /// </summary>
+    public static void Im2Col(
+        Tensor input,
+        Tensor weight,
+        Tensor? bias,
+        Tensor output,
+        int groups,
+        int strideH,
+        int strideW,
+        int dilH,
+        int dilW,
+        int padT,
+        int padL)
+    {
+        if (input.Shape.Rank != 4 || weight.Shape.Rank != 4 || output.Shape.Rank != 4)
+            throw new OnnxSharpException("Conv kernel expects NCHW rank-4 tensors");
+
+        int batches = input.Shape.Dims[0];
+        int channels = input.Shape.Dims[1];
+        int inH = input.Shape.Dims[2];
+        int inW = input.Shape.Dims[3];
+
+        int outChannels = output.Shape.Dims[1];
+        int outH = output.Shape.Dims[2];
+        int outW = output.Shape.Dims[3];
+
+        int kernelH = weight.Shape.Dims[2];
+        int kernelW = weight.Shape.Dims[3];
+
+        int inPerGroup = channels / groups;
+        int outPerGroup = outChannels / groups;
+        int kernelSize = inPerGroup * kernelH * kernelW;
+
+        // 1x1 / stride 1 / 无 pad / 无 dilation：卷积退化成 GEMM，输入直接当列矩阵用
+        bool isPointwise = kernelH == 1 && kernelW == 1
+            && strideH == 1 && strideW == 1 && dilH == 1 && dilW == 1
+            && padT == 0 && padL == 0;
+
+        if (isPointwise)
+        {
+            Pointwise(input, weight, bias, output, groups, batches,
+                channels, inPerGroup, outChannels, outPerGroup, outH * outW);
+            return;
+        }
+
+        int blockCount = (outH + BlockRows - 1) / BlockRows;
+
+        // 小特征图（如 80×80）只按行切只有十来个任务，喂不满多核；
+        // 再把输出宽度切开，让任务数达到线程数的 2 倍左右。
+        int spatialTasks = batches * groups * blockCount;
+        int colSplits = 1;
+        while (spatialTasks * colSplits < Environment.ProcessorCount * 2
+               && outW / (colSplits * 2) >= 32)
+        {
+            colSplits *= 2;
+        }
+
+        int tileWidth = (outW + colSplits - 1) / colSplits;
+        int tasks = spatialTasks * colSplits;
+
+        ParallelRange.For(tasks, (begin, end) =>
+        {
+            var src = input.AsSpan<float>();
+            var weights = weight.AsSpan<float>();
+            var biases = bias is null ? Span<float>.Empty : bias.AsSpan<float>();
+            var dst = output.AsSpan<float>();
+
+            int maxPixels = BlockRows * tileWidth;
+            float[] pool = ArrayPool<float>.Shared.Rent(kernelSize * maxPixels);
+            float[]? outPool = colSplits > 1
+                ? ArrayPool<float>.Shared.Rent(outPerGroup * maxPixels)
+                : null;
+
+            for (int task = begin; task < end; task++)
+            {
+                int colSplit = task % colSplits;
+                int rest = task / colSplits;
+                int block = rest % blockCount;
+                int outer = rest / blockCount;
+                int n = outer / groups;
+                int g = outer - n * groups;
+
+                int oyBegin = block * BlockRows;
+                int rows = Math.Min(BlockRows, outH - oyBegin);
+
+                int oxBegin = colSplit * tileWidth;
+                int colCount = Math.Min(tileWidth, outW - oxBegin);
+
+                int pixels = rows * colCount;
+
+                FillColumns(src, pool, channels, inH, inW, n, g * inPerGroup, inPerGroup,
+                    kernelH, kernelW, strideH, strideW, dilH, dilW, padT, padL,
+                    oyBegin, rows, oxBegin, colCount, outW, pixels);
+
+                long dstBase = ((long)n * outChannels + g * outPerGroup) * outH * outW
+                             + (long)oyBegin * outW + oxBegin;
+
+                var weightSlice = weights.Slice(g * outPerGroup * kernelSize, outPerGroup * kernelSize);
+                var colSlice = pool.AsSpan(0, kernelSize * pixels);
+
+                if (colSplits == 1)
+                {
+                    // 整行处理：块内像素在 NCHW 里就是连续的，直接写输出
+                    var target = dst.Slice((int)dstBase, (outPerGroup - 1) * outH * outW + pixels);
+
+                    GemmKernel.Multiply(weightSlice, colSlice, target,
+                        outPerGroup, kernelSize, pixels,
+                        ldc: outH * outW, parallel: false);
+
+                    if (biases.Length > 0)
+                        AddBias(target, biases, g * outPerGroup, outPerGroup, outH * outW, pixels);
+                }
+                else
+                {
+                    // 列切分后块内像素不再连续（每行只取 outW 中的一段），
+                    // 先在紧凑缓冲里算完再按行搬回输出。
+                    var scratch = outPool!.AsSpan(0, outPerGroup * pixels);
+
+                    GemmKernel.Multiply(weightSlice, colSlice, scratch,
+                        outPerGroup, kernelSize, pixels,
+                        ldc: pixels, parallel: false);
+
+                    if (biases.Length > 0)
+                        AddBias(scratch, biases, g * outPerGroup, outPerGroup, pixels, pixels);
+
+                    for (int oc = 0; oc < outPerGroup; oc++)
+                    {
+                        for (int r = 0; r < rows; r++)
+                        {
+                            scratch.Slice(oc * pixels + r * colCount, colCount)
+                                .CopyTo(dst.Slice((int)(dstBase + (long)oc * outH * outW + (long)r * outW), colCount));
+                        }
+                    }
+                }
+            }
+
+            ArrayPool<float>.Shared.Return(pool);
+
+            if (outPool is not null)
+                ArrayPool<float>.Shared.Return(outPool);
+        });
+    }
+
+    /// <summary>1x1 卷积：<c>out[oc, p] = Σ_ic W[oc, ic] · in[ic, p]</c>，零拷贝。</summary>
+    private static void Pointwise(
+        Tensor input,
+        Tensor weight,
+        Tensor? bias,
+        Tensor output,
+        int groups,
+        int batches,
+        int channels,
+        int inPerGroup,
+        int outChannels,
+        int outPerGroup,
+        int pixels)
+    {
+        int tasks = batches * groups;
+        bool innerParallel = tasks <= 1;
+
+        ParallelRange.For(tasks, (begin, end) =>
+        {
+            var src = input.AsSpan<float>();
+            var weights = weight.AsSpan<float>();
+            var biases = bias is null ? Span<float>.Empty : bias.AsSpan<float>();
+            var dst = output.AsSpan<float>();
+
+            for (int task = begin; task < end; task++)
+            {
+                int n = task / groups;
+                int g = task - n * groups;
+
+                long srcBase = (long)(n * channels + g * inPerGroup) * pixels;
+                long dstBase = ((long)n * outChannels + g * outPerGroup) * pixels;
+
+                GemmKernel.Multiply(
+                    weights.Slice(g * outPerGroup * inPerGroup, outPerGroup * inPerGroup),
+                    src.Slice((int)srcBase, inPerGroup * pixels),
+                    dst.Slice((int)dstBase, outPerGroup * pixels),
+                    outPerGroup, inPerGroup, pixels,
+                    ldc: pixels,
+                    parallel: innerParallel);
+
+                if (biases.Length > 0)
+                    AddBias(dst.Slice((int)dstBase, outPerGroup * pixels),
+                        biases, g * outPerGroup, outPerGroup, pixels, pixels);
+            }
+        });
+    }
+
+    /// <summary>把一块输出区域的感受野摊平成 <c>col[K, pixels]</c>（越界填 0）。</summary>
+    private static void FillColumns(
+        ReadOnlySpan<float> src,
+        float[] col,
+        int channels,
+        int inH,
+        int inW,
+        int batch,
+        int channelStart,
+        int inPerGroup,
+        int kernelH,
+        int kernelW,
+        int strideH,
+        int strideW,
+        int dilH,
+        int dilW,
+        int padT,
+        int padL,
+        int oyBegin,
+        int rows,
+        int oxBegin,
+        int colCount,
+        int outW,
+        int pixels)
+    {
+        for (int ic = 0; ic < inPerGroup; ic++)
+        {
+            long channelBase = (long)(batch * channels + channelStart + ic) * inH * inW;
+
+            for (int ky = 0; ky < kernelH; ky++)
+            {
+                for (int kx = 0; kx < kernelW; kx++)
+                {
+                    int colRow = (ic * kernelH + ky) * kernelW + kx;
+                    var target = col.AsSpan(colRow * pixels, pixels);
+
+                    for (int r = 0; r < rows; r++)
+                    {
+                        int y = (oyBegin + r) * strideH - padT + ky * dilH;
+                        var targetRow = target.Slice(r * colCount, colCount);
+
+                        if ((uint)y >= (uint)inH)
+                        {
+                            targetRow.Clear();
+                            continue;
+                        }
+
+                        var sourceRow = src.Slice((int)(channelBase + (long)y * inW), inW);
+                        int rowStart = oxBegin * strideW - padL + kx * dilW;
+
+                        for (int i = 0; i < colCount; i++)
+                        {
+                            int x = rowStart + i * strideW;
+                            targetRow[i] = (uint)x < (uint)inW ? sourceRow[x] : 0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static void AddBias(
+        Span<float> target,
+        ReadOnlySpan<float> bias,
+        int biasStart,
+        int outPerGroup,
+        int ldc,
+        int pixels)
+    {
+        for (int oc = 0; oc < outPerGroup; oc++)
+        {
+            float value = bias[biasStart + oc];
+            if (value == 0f)
+                continue;
+
+            var row = target.Slice(oc * ldc, pixels);
+            for (int i = 0; i < row.Length; i++)
+                row[i] += value;
+        }
+    }
+
     public static void Direct(
         Tensor input,
         Tensor weight,

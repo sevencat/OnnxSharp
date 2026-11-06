@@ -17,6 +17,7 @@ return args[0].ToLowerInvariant() switch
     "dump-graph" => DumpGraph(args),
     "run" => Run(args),
     "bench" => Bench(args),
+    "profile" => Profile(args),
     "detect" => Detect(args),
     "help" or "-h" or "--help" => Usage(),
     _ => Usage(),
@@ -36,6 +37,8 @@ static int Usage()
     Console.WriteLine("                                      # 跑一次前向，打印输出统计/耗时");
     Console.WriteLine("  OnnxSharp.Cli bench <model.onnx> --input <file.bin> [--iters N] [--warmup N]");
     Console.WriteLine("                                      # 计时迭代");
+    Console.WriteLine("  OnnxSharp.Cli profile <model.onnx> --input <file.bin> [--iters N] [--top N]");
+    Console.WriteLine("                                      # 逐算子耗时排行（找热点）");
     Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> --input <file.bin> [--conf 0.25] [--iou 0.45]");
     Console.WriteLine("                                      # 调用示例：YOLO decode + NMS（不写进产品库）");
     return 2;
@@ -308,6 +311,52 @@ static int Bench(string[] args)
     Console.WriteLine($"median    : {samples[iters / 2]:F1} ms");
     Console.WriteLine($"mean      : {samples.Average():F1} ms");
     Console.WriteLine($"max       : {samples[^1]:F1} ms");
+    return 0;
+}
+
+/// <summary>
+/// profile：逐算子耗时排行。第 1 次迭代包含 Finalize/权重打包，所以默认跑 2 次取平均。
+/// </summary>
+static int Profile(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: profile <model.onnx> --input <file.bin> [--iters N] [--top N]");
+        return 2;
+    }
+
+    string path = args[1];
+    var options = ParseOptions(args, 2);
+    if (!File.Exists(path))
+    {
+        Console.Error.WriteLine($"model not found: {path}");
+        return 2;
+    }
+
+    var net = Net.ReadModel(path);
+    BindInputs(net, options.Inputs);
+
+    int iters = Math.Max(1, options.GetInt("--iters", 2));
+    int top = options.GetInt("--top", 20);
+
+    var watch = System.Diagnostics.Stopwatch.StartNew();
+    var timings = net.ProfileAll(iters);
+    watch.Stop();
+
+    double total = timings.Sum(t => t.Milliseconds);
+
+    Console.WriteLine($"model     : {path}");
+    Console.WriteLine($"ops       : {net.MainGraph?.Prog.Count}    iters: {iters}    {watch.Elapsed.TotalMilliseconds:F0} ms");
+    Console.WriteLine($"total     : {total:F1} ms  ({total / iters:F1} ms/iter)");
+    Console.WriteLine();
+    Console.WriteLine($"{"#",4}  {"type",-18}{"avg ms",10}{"share",8}  name");
+
+    int index = 0;
+    foreach (var timing in timings.Take(top < 1 ? timings.Count : top))
+    {
+        Console.WriteLine($"{++index,4}  {timing.Type,-18}{timing.Average,10:F2}{timing.Milliseconds / total * 100,7:F1}%  {timing.Name}");
+    }
+
     return 0;
 }
 

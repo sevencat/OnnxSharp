@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using OnnxSharp.Tensors;
 
 namespace OnnxSharp.Core;
@@ -13,8 +14,17 @@ internal static class Interpreter
     /// <summary>
     /// 执行整张图。<paramref name="executeLayers"/> = false 时只做形状/类型推断与缓冲绑定，
     /// 不调用 <see cref="Layer.Forward"/>（供 `dump-graph` 与形状对齐测试使用）。
+    /// <para>
+    /// <paramref name="timings"/> 非空时累计<b>每个算子</b>的耗时（诊断用，
+    /// 对应 OpenCV 的 <c>ENABLE_PROFILING</c> / <c>getPerfProfile</c>）。
+    /// 计时本身有开销，只在 profile 时传。
+    /// </para>
     /// </summary>
-    public static void Run(NetImpl net, Graph graph, bool executeLayers = true)
+    public static void Run(
+        NetImpl net,
+        Graph graph,
+        bool executeLayers = true,
+        Dictionary<LayerInfo, (double Milliseconds, int Calls)>? timings = null)
     {
         // 绑定 LayerInfo.Net 并按生命周期分槽（图结构变化时才重算）。
         net.PrepareForGraph(graph);
@@ -112,7 +122,19 @@ internal static class Interpreter
                 layer.FinalizedOnce = true;
             }
 
-            layer.Forward(inpMats, outs, temps);
+            if (timings is null)
+            {
+                layer.Forward(inpMats, outs, temps);
+            }
+            else
+            {
+                long start = Stopwatch.GetTimestamp();
+                layer.Forward(inpMats, outs, temps);
+
+                double ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                var acc = timings.GetValueOrDefault(layer);
+                timings[layer] = (acc.Milliseconds + ms, acc.Calls + 1);
+            }
 
             if (op.DynamicOutputShapes())
             {

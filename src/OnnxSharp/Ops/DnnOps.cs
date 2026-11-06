@@ -1,5 +1,7 @@
+using System.Numerics;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
+using OnnxSharp.Threading;
 
 namespace OnnxSharp.Ops;
 
@@ -177,7 +179,7 @@ internal static class DnnOps
 
             Tensor? bias = Inputs.Count > 2 && Inputs[2].Idx != 0 && inputs[2].Count > 0 ? inputs[2] : null;
 
-            Kernels.ConvKernels.Direct(
+            Kernels.ConvKernels.Im2Col(
                 input, weight, bias, output,
                 _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[2]);
         }
@@ -524,28 +526,82 @@ internal static class DnnOps
             int inner = axis + 1 < dims.Length ? OpUtil.Product(dims.AsSpan(axis + 1)) : 1;
             int length = dims[axis];
 
-            var src = input.AsSpan<float>();
-            var dst = output.AsSpan<float>();
+            if (outer <= 0 || length <= 0)
+                return;
 
-            for (int o = 0; o < outer; o++)
+            // 按 outer（attention 里就是 batch*heads*rows）并行；每行内部保持顺序累加，数值不变。
+            ParallelRange.For(outer, (begin, end) =>
             {
-                for (int i = 0; i < inner; i++)
+                var src = input.AsSpan<float>();
+                var dst = output.AsSpan<float>();
+
+                for (int o = begin; o < end; o++)
                 {
-                    long baseIndex = (long)o * length * inner + i;
+                    if (inner == 1)
+                    {
+                        SoftmaxVector(src.Slice(o * length, length), dst.Slice(o * length, length));
+                        continue;
+                    }
 
-                    float max = float.NegativeInfinity;
-                    for (int k = 0; k < length; k++)
-                        max = MathF.Max(max, src[(int)(baseIndex + (long)k * inner)]);
+                    for (int i = 0; i < inner; i++)
+                    {
+                        long baseIndex = (long)o * length * inner + i;
 
-                    float sum = 0;
-                    for (int k = 0; k < length; k++)
-                        sum += MathF.Exp(src[(int)(baseIndex + (long)k * inner)] - max);
+                        float max = float.NegativeInfinity;
+                        for (int k = 0; k < length; k++)
+                            max = MathF.Max(max, src[(int)(baseIndex + (long)k * inner)]);
 
-                    for (int k = 0; k < length; k++)
-                        dst[(int)(baseIndex + (long)k * inner)] =
-                            MathF.Exp(src[(int)(baseIndex + (long)k * inner)] - max) / sum;
+                        float sum = 0;
+                        for (int k = 0; k < length; k++)
+                            sum += MathF.Exp(src[(int)(baseIndex + (long)k * inner)] - max);
+
+                        float inverse = 1f / sum;
+                        for (int k = 0; k < length; k++)
+                            dst[(int)(baseIndex + (long)k * inner)] =
+                                MathF.Exp(src[(int)(baseIndex + (long)k * inner)] - max) * inverse;
+                    }
                 }
+            });
+        }
+
+        /// <summary>
+        /// 末轴 Softmax（连续内存）：exp 只算一次并直接写入输出，再乘倒数归一化。
+        /// 原实现算了两遍 exp（求和一次、回填一次），是 attention 里的主要开销之一。
+        /// </summary>
+        private static void SoftmaxVector(ReadOnlySpan<float> src, Span<float> dst)
+        {
+            float max = MaxOf(src);
+
+            float sum = 0;
+            for (int k = 0; k < src.Length; k++)
+            {
+                float value = MathF.Exp(src[k] - max);
+                dst[k] = value;
+                sum += value;
             }
+
+            float inverse = 1f / sum;
+            for (int k = 0; k < dst.Length; k++)
+                dst[k] *= inverse;
+        }
+
+        private static float MaxOf(ReadOnlySpan<float> values)
+        {
+            int width = Vector<float>.Count;
+            int i = 0;
+            var accumulator = new Vector<float>(float.NegativeInfinity);
+
+            for (; i <= values.Length - width; i += width)
+                accumulator = Vector.Max(accumulator, new Vector<float>(values.Slice(i)));
+
+            float max = float.NegativeInfinity;
+            for (int lane = 0; lane < width; lane++)
+                max = MathF.Max(max, accumulator[lane]);
+
+            for (; i < values.Length; i++)
+                max = MathF.Max(max, values[i]);
+
+            return max;
         }
     }
 
@@ -662,16 +718,12 @@ internal static class DnnOps
                     bOffset += (long)coordB * bStrides[i] * k * n;
                 }
 
-                for (int row = 0; row < m; row++)
-                {
-                    for (int col = 0; col < n; col++)
-                    {
-                        float sum = 0;
-                        for (int t = 0; t < k; t++)
-                            sum += srcA[(int)(aOffset + (long)row * k + t)] * srcB[(int)(bOffset + (long)t * n + col)];
-                        dst[(int)(batch * m * n + (long)row * n + col)] = sum;
-                    }
-                }
+                // 单个 batch 的 [m,k] × [k,n] 交给共享内核（i-k-j + 向量化 + 大矩阵并行）
+                GemmKernel.Multiply(
+                    srcA.Slice((int)aOffset, m * k),
+                    srcB.Slice((int)bOffset, k * n),
+                    dst.Slice((int)(batch * m * n), m * n),
+                    m, k, n);
 
                 for (int i = batchRank - 1; i >= 0; i--)
                 {

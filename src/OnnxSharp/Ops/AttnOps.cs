@@ -88,31 +88,41 @@ internal static class AttnOps
             var dst = output.AsSpan<float>();
             var sc = c is null ? Span<float>.Empty : c.AsSpan<float>();
 
+            // transA/transB：先转成规范布局再交给共享内核。A 原始 [k,m]、B 原始 [n,k]。
+            ReadOnlySpan<float> matA = sa;
+            ReadOnlySpan<float> matB = sb;
+            if (_transA)
+                matA = GemmKernel.Transpose(sa, k, m);
+            if (_transB)
+                matB = GemmKernel.Transpose(sb, n, k);
+
+            GemmKernel.Multiply(matA, matB, dst, m, k, n);
+
+            bool hasScale = _alpha != 1f;
+            bool hasBias = _beta != 0f && sc.Length > 0;
+
+            if (!hasScale && !hasBias)
+                return;
+
+            bool fullBias = hasBias && sc.Length >= m * n;
+
             for (int i = 0; i < m; i++)
             {
                 for (int j = 0; j < n; j++)
                 {
-                    float sum = 0;
+                    int index = i * n + j;
+                    float value = hasScale ? _alpha * dst[index] : dst[index];
 
-                    for (int t = 0; t < k; t++)
-                    {
-                        float av = _transA ? sa[t * m + i] : sa[i * k + t];
-                        float bv = _transB ? sb[j * k + t] : sb[t * n + j];
-                        sum += av * bv;
-                    }
-
-                    float value = _alpha * sum;
-
-                    if (c is not null && sc.Length > 0)
+                    if (hasBias)
                     {
                         // C 可以是 [M,N]、[1,N] 或 [N]（甚至标量）
-                        float cv = sc.Length == 1 ? sc[0]
-                            : sc.Length >= (i + 1) * n ? sc[i * n + j]
+                        float cv = fullBias ? sc[index]
+                            : sc.Length == 1 ? sc[0]
                             : sc[j % sc.Length];
                         value += _beta * cv;
                     }
 
-                    dst[i * n + j] = value;
+                    dst[index] = value;
                 }
             }
         }
