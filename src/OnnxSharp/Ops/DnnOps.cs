@@ -572,17 +572,9 @@ internal static class DnnOps
         {
             float max = MaxOf(src);
 
-            float sum = 0;
-            for (int k = 0; k < src.Length; k++)
-            {
-                float value = MathF.Exp(src[k] - max);
-                dst[k] = value;
-                sum += value;
-            }
-
-            float inverse = 1f / sum;
-            for (int k = 0; k < dst.Length; k++)
-                dst[k] *= inverse;
+            // exp 与求和合并成一遍（向量版 exp），再乘倒数归一化
+            float sum = VectorMath.SumExp(src, dst, max);
+            VectorMath.Scale(dst, dst, 1f / sum);
         }
 
         private static float MaxOf(ReadOnlySpan<float> values)

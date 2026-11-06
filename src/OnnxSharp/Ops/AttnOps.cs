@@ -1,3 +1,4 @@
+using System.Numerics;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 
@@ -214,33 +215,87 @@ internal static class AttnOps
             var sx = x.AsSpan<float>();
             var dst = output.AsSpan<float>();
 
+            int w = Vector<float>.Count;
+
             for (int o = 0; o < outer; o++)
             {
                 int baseIndex = o * inner;
+                var xrow = sx.Slice(baseIndex, inner);
 
-                double sum = 0;
-                for (int i = 0; i < inner; i++)
-                    sum += sx[baseIndex + i];
+                // 一遍 SIMD 同时求 Σx 与 Σx²（float 向量累加、double 汇总），
+                // 免掉原来「先求 mean 再回头求方差」的第二遍扫描。
+                var vsum = Vector<float>.Zero;
+                var vsumsq = Vector<float>.Zero;
 
-                float mean = (float)(sum / inner);
-
-                double variance = 0;
-                for (int i = 0; i < inner; i++)
+                int i = 0;
+                for (; i <= inner - w; i += w)
                 {
-                    double d = sx[baseIndex + i] - mean;
-                    variance += d * d;
+                    var v = new Vector<float>(xrow.Slice(i));
+                    vsum += v;
+                    vsumsq += v * v;
                 }
 
-                float invStd = 1f / MathF.Sqrt((float)(variance / inner) + _epsilon);
-
-                for (int i = 0; i < inner; i++)
+                double sum = 0;
+                double sumsq = 0;
+                for (int k = 0; k < w; k++)
                 {
-                    float value = (sx[baseIndex + i] - mean) * invStd;
-                    if (scale.Length > 0)
-                        value *= scale[i % scale.Length];
-                    if (bias.Length > 0)
-                        value += bias[i % bias.Length];
-                    dst[baseIndex + i] = value;
+                    sum += vsum[k];
+                    sumsq += vsumsq[k];
+                }
+
+                for (; i < inner; i++)
+                {
+                    float v = xrow[i];
+                    sum += v;
+                    sumsq += (double)v * v;
+                }
+
+                double meanD = sum / inner;
+                double varD = sumsq / inner - meanD * meanD;
+                if (varD < 0)
+                    varD = 0;
+
+                float mean = (float)meanD;
+                float invStd = 1f / MathF.Sqrt((float)varD + _epsilon);
+
+                var drow = dst.Slice(baseIndex, inner);
+
+                // 常规情形：scale/bias 与归一化轴等长（或纯广播），可以整行向量化
+                bool biasFull = bias.Length == inner;
+                if (scale.Length == inner && (biasFull || bias.Length == 0))
+                {
+                    var vmean = new Vector<float>(mean);
+                    var vinv = new Vector<float>(invStd);
+
+                    int j = 0;
+                    for (; j <= inner - w; j += w)
+                    {
+                        var r = (new Vector<float>(xrow.Slice(j)) - vmean) * vinv;
+                        r *= new Vector<float>(scale.Slice(j));
+                        if (biasFull)
+                            r += new Vector<float>(bias.Slice(j));
+                        r.CopyTo(drow.Slice(j));
+                    }
+
+                    for (; j < inner; j++)
+                    {
+                        float value = (xrow[j] - mean) * invStd * scale[j];
+                        if (biasFull)
+                            value += bias[j];
+                        drow[j] = value;
+                    }
+                }
+                else
+                {
+                    for (int j = 0; j < inner; j++)
+                    {
+                        float value = (xrow[j] - mean) * invStd;
+                        if (scale.Length > 0)
+                            value *= scale[j % scale.Length];
+                        if (bias.Length > 0)
+                            value += bias[j % bias.Length];
+                        drow[j] = value;
+                    }
                 }
             }
         }

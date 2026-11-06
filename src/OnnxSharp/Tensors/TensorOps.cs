@@ -1,4 +1,6 @@
 using System.Numerics;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using OnnxSharp.Core;
 
 namespace OnnxSharp.Tensors;
@@ -236,16 +238,16 @@ public static class TensorOps
                 break;
 
             case UnaryOpKind.Exp:
-                for (; i < n; i++) sc[i] = MathF.Exp(sa[i]);
-                break;
+                VectorMath.Exp(sa, sc);
+                return;
 
             case UnaryOpKind.Sigmoid:
-                for (; i < n; i++) sc[i] = 1f / (1f + MathF.Exp(-sa[i]));
-                break;
+                VectorMath.Sigmoid(sa, sc);
+                return;
 
             case UnaryOpKind.Erf:
-                for (; i < n; i++) sc[i] = Erf(sa[i]);
-                break;
+                VectorMath.Erf(sa, sc);
+                return;
 
             case UnaryOpKind.Sin:
                 for (; i < n; i++) sc[i] = MathF.Sin(sa[i]);
@@ -279,6 +281,78 @@ public static class TensorOps
     /// 无广播的逐元素运算：switch 提到循环外、内层用 <see cref="Vector{T}"/>，
     /// 这样 JIT 才能向量化。把 <c>Apply(op, ...)</c> 放进循环里是之前的性能杀手。
     /// </summary>
+    /// <summary>
+    /// 二元运算的向量内核。用泛型静态抽象方法做分派：JIT 会为每个 struct 特化出一份循环，
+    /// 热路径里只剩下 vaddps / vmulps 加一次 load、一次 store —— 没有 op 的 switch、
+    /// 也没有 Span 的逐元素边界检查。原来是 128 位 Vector&lt;float&gt;，带宽只有 AVX2 的一半。
+    /// </summary>
+    private interface IBinaryKernel
+    {
+        static abstract Vector256<float> Apply(Vector256<float> a, Vector256<float> b);
+
+        static abstract float Apply(float a, float b);
+    }
+
+    private readonly struct AddKernel : IBinaryKernel
+    {
+        public static Vector256<float> Apply(Vector256<float> a, Vector256<float> b) => Avx.Add(a, b);
+        public static float Apply(float a, float b) => a + b;
+    }
+
+    private readonly struct SubKernel : IBinaryKernel
+    {
+        public static Vector256<float> Apply(Vector256<float> a, Vector256<float> b) => Avx.Subtract(a, b);
+        public static float Apply(float a, float b) => a - b;
+    }
+
+    private readonly struct MulKernel : IBinaryKernel
+    {
+        public static Vector256<float> Apply(Vector256<float> a, Vector256<float> b) => Avx.Multiply(a, b);
+        public static float Apply(float a, float b) => a * b;
+    }
+
+    private readonly struct DivKernel : IBinaryKernel
+    {
+        public static Vector256<float> Apply(Vector256<float> a, Vector256<float> b) => Avx.Divide(a, b);
+        public static float Apply(float a, float b) => a / b;
+    }
+
+    private readonly struct MaxKernel : IBinaryKernel
+    {
+        public static Vector256<float> Apply(Vector256<float> a, Vector256<float> b) => Avx.Max(a, b);
+        public static float Apply(float a, float b) => MathF.Max(a, b);
+    }
+
+    private readonly struct MinKernel : IBinaryKernel
+    {
+        public static Vector256<float> Apply(Vector256<float> a, Vector256<float> b) => Avx.Min(a, b);
+        public static float Apply(float a, float b) => MathF.Min(a, b);
+    }
+
+    private static unsafe void ContiguousKernel<T>(
+        ReadOnlySpan<float> x,
+        ReadOnlySpan<float> y,
+        Span<float> c,
+        int n)
+        where T : struct, IBinaryKernel
+    {
+        fixed (float* px = x)
+        fixed (float* py = y)
+        fixed (float* pc = c)
+        {
+            int i = 0;
+
+            if (Avx.IsSupported)
+            {
+                for (; i <= n - 8; i += 8)
+                    Avx.Store(pc + i, T.Apply(Avx.LoadVector256(px + i), Avx.LoadVector256(py + i)));
+            }
+
+            for (; i < n; i++)
+                pc[i] = T.Apply(px[i], py[i]);
+        }
+    }
+
     private static void ApplyContiguous(
         BinaryOpKind op,
         ReadOnlySpan<float> left,
@@ -286,49 +360,18 @@ public static class TensorOps
         Span<float> c)
     {
         int n = c.Length;
-        int width = Vector<float>.Count;
-        int i = 0;
 
         switch (op)
         {
-            case BinaryOpKind.Add:
-                for (; i <= n - width; i += width)
-                    (new Vector<float>(left.Slice(i)) + new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = left[i] + right[i];
-                break;
-
-            case BinaryOpKind.Sub:
-                for (; i <= n - width; i += width)
-                    (new Vector<float>(left.Slice(i)) - new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = left[i] - right[i];
-                break;
-
-            case BinaryOpKind.Mul:
-                for (; i <= n - width; i += width)
-                    (new Vector<float>(left.Slice(i)) * new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = left[i] * right[i];
-                break;
-
-            case BinaryOpKind.Div:
-                for (; i <= n - width; i += width)
-                    (new Vector<float>(left.Slice(i)) / new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = left[i] / right[i];
-                break;
-
-            case BinaryOpKind.Max:
-                for (; i <= n - width; i += width)
-                    Vector.Max(new Vector<float>(left.Slice(i)), new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = MathF.Max(left[i], right[i]);
-                break;
-
-            case BinaryOpKind.Min:
-                for (; i <= n - width; i += width)
-                    Vector.Min(new Vector<float>(left.Slice(i)), new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = MathF.Min(left[i], right[i]);
-                break;
-
+            case BinaryOpKind.Add: ContiguousKernel<AddKernel>(left, right, c, n); break;
+            case BinaryOpKind.Sub: ContiguousKernel<SubKernel>(left, right, c, n); break;
+            case BinaryOpKind.Mul: ContiguousKernel<MulKernel>(left, right, c, n); break;
+            case BinaryOpKind.Div: ContiguousKernel<DivKernel>(left, right, c, n); break;
+            case BinaryOpKind.Max: ContiguousKernel<MaxKernel>(left, right, c, n); break;
+            case BinaryOpKind.Min: ContiguousKernel<MinKernel>(left, right, c, n); break;
             default:
-                for (; i < n; i++) c[i] = Apply(op, left[i], right[i]);
+                for (int i = 0; i < n; i++)
+                    c[i] = Apply(op, left[i], right[i]);
                 break;
         }
     }
@@ -336,6 +379,47 @@ public static class TensorOps
     /// <summary>
     /// 标量广播：<c>x op s</c> 或 <c>s op x</c>（<paramref name="scalarIsLeft"/> 决定顺序）。
     /// </summary>
+    private static unsafe void ScalarKernel<T>(
+        ReadOnlySpan<float> x,
+        float s,
+        Span<float> c,
+        int n,
+        bool scalarIsLeft)
+        where T : struct, IBinaryKernel
+    {
+        fixed (float* px = x)
+        fixed (float* pc = c)
+        {
+            int i = 0;
+
+            if (Avx.IsSupported)
+            {
+                var vs = Vector256.Create(s);
+                if (scalarIsLeft)
+                {
+                    for (; i <= n - 8; i += 8)
+                        Avx.Store(pc + i, T.Apply(vs, Avx.LoadVector256(px + i)));
+                }
+                else
+                {
+                    for (; i <= n - 8; i += 8)
+                        Avx.Store(pc + i, T.Apply(Avx.LoadVector256(px + i), vs));
+                }
+            }
+
+            if (scalarIsLeft)
+            {
+                for (; i < n; i++)
+                    pc[i] = T.Apply(s, px[i]);
+            }
+            else
+            {
+                for (; i < n; i++)
+                    pc[i] = T.Apply(px[i], s);
+            }
+        }
+    }
+
     private static void ApplyScalar(
         BinaryOpKind op,
         ReadOnlySpan<float> x,
@@ -344,68 +428,17 @@ public static class TensorOps
         bool scalarIsLeft)
     {
         int n = c.Length;
-        int width = Vector<float>.Count;
-        int i = 0;
-        var sv = new Vector<float>(s);
 
         switch (op)
         {
-            case BinaryOpKind.Add:   // 交换律，不分左右
-                for (; i <= n - width; i += width)
-                    (new Vector<float>(x.Slice(i)) + sv).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = x[i] + s;
-                break;
-
-            case BinaryOpKind.Mul:
-                for (; i <= n - width; i += width)
-                    (new Vector<float>(x.Slice(i)) * sv).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = x[i] * s;
-                break;
-
-            case BinaryOpKind.Sub:
-                if (scalarIsLeft)
-                {
-                    for (; i <= n - width; i += width)
-                        (sv - new Vector<float>(x.Slice(i))).CopyTo(c.Slice(i));
-                    for (; i < n; i++) c[i] = s - x[i];
-                }
-                else
-                {
-                    for (; i <= n - width; i += width)
-                        (new Vector<float>(x.Slice(i)) - sv).CopyTo(c.Slice(i));
-                    for (; i < n; i++) c[i] = x[i] - s;
-                }
-                break;
-
-            case BinaryOpKind.Div:
-                if (scalarIsLeft)
-                {
-                    for (; i <= n - width; i += width)
-                        (sv / new Vector<float>(x.Slice(i))).CopyTo(c.Slice(i));
-                    for (; i < n; i++) c[i] = s / x[i];
-                }
-                else
-                {
-                    for (; i <= n - width; i += width)
-                        (new Vector<float>(x.Slice(i)) / sv).CopyTo(c.Slice(i));
-                    for (; i < n; i++) c[i] = x[i] / s;
-                }
-                break;
-
-            case BinaryOpKind.Max:
-                for (; i <= n - width; i += width)
-                    Vector.Max(new Vector<float>(x.Slice(i)), sv).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = MathF.Max(x[i], s);
-                break;
-
-            case BinaryOpKind.Min:
-                for (; i <= n - width; i += width)
-                    Vector.Min(new Vector<float>(x.Slice(i)), sv).CopyTo(c.Slice(i));
-                for (; i < n; i++) c[i] = MathF.Min(x[i], s);
-                break;
-
+            case BinaryOpKind.Add: ScalarKernel<AddKernel>(x, s, c, n, scalarIsLeft); break;
+            case BinaryOpKind.Sub: ScalarKernel<SubKernel>(x, s, c, n, scalarIsLeft); break;
+            case BinaryOpKind.Mul: ScalarKernel<MulKernel>(x, s, c, n, scalarIsLeft); break;
+            case BinaryOpKind.Div: ScalarKernel<DivKernel>(x, s, c, n, scalarIsLeft); break;
+            case BinaryOpKind.Max: ScalarKernel<MaxKernel>(x, s, c, n, scalarIsLeft); break;
+            case BinaryOpKind.Min: ScalarKernel<MinKernel>(x, s, c, n, scalarIsLeft); break;
             default:
-                for (; i < n; i++)
+                for (int i = 0; i < n; i++)
                     c[i] = scalarIsLeft ? Apply(op, s, x[i]) : Apply(op, x[i], s);
                 break;
         }
