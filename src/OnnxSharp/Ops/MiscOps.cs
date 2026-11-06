@@ -1,3 +1,5 @@
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 
@@ -308,6 +310,14 @@ internal static class MiscOps
             var src = input.AsSpan<float>();
             var dst = output.AsSpan<float>();
 
+            // 绝大多数归约（reduce 最后几维 / 中间一段连续维）都可以拆成
+            // (outer, mid, inner)，既能向量化，也不用每个元素再做 rank 次除法取坐标。
+            if (TryContiguousReduction(dims, reduced, out int outer, out int mid, out int inner))
+            {
+                ReduceBlocks(src, dst, outer, mid, inner);
+                return;
+            }
+
             if (_kind == ReduceKind.Max)
                 dst.Fill(float.NegativeInfinity);
             else
@@ -339,6 +349,139 @@ internal static class MiscOps
                     dst[(int)target] += value;
                 }
             }
+        }
+
+        /// <summary>
+        /// 被归约的轴如果正好是连续的一段 [r0, r1]，整个归约就能拆成
+        /// <c>outer × mid × inner</c> 三层（inner 是 r1 之后不动的那几维）。
+        /// </summary>
+        private static bool TryContiguousReduction(
+            int[] dims,
+            bool[] reduced,
+            out int outer,
+            out int mid,
+            out int inner)
+        {
+            int r0 = -1;
+            int r1 = -1;
+            for (int i = 0; i < dims.Length; i++)
+            {
+                if (!reduced[i])
+                    continue;
+
+                if (r0 < 0)
+                    r0 = i;
+                r1 = i;
+            }
+
+            outer = mid = inner = 0;
+            if (r0 < 0)
+                return false;
+
+            for (int i = r0; i <= r1; i++)
+            {
+                if (!reduced[i])
+                    return false;
+            }
+
+            outer = 1;
+            for (int i = 0; i < r0; i++)
+                outer *= dims[i];
+
+            mid = 1;
+            for (int i = r0; i <= r1; i++)
+                mid *= dims[i];
+
+            inner = 1;
+            for (int i = r1 + 1; i < dims.Length; i++)
+                inner *= dims[i];
+
+            return true;
+        }
+
+        private unsafe void ReduceBlocks(ReadOnlySpan<float> src, Span<float> dst, int outer, int mid, int inner)
+        {
+            bool isMax = _kind == ReduceKind.Max;
+            float identity = isMax ? float.NegativeInfinity : 0f;
+
+            for (int o = 0; o < outer; o++)
+            {
+                var block = src.Slice(o * mid * inner, mid * inner);
+                var result = dst.Slice(o * inner, inner);
+
+                if (mid == 1)
+                {
+                    block.Slice(0, inner).CopyTo(result);
+                    continue;
+                }
+
+                fixed (float* pBlock = block)
+                fixed (float* pResult = result)
+                {
+                    if (inner == 1)
+                    {
+                        // 归约最后一维：源连续，直接 8 路累加
+                        int i = 0;
+                        float acc = identity;
+
+                        if (Avx.IsSupported && mid >= 8)
+                        {
+                            var v = Vector256.Create(identity);
+                            for (; i <= mid - 8; i += 8)
+                            {
+                                var x = Avx.LoadVector256(pBlock + i);
+                                v = isMax ? Avx.Max(v, x) : Avx.Add(v, x);
+                            }
+
+                            acc = isMax ? MaxLanes(v) : SumLanes(v);
+                        }
+
+                        for (; i < mid; i++)
+                            acc = isMax ? MathF.Max(acc, pBlock[i]) : acc + pBlock[i];
+
+                        pResult[0] = acc;
+                        continue;
+                    }
+
+                    int j = 0;
+                    if (Avx.IsSupported && inner >= 8)
+                    {
+                        for (; j <= inner - 8; j += 8)
+                        {
+                            var acc = Vector256.Create(identity);
+                            for (int m = 0; m < mid; m++)
+                            {
+                                var x = Avx.LoadVector256(pBlock + (long)m * inner + j);
+                                acc = isMax ? Avx.Max(acc, x) : Avx.Add(acc, x);
+                            }
+
+                            Avx.Store(pResult + j, acc);
+                        }
+                    }
+
+                    for (; j < inner; j++)
+                    {
+                        float acc = identity;
+                        for (int m = 0; m < mid; m++)
+                        {
+                            float value = pBlock[(long)m * inner + j];
+                            acc = isMax ? MathF.Max(acc, value) : acc + value;
+                        }
+
+                        pResult[j] = acc;
+                    }
+                }
+            }
+        }
+
+        private static float SumLanes(Vector256<float> v)
+            => Vector128.Sum(Avx.Add(v.GetLower(), v.GetUpper()));
+
+        private static float MaxLanes(Vector256<float> v)
+        {
+            var lo = Avx.Max(v.GetLower(), v.GetUpper());
+            lo = Vector128.Max(lo, Vector128.Shuffle(lo, Vector128.Create(2, 3, 0, 1)));
+            return MathF.Max(lo.GetElement(0), lo.GetElement(1));
         }
 
         /// <summary>形状链里的整数归约（如 ReduceSum(shape, ...)）。</summary>
