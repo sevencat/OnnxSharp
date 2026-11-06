@@ -35,5 +35,7 @@ public static class LayerRegistry
 
         Ops.NaryEltwiseLayer.Register();
         Ops.ActivationLayer.Register();
+        Ops.ShapeOps.Register();
+        Ops.DnnOps.Register();
     }
 }

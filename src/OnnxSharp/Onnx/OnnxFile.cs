@@ -72,6 +72,20 @@ internal sealed class OnnxFile
 
     public required IReadOnlyList<OnnxValueInfo> ValueInfos { get; init; }
 
+    /// <summary>仅用于测试/工具：构造一个空的模型壳子（<see cref="DecodeTensor"/> 只需要 BaseDirectory）。</summary>
+    internal static OnnxFile CreateBare(string baseDirectory) => new()
+    {
+        Path = "",
+        BaseDirectory = baseDirectory,
+        Opset = 0,
+        Producer = "",
+        Nodes = Array.Empty<OnnxNodeProto>(),
+        Initializers = new Dictionary<string, Tensor>(0, StringComparer.Ordinal),
+        Inputs = Array.Empty<OnnxValueInfo>(),
+        Outputs = Array.Empty<OnnxValueInfo>(),
+        ValueInfos = Array.Empty<OnnxValueInfo>(),
+    };
+
     public static OnnxFile Load(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
@@ -147,9 +161,9 @@ internal sealed class OnnxFile
             Producer = file.Producer,
             Nodes = nodes,
             Initializers = initializers,
-            Inputs = ValueInfos(graph, 11, initializers),
-            Outputs = ValueInfos(graph, 12, null),
-            ValueInfos = ValueInfos(graph, 13, null),
+            Inputs = ReadValueInfos(graph, 11, initializers),
+            Outputs = ReadValueInfos(graph, 12, null),
+            ValueInfos = ReadValueInfos(graph, 13, null),
         };
     }
 
@@ -163,7 +177,7 @@ internal sealed class OnnxFile
         for (int i = 0; i < dims.Length; i++)
             shapeDims[i] = checked((int)dims[i]);
 
-        var dtype = MapDType((int)tensorProto.Int(2));
+        var dtype = MapDType((int)tensorProto.Int(2), $"tensor '{debugName}'");
         var shape = new TensorShape(shapeDims);
         var tensor = Tensor.Allocate(shape, dtype);
 
@@ -326,34 +340,41 @@ internal sealed class OnnxFile
         }
     }
 
-    private static DType MapDType(int onnxType) => onnxType switch
+    /// <summary>
+    /// ONNX <c>TensorProto.DataType</c> → <see cref="DType"/>。
+    /// 注意该枚举从 <c>FLOAT = 1</c> 起（UNDEFINED 占 0）。
+    /// </summary>
+    private static DType MapDType(int onnxType, string context) => onnxType switch
     {
-        2 => DType.F32,     // FLOAT
-        3 => DType.U8,      // UINT8
-        4 => DType.I8,      // INT8
-        7 => DType.I32,     // INT32
-        8 => DType.I64,     // INT64
-        10 => DType.Bool,   // BOOL
-        11 => DType.F16,    // FLOAT16
+        1 => DType.F32,     // FLOAT
+        2 => DType.U8,      // UINT8
+        3 => DType.I8,      // INT8
+        6 => DType.I32,     // INT32
+        7 => DType.I64,     // INT64
+        9 => DType.Bool,    // BOOL
+        10 => DType.F16,    // FLOAT16
         _ => throw new OnnxSharpException(
-            $"unsupported ONNX data_type {onnxType}; supported: 2(F32) 3(U8) 4(I8) 7(I32) 8(I64) 10(Bool) 11(F16)"),
+            $"{context}: unsupported ONNX data_type {onnxType}; supported: 1(F32) 2(U8) 3(I8) 6(I32) 7(I64) 9(Bool) 10(F16)"),
     };
 
     // ---------------- graph 元信息 ----------------
 
+    /// <summary>
+    /// 读取 repeated string 字段。
+    /// <para>
+    /// <b>必须保留空串</b>：ONNX 用 <c>""</c> 占位「可选输入」（如
+    /// <c>Resize(X, "", scales)</c>），丢掉空串会让后面的输入整体错位。
+    /// </para>
+    /// </summary>
     private static string[] Strings(Proto message, int field)
     {
         var list = new List<string>(4);
         foreach (var buffer in message.Buffers(field))
-        {
-            var text = System.Text.Encoding.UTF8.GetString(buffer.Span);
-            if (text.Length != 0)
-                list.Add(text);
-        }
+            list.Add(System.Text.Encoding.UTF8.GetString(buffer.Span));
         return list.ToArray();
     }
 
-    private static List<OnnxValueInfo> ValueInfos(
+    private static List<OnnxValueInfo> ReadValueInfos(
         Proto graph, int field, IReadOnlyDictionary<string, Tensor>? initializers)
     {
         var result = new List<OnnxValueInfo>();
@@ -382,7 +403,7 @@ internal sealed class OnnxFile
             }
 
             var tensorType = Proto.Parse(tensorTypeMessage);
-            var dtype = MapDType((int)tensorType.Int(1, 2));
+            var dtype = MapDType((int)tensorType.Int(1, 2), $"value_info '{name}'");
 
             var dims = Array.Empty<int>();
             if (tensorType.Buffer(2) is { } shapeMessage)

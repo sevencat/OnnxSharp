@@ -13,6 +13,7 @@ internal static class Harness
     {
         var list = cases.ToList();
         int passed = 0;
+        int skipped = 0;
         var failures = new List<string>();
 
         Console.WriteLine($"running {list.Count} test(s)");
@@ -24,6 +25,11 @@ internal static class Harness
                 passed++;
                 Console.WriteLine($"  PASS  {test.Name}");
             }
+            catch (TestSkipException e)
+            {
+                skipped++;
+                Console.WriteLine($"  SKIP  {test.Name} ({e.Message})");
+            }
             catch (Exception e)
             {
                 failures.Add(test.Name);
@@ -33,7 +39,7 @@ internal static class Harness
         }
 
         Console.WriteLine();
-        Console.WriteLine($"{passed}/{list.Count} passed, {failures.Count} failed");
+        Console.WriteLine($"{passed}/{list.Count} passed, {skipped} skipped, {failures.Count} failed");
         if (failures.Count > 0)
         {
             Console.WriteLine("failed:");
@@ -105,3 +111,6 @@ internal static class Assert
 }
 
 internal sealed class TestFailureException(string message) : Exception(message);
+
+/// <summary>环境不满足（如参考模型不存在）时用，不计入失败。</summary>
+internal sealed class TestSkipException(string message) : Exception(message);

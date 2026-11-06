@@ -25,6 +25,8 @@ public sealed class LayerParams
 
     public void Set(string key, long[] value) => _dict[key] = DictValue.FromInts(value);
 
+    public void Set(string key, string[] value) => _dict[key] = DictValue.FromStrings(value);
+
     public void Set(string key, int[] value) => _dict[key] = DictValue.FromInts(Array.ConvertAll(value, x => (long)x));
 
     public void Set(string key, float[] value) => _dict[key] = DictValue.FromFloats(Array.ConvertAll(value, x => (double)x));

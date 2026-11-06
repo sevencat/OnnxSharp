@@ -1,6 +1,6 @@
 # OnnxSharp 杂项
 
-> 与 `plan.md` 分离的“事实库”：实测数据、源码地图、环境、坑、脚本、备忘。
+> 与 `plan.md` 分离的"事实库"：实测数据、源码地图、环境、坑、脚本、备忘。
 > 本文件允许频繁追加，不追求结构性。
 
 ---
@@ -421,11 +421,11 @@ Tile TopK Transpose Unsqueeze Where
 
 ### 6.1 ONNX opset 17/19 相关
 
-1. **参数走 input 而非 attribute**：`Slice`、`Split`、`Resize`、`ReduceSum`、`Expand`、`Tile`、`TopK`(k)、`Pad`、`Clip` 的参数是张量输入（多来自 initializer）→ `LayerParams` 必须支持“从 const 输入取属性”。
+1. **参数走 input 而非 attribute**：`Slice`、`Split`、`Resize`、`ReduceSum`、`Expand`、`Tile`、`TopK`(k)、`Pad`、`Clip` 的参数是张量输入（多来自 initializer）→ `LayerParams` 必须支持"从 const 输入取属性"。
 2. **`Split`**：opset 13+ 的 `split` 是可选 input；缺省时按输出个数均分，除不尽时**最后一组更小**。
 3. **`Slice`**：`starts/ends/axes/steps` 均可为负；`ends` 可能是 `INT64_MAX`（表示到末尾）。
-4. **`Resize`**：`coordinate_transformation_mode=asymmetric` + `nearest_mode=floor` → `src = floor(dst * scale)`；与常见“四舍五入”实现不同，必须照 floor。
-5. **`Reshape`**：`allowzero=0` 时 `0` 表示“复制输入对应维”，`-1` 表示推断；`allowzero=1` 时 `0` 是真正的 0。两个目标模型都带 `allowzero` 属性。
+4. **`Resize`**：`coordinate_transformation_mode=asymmetric` + `nearest_mode=floor` → `src = floor(dst * scale)`；与常见"四舍五入"实现不同，必须照 floor。
+5. **`Reshape`**：`allowzero=0` 时 `0` 表示"复制输入对应维"，`-1` 表示推断；`allowzero=1` 时 `0` 是真正的 0。两个目标模型都带 `allowzero` 属性。
 6. **`ReduceSum`**：opset 13+ 的 `axes` 是输入；`noop_with_empty_axes=1` 且 axes 为空 → 不归约（identity）；`=0` → 归约所有轴。
 7. **`TopK`**：`k` 是 int64 输入张量；输出两个（values + indices）。
 8. **`ConstantOfShape`**：`value` 属性是 TensorProto（取第 0 个元素填充）。
@@ -479,6 +479,16 @@ Tile TopK Transpose Unsqueeze Where
     ```
 
     yolo11n 的 2 处 `Resize` 都是 2× 上采样（`in*scale` 为整数），两种写法结果相同 → 当前不受影响，但**实现必须按 `1/scale`**，否则换成非整数倍率（如 640→400）会错。另外上游 importer 会把常量 `scales` 折进 `zoom_factor_*`，我们的 handler 也应把常量 `scales` 搬进 `LayerParams`，避免在 shape 推断时反复读输入。`align_corners=1` 时保持 shape 推导的 `(in-1)/(out-1)`；`sizes` 与 `tf_crop_and_resize` 不使用该 scale。
+
+31. **`TensorProto.DataType` 从 `FLOAT = 1` 开始，不是 2**（`UNDEFINED = 0` 占位）。完整表：`1 FLOAT / 2 UINT8 / 3 INT8 / 4 UINT16 / 5 INT16 / 6 INT32 / 7 INT64 / 8 STRING / 9 BOOL / 10 FLOAT16 / 11 DOUBLE / 12 UINT32 / 13 UINT64 / 16 BFLOAT16`。按「从 0 数」写会整体偏移一位，两个目标模型都会在**第一个 conv 权重**（`model.0.conv.weight`）上报 `unsupported data_type 1`——这是最快的自查信号。首版只接受 1/2/3/6/7/9/10，其余显式报错而不是静默退化。
+
+32. **RF-DETR 是双输出**：`dets:F32[1,300,4]` + `labels:F32[1,300,91]`（早前文档只记了 `dets`）。因此 `Net.Forward()` 的无参重载对 RF-DETR 不成立，验收脚本一律用 `Forward(name)` / `ForwardAll()`。两模型输入都是**静态形状**（RF-DETR 是 `[1,3,512,512]`，不是动态 512 可变）。
+
+33. **`Constant` 节点才是 I64/Bool 的主来源**：RF-DETR 的 459 个 `Constant` 里有 379 个 I64 + 80 个 F32 张量，而 354 个 initializer 全是 F32。importer 必须两条路都支持（initializer→Const Arg、`Constant` 节点→Const Arg），否则 `Shape/Slice/Gather/Where` 全部拿不到索引值。
+
+34. **重复字符串字段里的空串是「占位符」，绝不能过滤掉**。ONNX 用 `""` 表示「这个可选输入不存在」，但**位置必须保留**：yolo11n 的 Resize 是 `Resize(X, "", scales)`，把空串过滤掉后 `scales` 会滑到 index 1（`roi`），handler 按 `inputs[2]` 取 scales 就取不到，报「neither scales nor scales provided」。同理 `Split(X, "", ...)`、`Resize` 的 `sizes`。解析层一律原样保留（见 `OnnxFile.Strings`），由各 handler 用 `Inputs[i].Idx != 0` 判断占位。
+
+35. **`ArgData.Shape` 与 `Tensor.Shape` 不是一回事**。共享缓冲槽会被后续算子反复 `Fit`，所以 `GetArgTensor(arg).Shape` 读到的是**该槽最后一次写入的形状**，而 `GetArgData(arg).Shape` 才是「这个 Arg 被生产时」的形状。凡是「事后」检查/打印中间张量形状的地方（形状对齐测试、`dump-graph`）都必须读 `ArgData`；第一版 `dump-graph` 就是踩了这个坑，打印出满屏相同的形状。
 
 ---
 
@@ -576,22 +586,59 @@ dotnet build OnnxSharp.slnx
 # 测试（零依赖运行器；退出码 0 = 全通过）
 dotnet run --project tests/OnnxSharp.Tests
 
-# CLI 冒烟 / 后续子命令
+# CLI：冒烟 / ONNX 结构统计（M1 已可用）
+dotnet run --project tools/OnnxSharp.Cli -- info F:\ai\models\yolo\yolo11n.onnx
+dotnet run --project tools/OnnxSharp.Cli -- info F:\ai\rfdetr\onnx_model\rfdetr-small.onnx
+
+# CLI：导入成图并打印每个节点的推断形状（纯 shape 推断，不跑 kernel）
 dotnet run --project tools/OnnxSharp.Cli -- dump-graph F:\ai\models\yolo\yolo11n.onnx
+dotnet run --project tools/OnnxSharp.Cli -- dump-graph F:\ai\models\yolo\yolo11n.onnx --type Conv --limit 5
+
+# 生成 / 刷新对照数据（形状 oracle + ORT golden）
+python tools/scripts/dump_shapes.py F:\ai\models\yolo\yolo11n.onnx --out tests/data/yolo11n.shapes.tsv
+python tools/scripts/gen_golden.py F:\ai\models\yolo\yolo11n.onnx F:\ai\models\yolo\golden\yolo11n
+
+# 后续子命令
 dotnet run --project tools/OnnxSharp.Cli -- run F:\ai\models\yolo\yolo11n.onnx --input test.bin
 dotnet run --project tools/OnnxSharp.Cli -- bench F:\ai\rfdetr\onnx_model\rfdetr-small.onnx --iters 20
 ```
 
-M0.5 完成时的实测输出：
+M1 + M2（Conv）完成时的实测输出：
 
 ```
 $ dotnet build OnnxSharp.slnx
 已成功生成。0 个警告 0 个错误
 
 $ dotnet run --project tests/OnnxSharp.Tests
-running 16 test(s)
-... 16/16 passed, 0 failed
+running 25 test(s)
+... 25/25 passed, 0 skipped, 0 failed
+
+$ dotnet run --project tools/OnnxSharp.Cli -- info F:\ai\models\yolo\yolo11n.onnx
+file      : F:\ai\models\yolo\yolo11n.onnx (10.2 MB)
+producer  : pytorch    opset: 19
+loaded in : 22 ms
+nodes     : 320
+inits     : 196 (10.1 MB)
+inputs    : images:F32[1,3,640,640]
+outputs   : output0:F32[1,84,8400]
+
+$ dotnet run --project tools/OnnxSharp.Cli -- dump-graph F:\ai\models\yolo\yolo11n.onnx --limit 1
+imported  : 51 ms    ops: 320    slots: 10
+  [   1] Conv         /model.0/conv/Conv     -> F32 [1,16,320,320]
+
+$ dotnet run --project tests/OnnxSharp.Tests
+        compared 333 tensors against oracle (333 entries)
+  PASS  shapes: yolo11n matches onnx.shape_inference
+        forward 5382 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
+  PASS  yolo11n: end-to-end matches onnxruntime golden
 ```
+
+> 注意：**26 个 `TensorProto.DataType` 变体里 `FLOAT = 1`**（`UNDEFINED = 0` 占位）。
+> 实现时按「从 0 开始」写偏移一位，两个模型都会在第一个 conv 权重上报 `unsupported data_type 1`。
+> `misc.md` 坑 #31 已登记。
+
+> `max|diff|` 1.9e-3 出现在量级 ~267 的输出上（相对误差 ~7e-6），是累加顺序差异，不是算错。
+> 5.4 s 是标量直接卷积的耗时，性能优化在 M4。
 
 ---
 
@@ -627,15 +674,27 @@ F:\code\OnnxSharp\
 │  ├─ Core\Net.cs                        门面（ReadModel 待 M1）
 │  ├─ Core\OnnxSharpException.cs
 │  ├─ Engine\BufferAllocator.cs          生命周期区间着色，共享缓冲槽             [M0.5]
+│  ├─ Onnx\Proto.cs                      protobuf 消息视图（零拷贝）             [M1]
+│  ├─ Onnx\OnnxFile.cs                   模型结构 + TensorProto 解码             [M1]
+│  ├─ Onnx\OnnxImporter.cs               图导入：initializer/Constant→Const Arg、value_info、属性 [M1]
+│  ├─ Ops\OpUtil.cs                      广播/轴/常量读取等公共工具              [M1]
+│  ├─ Ops\ShapeOps.cs                    Shape/Reshape/Transpose/Concat/Split/Slice/Gather [M1]
+│  ├─ Ops\DnnOps.cs                      Conv/MaxPool/Resize/Softmax/MatMul        [M1+M2]
+│  ├─ Kernels\ConvKernels.cs             直接卷积（group/stride/dilation/pad）    [M2]
 │  ├─ Threading\ParallelRange.cs         parallel_for_ 等价物
 │  ├─ Ops\NaryEltwiseLayer.cs            Add/Sub/Mul/Div/Max/Min
 │  └─ Ops\ActivationLayer.cs             Relu/Sigmoid/Sqrt/Exp/Neg/Abs
-├─ tests\OnnxSharp.Tests\                零依赖测试运行器；16 个用例（net10.0） [M0.5]
-│  ├─ Harness.cs                         TestCase / Assert / RunAll
+├─ tests\OnnxSharp.Tests\                零依赖测试运行器；25 个用例（net10.0）
+│  ├─ Harness.cs                         TestCase / Assert / RunAll / Skip
 │  ├─ ArgTableTests.cs                   Declare/Require/TryGetArg/常量元信息
 │  ├─ BufferAllocatorTests.cs            槽复用、并发分支、图输出存活、保守策略
 │  ├─ EngineTests.cs                     常量驱动形状、temp 池、动态形状、图变更
+│  ├─ OnnxReaderTests.cs                 protobuf/类型解码 + 两模型结构断言   [M1]
+│  ├─ OnnxShapeTests.cs                  333 张量形状 vs onnx.shape_inference [M1]
+│  ├─ YoloGoldenTests.cs                 yolo11n 端到端 vs ORT golden        [M2]
 │  └─ TestLayers.cs                      ReadConstShapeLayer / DynamicFillLayer
+├─ tools\scripts\dump_shapes.py         生成形状 oracle（onnx.shape_inference）
+├─ tools\scripts\gen_golden.py          生成 ORT golden 张量               [M2]
 └─ tools\OnnxSharp.Cli\                  冒烟测试（手工建图 Add+Relu）
 ```
 
@@ -682,6 +741,9 @@ SMOKE TEST: PASS
 | 2026-11-07 | 新增 **§11 上游 OpenCV 5 dnn 变更跟踪**：基线 `5.x @ 43f8b1f5`（2026-11-06）、实测变更规模（6 个月 333 条 / 30 天 99 条）、只读 fetch 命令集、路径→本项目模块映射表、改动分类处理规则、跟踪记录模板，并完成首批 4 条评估（含 `resize2_layer` 的 `step = 1/scale` 修复） |
 | 2026-11-07 | §11.1 升级为**跟踪版本台账（单一事实源）**：当前跟踪提交 + 提交日期/主题 + 校验命令（`rev-parse` / `log 43f8b1f5..origin/5.x`）+ **版本推进记录表（只增不改）**；`plan.md §13.1` 改为引用该台账 |
 | 2026-11-07 | 新增仓库根 **`upstream.lock`**（JSON：remote/branch/commit/scope/verify 命令/history），与 §11.1 互为镜像 |
+| 2026-11-07 | **M1 完成**：`Onnx/OnnxImporter.cs`（initializer/Constant→Const Arg、value_info→shape/dtype、属性解析）、`Ops/OpUtil.cs` + `Ops/ShapeOps.cs` + `Ops/DnnOps.cs`（yolo 所需 15 类算子）、CLI `dump-graph`、`OnnxShapeTests`（333 张量全对齐）、`Net.ReadModel` 打通。新增坑 #34（空串占位输入）、#35（`ArgData.Shape` ≠ `Tensor.Shape`） |
+| 2026-11-07 | **M2 第一批完成**：`Kernels/ConvKernels.cs` 直接卷积；`tools/scripts/gen_golden.py` + `YoloGoldenTests` 打通 ORT 对照；**yolo11n 端到端跑通，max\\|diff\\|=1.9e-3 / mean\\|diff\\|=3.3e-6，耗时 5.4 s**（标量版，性能留给 M4）。25/25 PASS |
+| 2026-11-07 | **M1 第一批完成**：`Onnx/Proto.cs`（零拷贝 protobuf 视图）、`Onnx/OnnxFile.cs`（结构 + TensorProto 解码，含外部数据路径校验）、CLI `info` 子命令、`OnnxReaderTests`（7 个用例）。实测 yolo11n 22ms/320 节点/196 init，rfdetr-small 91ms/1539 节点/354 init。新增坑 #31（DataType 从 1 起）、#32（RF-DETR 双输出）、#33（Constant 才是 I64 来源） |
 | 2026-11-07 | **M0.5 落地完成**：`Engine/BufferAllocator.cs`（生命周期着色）、`LayerInfo.Net` + `In()/IsConstInput()`、`Graph.Version/Reset/RemoveAll`、`NetImpl` 槽池 + `FitTemps` + `Declare/Require/TryGetArg`、`Interpreter` 动态形状分支 + 类型签名、`Tensors/Layout.cs` 预留、`tests/OnnxSharp.Tests`（零依赖 16 用例）。`dotnet build` 0 警告 0 错误，16/16 PASS |
 
 ---

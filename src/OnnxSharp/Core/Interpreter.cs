@@ -10,7 +10,11 @@ internal static class Interpreter
 {
     private static readonly IReadOnlyList<Tensor> NoTemps = Array.Empty<Tensor>();
 
-    public static void Run(NetImpl net, Graph graph)
+    /// <summary>
+    /// 执行整张图。<paramref name="executeLayers"/> = false 时只做形状/类型推断与缓冲绑定，
+    /// 不调用 <see cref="Layer.Forward"/>（供 `dump-graph` 与形状对齐测试使用）。
+    /// </summary>
+    public static void Run(NetImpl net, Graph graph, bool executeLayers = true)
     {
         // 绑定 LayerInfo.Net 并按生命周期分槽（图结构变化时才重算）。
         net.PrepareForGraph(graph);
@@ -82,6 +86,16 @@ internal static class Interpreter
 
             if (op is not Layer layer)
                 throw new OnnxSharpException($"op '{op.Name}' ({op.Type}) has no executor");
+
+            if (!executeLayers)
+            {
+                // 形状对齐模式：动态 op 的形状无法在不执行的情况下推断
+                if (op.DynamicOutputShapes())
+                    throw new OnnxSharpException(
+                        $"op '{op.Name}' ({op.Type}) has dynamic output shapes; " +
+                        "shape-only mode cannot infer them");
+                continue;
+            }
 
             bool signatureChanged = !layer.FinalizedOnce
                 || !SameShapes(layer.LastInShapes, inpShapes)

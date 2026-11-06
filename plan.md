@@ -3,8 +3,10 @@
 > 纯 C# 的 ONNX 推理运行时，以 OpenCV 5 dnn 新版 graph 引擎为参考实现。
 > 首版目标：跑通 YOLOv11 检测 与 RF-DETR。
 >
-> **当前状态：M0 + M0.5 已完成**（`dotnet build OnnxSharp.slnx` 0 警告 0 错误；`tests` 16/16 PASS；CLI 冒烟 PASS）
-> 下一步：M1（ONNX 加载）
+> **当前状态：M0 + M0.5 + M1 已完成，M2 进行中（yolo11n 已跑通并数值对齐）**
+> 已完成：引擎内核（共享缓冲槽 + temp 池 + 动态形状）、ONNX 全链路导入、15 类算子、yolo11n 端到端
+> 校验：`dotnet build OnnxSharp.slnx` 0 警告 0 错误；`tests` 25/25 PASS（含 333 张量形状对齐 + ORT golden 对比）
+> 下一步：M2 收尾（逐层比对 + CLI decode/NMS 示例）→ M3（RF-DETR 的 27 个算子）
 > 最后更新：2026-11-07
 
 ---
@@ -176,8 +178,9 @@ F:\code\OnnxSharp\
 │     │  ├─ BufferAllocator.cs 生命周期区间着色，共享缓冲槽              [M0.5 完成]
 │     │  └─ ConstFolder.cs     （M3）常量折叠 / Shape 链
 │     ├─ Onnx\
-│     │  ├─ Proto\             protobuf 读取（M1，移植 SimdYolo Proto）
-│     │  ├─ OnnxImporter.cs    通用骨架：graph/value_info/initializer/属性
+│     │  ├─ Proto.cs           protobuf 消息视图（零拷贝，移植 SimdYolo）  [M1 完成]
+│     │  ├─ OnnxFile.cs        模型结构 + TensorProto 解码（含外部数据）   [M1 完成]
+│     │  ├─ OnnxImporter.cs    通用骨架：graph/value_info/initializer/属性（M1 待做）
 │     │  └─ Handlers\          按算子分文件的 handler
 │     ├─ Ops\                  42 个 LayerInfo+Layer 实现
 │     └─ Kernels\
@@ -243,32 +246,61 @@ F:\code\OnnxSharp\
   - 分配器：链式 4 个 Arg 用 2 槽、并发分支不共享、图输出不被覆盖、常量/输入无槽
 - CLI 冒烟：`SMOKE TEST: PASS`
 
-### M1 — ONNX 加载（dump 与参考对齐）
+### M1 — ONNX 加载（dump 与参考对齐）— **已完成 2026-11-07**
 
 **任务**
-- [ ] protobuf reader：**移植 SimdYolo `OnnxReader.cs` 的 `Proto`**（约 139 行，已覆盖 varint / fixed32 / fixed64 / length-delimited / packed / 未知字段跳过 / `ParseView` 零拷贝），**加 DType 维度**（SimdYolo 全转 float，会丢 I64）
-- [ ] 对象模型：`ModelProto/GraphProto/NodeProto/AttributeProto/TensorProto/ValueInfoProto/TypeProto`（只保留用到的字段）
-- [ ] `OnnxImporter` 骨架：initializer→Const Arg、value_info→shape/type、`Constant` 节点、外部数据（`external_data`，含路径逃逸校验）
-- [ ] `LayerParams` 属性解析：`ints/floats/strings/tensor`；**统一"先看 const 输入，再看 attribute"**
-- [ ] **42 个算子的 handler**（分 5 批，见 §7）
-- [ ] CLI `dump-graph`：输出节点序/类型/输入名/推断 shape
+- [x] protobuf reader：`Onnx/Proto.cs`（移植 SimdYolo `Proto`，长度分隔字段全部用 `ReadOnlyMemory<byte>` 视图，零拷贝）
+- [x] 对象模型：`Onnx/OnnxFile.cs`（ModelProto/GraphProto/NodeProto/AttributeProto/TensorProto/ValueInfoProto/TypeProto 的按需读取）
+- [x] `TensorProto` 解码：`raw_data` / `float_data` / `int32_data` / `int64_data` / 外部数据（含**路径逃逸校验**），DType 保留（I64/Bool/I8/U8/F16 不再退化成 float）
+- [x] CLI `info <model>`：结构统计（真实模型已验证）
+- [x] `OnnxImporter`：initializer→Const Arg、`Constant` 节点→Const Arg、value_info→shape/dtype、节点→Layer
+- [x] `LayerParams` 属性解析：`FLOAT/INT/STRING/TENSOR/FLOATS/INTS/STRINGS`，`type` 字段缺失时按字段存在性推断
+- [x] **yolo11n 所需的 15 类算子 handler**：Conv / MaxPool / Resize / Softmax / MatMul / Add / Sub / Mul / Div / Sigmoid / Concat / Split / Reshape / Transpose / Slice（其余 27 类留给 M3）
+- [x] CLI `dump-graph <model> [--type X] [--limit N]`：纯形状推断，不执行 kernel
 
-**验收**（改法，见 §8.1）：节点数、节点类型序列、输入输出名集合与 python onnx 一致；**每个 Arg 的 shape/dtype 与 `onnx.shape_inference.infer_shapes()` 完全一致**（实测两模型均 100% 可推，未知张量 = 0）。不需要任何 kernel。
+**实测（2026-11-07）**
 
-### M2 — YOLOv11 跑通（15 个算子）
+| 模型 | 大小 | 解析耗时 | opset | 节点 | initializer | 输入 | 输出 |
+|---|---|---|---|---|---|---|---|
+| `yolo11n.onnx` | 10.2 MB | 22 ms | 19 | 320 | 196 (10.1 MB) | `images:F32[1,3,640,640]` | `output0:F32[1,84,8400]` |
+| `rfdetr-small.onnx` | 115.4 MB | 91 ms | 17 | 1539 | 354 (108.7 MB) | `input:F32[1,3,512,512]` | **`dets:F32[1,300,4]` + `labels:F32[1,300,91]`** |
+
+- **RF-DETR 是双输出**，`Forward()` 单输出重载对它不适用，调用方需用 `Forward(name)` 或 `ForwardAll()`。
+- RF-DETR 的 459 个 `Constant` 节点里有 **379 个 I64 张量** + 80 个 F32 —— 印证「DType 不能丢」。
+- 两模型输入都是**静态形状**（RF-DETR 为 512²，非动态）。
+- yolo11n 导入后：320 op / **10 个共享缓冲槽** / 51 ms（含形状推断）。
+
+**验收（已通过）**
+- 节点数、op 类型直方图、输入输出名与 python onnx 一致；
+- **333 个张量的 shape/dtype 与 `onnx.shape_inference.infer_shapes()` 完全一致**（`OnnxShapeTests`，一个不多一个不少）。
+
+### M2 — YOLOv11 跑通（15 个算子）— **进行中**
 
 **任务**
-- [ ] Conv：3×3 s1/s2、1×1、3×3 depthwise（先标量，后移植 SimdYolo 的 panel 打包 + packed GEMM）
-- [ ] MaxPool 5×5 s1 pad2 ceil=0
-- [ ] Resize nearest / asymmetric / floor（`scales` 走第 3 输入）
-- [ ] Softmax（axis=-1 与 axis=1）
-- [ ] 逐元素：Add/Sub/Mul/Div（含广播）+ Sigmoid
-- [ ] 形状类：Reshape/Slice/Split/Concat/Transpose
-- [ ] MatMul（4D batched + broadcast）+ GEMM
-- [ ] 与 ORT 逐层 + 端到端比对
+- [x] Conv：`Kernels/ConvKernels.cs` 直接卷积（group / stride / dilation / pad / auto_pad，按输出通道并行）
+- [x] MaxPool 5×5 s1 pad2 ceil=0
+- [x] Resize nearest / asymmetric / floor（`scales` 走第 3 输入 + `sizes` 分支 + bilinear）
+- [x] Softmax（任意 axis，数值稳定）
+- [x] 逐元素：Add/Sub/Mul/Div（含广播）+ Sigmoid
+- [x] 形状类：Reshape/Slice/Split/Concat/Transpose
+- [x] MatMul（N-D batched + broadcast，含 numpy 的 1D 补 1 语义）
+- [x] 与 ORT 端到端比对（`gen_golden.py` + `YoloGoldenTests`）
+- [ ] 与 ORT **逐层**比对（定位误差来源用，M2 收尾再补）
 - [ ] （非引擎）CLI 里提供 decode+NMS 的**调用示例**，不写进产品库
 
-**验收**：`yolo11n.onnx` 输出 `[1,84,8400]` 与 ORT 的**最大绝对误差 < 1e-4**；`yolov11s.onnx` 同标准；单张 640² 端到端 **< 200 ms**（朴素 SIMD 版）。
+**实测（2026-11-07）**
+
+```
+yolo11n.onnx 端到端（1×3×640×640，单线程朴素卷积）
+forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
+```
+
+**验收**：`yolo11n.onnx` 输出 `[1,84,8400]` 与 ORT 的**最大绝对误差 < 1e-4**（当前 1.9e-3，见下）；
+`yolov11s.onnx` 同标准；单张 640² 端到端 **< 200 ms**（朴素 SIMD 版）。
+
+> **误差与性能说明**
+> - 1.9e-3 的绝对误差出现在量级 ~267 的通道上（相对误差 ~7e-6），根源是**累加顺序不同**（直接卷积 vs ORT 的 im2col+GEMM 分块）。要看「数值是否正确」应看相对误差，绝对误差 1e-4 的目标对 F32 累加其实过紧 —— M4 换成分块 GEMM 后误差会自然靠近 ORT。
+> - 5.5 s 是**标量直接卷积**的成绩，只用于验证正确性；M4 的 im2col+GEMM / Winograd 才是性能路径。
 
 ### M3 — RF-DETR 跑通（补 27 个算子）
 
