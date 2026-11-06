@@ -357,6 +357,24 @@ static int Profile(string[] args)
         Console.WriteLine($"{++index,4}  {timing.Type,-18}{timing.Average,10:F2}{timing.Milliseconds / total * 100,7:F1}%  {timing.Name}");
     }
 
+    // 按算子类型汇总：热点分散时（几百个 op 各占 1%）看这个更有用
+    Console.WriteLine();
+    Console.WriteLine($"{"type",-20}{"ops",6}{"avg ms",10}{"share",8}");
+
+    var byType = timings
+        .GroupBy(t => t.Type)
+        .Select(g => new
+        {
+            Type = g.Key,
+            Ops = g.Count(),
+            Milliseconds = g.Sum(t => t.Milliseconds) / iters,
+            Share = g.Sum(t => t.Milliseconds) / total * 100,
+        })
+        .OrderByDescending(g => g.Milliseconds);
+
+    foreach (var group in byType)
+        Console.WriteLine($"{group.Type,-20}{group.Ops,6}{group.Milliseconds,10:F1}{group.Share,7:F1}%");
+
     return 0;
 }
 

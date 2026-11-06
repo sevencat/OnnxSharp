@@ -1,3 +1,4 @@
+using System.Numerics;
 using OnnxSharp.Core;
 
 namespace OnnxSharp.Tensors;
@@ -77,8 +78,36 @@ public static class TensorOps
         if (a.Shape.Equals(c.Shape) && b.Shape.Equals(c.Shape))
         {
             // 无广播快速路径
-            for (int i = 0; i < sc.Length; i++)
-                sc[i] = Apply(op, sa[i], sb[i]);
+            ApplyContiguous(op, sa, sb, sc);
+            return;
+        }
+
+        // 标量广播（GELU 的 x*0.5、x/√2 都是）：单独一条路径，否则会退化成
+        // 「每 1 个元素调用一次 ApplyContiguous」，比不优化还慢。
+        if (a.Shape.Equals(c.Shape) && b.Count == 1)
+        {
+            ApplyScalar(op, sa, sb[0], sc, scalarIsLeft: false);
+            return;
+        }
+
+        if (b.Shape.Equals(c.Shape) && a.Count == 1)
+        {
+            ApplyScalar(op, sb, sa[0], sc, scalarIsLeft: true);
+            return;
+        }
+
+        // 「尾部广播」快速路径：transformer 里的 bias-add / scale-mul 都是这种形状
+        // （如 [1,1024,384] + [384]），此时广播方的索引就是 i % inner，可以整段向量化。
+        if (a.Shape.Equals(c.Shape) && IsTailBroadcast(b.Shape, c.Shape, sc.Length, out int innerB))
+        {
+            ApplyBroadcast(op, sa, sb, sc, innerB, leftIsFull: true);
+            return;
+        }
+
+        if (b.Shape.Equals(c.Shape) && IsTailBroadcast(a.Shape, c.Shape, sc.Length, out int innerA))
+        {
+            // 参数顺序固定为 (全长, 重复)，再靠 leftIsFull 决定谁在 operator 左边
+            ApplyBroadcast(op, sb, sa, sc, innerA, leftIsFull: false);
             return;
         }
 
@@ -175,8 +204,61 @@ public static class TensorOps
         if (sa.Length != sc.Length)
             throw new OnnxSharpException($"unary op size mismatch: {sa.Length} vs {sc.Length}");
 
-        for (int i = 0; i < sc.Length; i++)
-            sc[i] = Apply(op, sa[i]);
+        int n = sc.Length;
+        int width = Vector<float>.Count;
+        int i = 0;
+
+        // switch 提到循环外：Erf/Sigmoid 之类每元素都要一次分派，热路径上代价很高
+        switch (op)
+        {
+            case UnaryOpKind.Relu:
+                for (; i <= n - width; i += width)
+                    Vector.Max(new Vector<float>(sa.Slice(i)), Vector<float>.Zero).CopyTo(sc.Slice(i));
+                for (; i < n; i++) sc[i] = sa[i] > 0f ? sa[i] : 0f;
+                break;
+
+            case UnaryOpKind.Neg:
+                for (; i <= n - width; i += width)
+                    (-new Vector<float>(sa.Slice(i))).CopyTo(sc.Slice(i));
+                for (; i < n; i++) sc[i] = -sa[i];
+                break;
+
+            case UnaryOpKind.Abs:
+                for (; i <= n - width; i += width)
+                    Vector.Abs(new Vector<float>(sa.Slice(i))).CopyTo(sc.Slice(i));
+                for (; i < n; i++) sc[i] = MathF.Abs(sa[i]);
+                break;
+
+            case UnaryOpKind.Sqrt:
+                for (; i <= n - width; i += width)
+                    Vector.SquareRoot(new Vector<float>(sa.Slice(i))).CopyTo(sc.Slice(i));
+                for (; i < n; i++) sc[i] = MathF.Sqrt(sa[i]);
+                break;
+
+            case UnaryOpKind.Exp:
+                for (; i < n; i++) sc[i] = MathF.Exp(sa[i]);
+                break;
+
+            case UnaryOpKind.Sigmoid:
+                for (; i < n; i++) sc[i] = 1f / (1f + MathF.Exp(-sa[i]));
+                break;
+
+            case UnaryOpKind.Erf:
+                for (; i < n; i++) sc[i] = Erf(sa[i]);
+                break;
+
+            case UnaryOpKind.Sin:
+                for (; i < n; i++) sc[i] = MathF.Sin(sa[i]);
+                break;
+
+            case UnaryOpKind.Cos:
+                for (; i < n; i++) sc[i] = MathF.Cos(sa[i]);
+                break;
+
+            default:
+                for (; i < n; i++) sc[i] = Apply(op, sa[i]);
+                break;
+        }
     }
 
     private static int[] ComputeStrides(TensorShape shape, int outRank)
@@ -191,6 +273,198 @@ public static class TensorOps
             acc *= dim;
         }
         return strides;
+    }
+
+    /// <summary>
+    /// 无广播的逐元素运算：switch 提到循环外、内层用 <see cref="Vector{T}"/>，
+    /// 这样 JIT 才能向量化。把 <c>Apply(op, ...)</c> 放进循环里是之前的性能杀手。
+    /// </summary>
+    private static void ApplyContiguous(
+        BinaryOpKind op,
+        ReadOnlySpan<float> left,
+        ReadOnlySpan<float> right,
+        Span<float> c)
+    {
+        int n = c.Length;
+        int width = Vector<float>.Count;
+        int i = 0;
+
+        switch (op)
+        {
+            case BinaryOpKind.Add:
+                for (; i <= n - width; i += width)
+                    (new Vector<float>(left.Slice(i)) + new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = left[i] + right[i];
+                break;
+
+            case BinaryOpKind.Sub:
+                for (; i <= n - width; i += width)
+                    (new Vector<float>(left.Slice(i)) - new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = left[i] - right[i];
+                break;
+
+            case BinaryOpKind.Mul:
+                for (; i <= n - width; i += width)
+                    (new Vector<float>(left.Slice(i)) * new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = left[i] * right[i];
+                break;
+
+            case BinaryOpKind.Div:
+                for (; i <= n - width; i += width)
+                    (new Vector<float>(left.Slice(i)) / new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = left[i] / right[i];
+                break;
+
+            case BinaryOpKind.Max:
+                for (; i <= n - width; i += width)
+                    Vector.Max(new Vector<float>(left.Slice(i)), new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = MathF.Max(left[i], right[i]);
+                break;
+
+            case BinaryOpKind.Min:
+                for (; i <= n - width; i += width)
+                    Vector.Min(new Vector<float>(left.Slice(i)), new Vector<float>(right.Slice(i))).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = MathF.Min(left[i], right[i]);
+                break;
+
+            default:
+                for (; i < n; i++) c[i] = Apply(op, left[i], right[i]);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 标量广播：<c>x op s</c> 或 <c>s op x</c>（<paramref name="scalarIsLeft"/> 决定顺序）。
+    /// </summary>
+    private static void ApplyScalar(
+        BinaryOpKind op,
+        ReadOnlySpan<float> x,
+        float s,
+        Span<float> c,
+        bool scalarIsLeft)
+    {
+        int n = c.Length;
+        int width = Vector<float>.Count;
+        int i = 0;
+        var sv = new Vector<float>(s);
+
+        switch (op)
+        {
+            case BinaryOpKind.Add:   // 交换律，不分左右
+                for (; i <= n - width; i += width)
+                    (new Vector<float>(x.Slice(i)) + sv).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = x[i] + s;
+                break;
+
+            case BinaryOpKind.Mul:
+                for (; i <= n - width; i += width)
+                    (new Vector<float>(x.Slice(i)) * sv).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = x[i] * s;
+                break;
+
+            case BinaryOpKind.Sub:
+                if (scalarIsLeft)
+                {
+                    for (; i <= n - width; i += width)
+                        (sv - new Vector<float>(x.Slice(i))).CopyTo(c.Slice(i));
+                    for (; i < n; i++) c[i] = s - x[i];
+                }
+                else
+                {
+                    for (; i <= n - width; i += width)
+                        (new Vector<float>(x.Slice(i)) - sv).CopyTo(c.Slice(i));
+                    for (; i < n; i++) c[i] = x[i] - s;
+                }
+                break;
+
+            case BinaryOpKind.Div:
+                if (scalarIsLeft)
+                {
+                    for (; i <= n - width; i += width)
+                        (sv / new Vector<float>(x.Slice(i))).CopyTo(c.Slice(i));
+                    for (; i < n; i++) c[i] = s / x[i];
+                }
+                else
+                {
+                    for (; i <= n - width; i += width)
+                        (new Vector<float>(x.Slice(i)) / sv).CopyTo(c.Slice(i));
+                    for (; i < n; i++) c[i] = x[i] / s;
+                }
+                break;
+
+            case BinaryOpKind.Max:
+                for (; i <= n - width; i += width)
+                    Vector.Max(new Vector<float>(x.Slice(i)), sv).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = MathF.Max(x[i], s);
+                break;
+
+            case BinaryOpKind.Min:
+                for (; i <= n - width; i += width)
+                    Vector.Min(new Vector<float>(x.Slice(i)), sv).CopyTo(c.Slice(i));
+                for (; i < n; i++) c[i] = MathF.Min(x[i], s);
+                break;
+
+            default:
+                for (; i < n; i++)
+                    c[i] = scalarIsLeft ? Apply(op, s, x[i]) : Apply(op, x[i], s);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 尾部广播：广播方每 <paramref name="inner"/> 个元素重复一次，
+    /// 于是可以按 inner 分段，每段内部都是连续访问，照常向量化。
+    /// </summary>
+    private static void ApplyBroadcast(
+        BinaryOpKind op,
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int inner,
+        bool leftIsFull)
+    {
+        for (int start = 0; start < c.Length; start += inner)
+        {
+            int length = Math.Min(inner, c.Length - start);
+            var full = a.Slice(start, length);
+            var repeat = b.Slice(0, length);
+            var dst = c.Slice(start, length);
+
+            if (leftIsFull)
+                ApplyContiguous(op, full, repeat, dst);
+            else
+                ApplyContiguous(op, repeat, full, dst);
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="x"/> 是否是 <paramref name="c"/> 的「尾部后缀」形状
+    /// （右对齐后各维相等），此时 x 在 c 里就是按块重复。
+    /// </summary>
+    private static bool IsTailBroadcast(TensorShape x, TensorShape c, int targetCount, out int count)
+    {
+        count = 0;
+
+        if (x.Rank > c.Rank)
+            return false;
+
+        int offset = c.Rank - x.Rank;
+        for (int i = 0; i < x.Rank; i++)
+        {
+            if (x[i] != c[offset + i])
+                return false;
+        }
+
+        int total = 1;
+        for (int i = 0; i < x.Rank; i++)
+            total *= x[i];
+
+        // 等于全长时上面的「同形状」路径已经覆盖，这里只处理真正需要重复的情形
+        if (total <= 0 || total >= targetCount)
+            return false;
+
+        count = total;
+        return true;
     }
 
     private static float Apply(BinaryOpKind op, float a, float b) => op switch
