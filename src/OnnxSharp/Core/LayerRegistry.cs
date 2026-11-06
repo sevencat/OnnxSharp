@@ -37,5 +37,8 @@ public static class LayerRegistry
         Ops.ActivationLayer.Register();
         Ops.ShapeOps.Register();
         Ops.DnnOps.Register();
+        Ops.IndexOps.Register();
+        Ops.BroadcastOps.Register();
+        Ops.MiscOps.Register();
     }
 }

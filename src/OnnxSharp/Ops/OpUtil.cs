@@ -97,6 +97,138 @@ internal static class OpUtil
         return op.In(index);
     }
 
+    /// <summary>
+    /// 读取 axes：opset 13+ 优先第 1 个「常量」输入，老版本用 attribute。
+    /// 返回<b>未归一化</b>的原始值（负数轴由调用方按各自的 rank 归一化：
+    /// <c>Squeeze</c> 按输入 rank、<c>Unsqueeze</c> 按输出 rank）。
+    /// </summary>
+    public static int[] Axes(LayerInfo op, int[]? attrAxes)
+    {
+        if (op.Inputs.Count > 1 && op.Inputs[1].Idx != 0)
+            return ReadInts(RequireConstInput(op, 1));
+        return attrAxes ?? Array.Empty<int>();
+    }
+
+    /// <summary>归一化（负轴 +rank）、排序、去重。</summary>
+    public static int[] NormalizeAxes(ReadOnlySpan<int> axes, int rank, string context)
+    {
+        if (axes.Length == 0)
+            return Array.Empty<int>();
+
+        var result = new int[axes.Length];
+        for (int i = 0; i < axes.Length; i++)
+            result[i] = NormalizeAxis(axes[i], rank, context);
+
+        Array.Sort(result);
+
+        int unique = 1;
+        for (int i = 1; i < result.Length; i++)
+        {
+            if (result[i] != result[unique - 1])
+                result[unique++] = result[i];
+        }
+
+        if (unique != result.Length)
+            Array.Resize(ref result, unique);
+
+        return result;
+    }
+
+    /// <summary>布尔掩码 / 索引张量读成 bool[]（Bool/U8/I64/I32/F32 都接受）。</summary>
+    public static bool[] ReadBools(Tensor tensor)
+    {
+        int count = checked((int)tensor.Count);
+        var result = new bool[count];
+
+        if (tensor.DType is DType.Bool or DType.U8)
+        {
+            var span = tensor.AsSpan<byte>();
+            for (int i = 0; i < count; i++)
+                result[i] = span[i] != 0;
+        }
+        else if (tensor.DType == DType.I64)
+        {
+            var span = tensor.AsSpan<long>();
+            for (int i = 0; i < count; i++)
+                result[i] = span[i] != 0;
+        }
+        else if (tensor.DType == DType.I32)
+        {
+            var span = tensor.AsSpan<int>();
+            for (int i = 0; i < count; i++)
+                result[i] = span[i] != 0;
+        }
+        else if (tensor.DType == DType.F32)
+        {
+            var span = tensor.AsSpan<float>();
+            for (int i = 0; i < count; i++)
+                result[i] = span[i] != 0f;
+        }
+        else
+        {
+            throw new OnnxSharpException($"cannot read booleans from {tensor.DType} tensor");
+        }
+
+        return result;
+    }
+
+    /// <summary>多输入广播后的输出形状（numpy 右对齐规则）。</summary>
+    public static int[] BroadcastDims(IReadOnlyList<TensorShape> shapes)
+    {
+        int rank = 0;
+        foreach (var shape in shapes)
+            rank = Math.Max(rank, shape.Rank);
+
+        var dims = new int[rank];
+        Array.Fill(dims, 1);
+
+        foreach (var shape in shapes)
+        {
+            int offset = rank - shape.Rank;
+            for (int i = 0; i < shape.Rank; i++)
+            {
+                int target = dims[offset + i];
+                int source = shape[i];
+
+                if (source == target || source == 1)
+                    continue;
+
+                if (target != 1)
+                    throw new OnnxSharpException(
+                        $"cannot broadcast shapes (axis {offset + i}: {target} vs {source})");
+
+                dims[offset + i] = source;
+            }
+        }
+
+        return dims;
+    }
+
+    /// <summary>
+    /// 把张量形状对齐到 <paramref name="outDims"/> 后的元素步长；
+    /// 广播维（源为 1、目标 &gt; 1）步长为 0，因此可以直接做线性遍历。
+    /// </summary>
+    public static int[] BroadcastStrides(TensorShape shape, int[] outDims)
+    {
+        var dims = shape.ToArray();
+        var strides = Strides(dims);
+
+        int offset = outDims.Length - dims.Length;
+        if (offset < 0)
+            throw new OnnxSharpException($"cannot broadcast {shape} to [{string.Join(",", outDims)}]");
+
+        var result = new int[outDims.Length];
+        for (int i = 0; i < dims.Length; i++)
+        {
+            int target = outDims[offset + i];
+            if (dims[i] != 1 && dims[i] != target)
+                throw new OnnxSharpException($"cannot broadcast {shape} to [{string.Join(",", outDims)}]");
+            result[offset + i] = dims[i] == 1 && target != 1 ? 0 : strides[i];
+        }
+
+        return result;
+    }
+
     /// <summary>按元素字节宽度整块拷贝。</summary>
     public static void CopyBytes(Tensor src, long srcElementOffset, Tensor dst, long dstElementOffset, long elements)
     {

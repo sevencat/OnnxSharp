@@ -20,6 +20,9 @@ public enum UnaryOpKind
     Exp,
     Neg,
     Abs,
+    Erf,
+    Sin,
+    Cos,
 }
 
 /// <summary>
@@ -92,6 +95,28 @@ public static class TensorOps
         }
     }
 
+    /// <summary>
+    /// erf(x) = 2/√π ∫₀ˣ e^(−t²) dt。Abramowitz &amp; Stegun 7.1.26 有理逼近，
+    /// 绝对误差 &lt; 1.5e-7 —— 对 F32 已经足够（F32 自身 eps 约 1.2e-7）。
+    /// .NET 没有内建 erf（Math/MathF 只有 Gamma 系列），只能自己写。
+    /// </summary>
+    public static float Erf(float x)
+    {
+        const float p = 0.3275911f;
+        const float a1 = 0.254829592f;
+        const float a2 = -0.284496736f;
+        const float a3 = 1.421413741f;
+        const float a4 = -1.453152027f;
+        const float a5 = 1.061405429f;
+
+        float sign = x < 0 ? -1f : 1f;
+        float ax = MathF.Abs(x);
+        float t = 1f / (1f + p * ax);
+        float poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+
+        return sign * (1f - poly * MathF.Exp(-ax * ax));
+    }
+
     public static void ElementWiseUnary(UnaryOpKind op, Tensor a, Tensor c)
     {
         if (a.DType != DType.F32 || c.DType != DType.F32)
@@ -139,6 +164,9 @@ public static class TensorOps
         UnaryOpKind.Exp => MathF.Exp(a),
         UnaryOpKind.Neg => -a,
         UnaryOpKind.Abs => MathF.Abs(a),
+        UnaryOpKind.Erf => Erf(a),
+        UnaryOpKind.Sin => MathF.Sin(a),
+        UnaryOpKind.Cos => MathF.Cos(a),
         _ => throw new ArgumentOutOfRangeException(nameof(op), op, null),
     };
 }

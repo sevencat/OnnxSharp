@@ -18,7 +18,7 @@ internal static class ShapeOps
         LayerRegistry.Register("Slice", p => new SliceLayer(p));
     }
 
-    private static int[] ToInts(long[]? values)
+    internal static int[] ToInts(long[]? values)
     {
         if (values is null || values.Length == 0)
             return Array.Empty<int>();

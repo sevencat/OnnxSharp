@@ -23,6 +23,9 @@ public sealed class ActivationLayer : Layer
         LayerRegistry.Register("Exp", p => new ActivationLayer(p, UnaryOpKind.Exp));
         LayerRegistry.Register("Neg", p => new ActivationLayer(p, UnaryOpKind.Neg));
         LayerRegistry.Register("Abs", p => new ActivationLayer(p, UnaryOpKind.Abs));
+        LayerRegistry.Register("Erf", p => new ActivationLayer(p, UnaryOpKind.Erf));
+        LayerRegistry.Register("Sin", p => new ActivationLayer(p, UnaryOpKind.Sin));
+        LayerRegistry.Register("Cos", p => new ActivationLayer(p, UnaryOpKind.Cos));
     }
 
     public override void GetMemoryShapes(
