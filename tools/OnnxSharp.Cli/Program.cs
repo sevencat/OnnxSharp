@@ -15,6 +15,9 @@ return args[0].ToLowerInvariant() switch
 {
     "info" => Info(args),
     "dump-graph" => DumpGraph(args),
+    "run" => Run(args),
+    "bench" => Bench(args),
+    "detect" => Detect(args),
     "help" or "-h" or "--help" => Usage(),
     _ => Usage(),
 };
@@ -28,6 +31,13 @@ static int Usage()
     Console.WriteLine("  OnnxSharp.Cli info <model.onnx>     # 打印 ONNX 结构统计");
     Console.WriteLine("  OnnxSharp.Cli dump-graph <model.onnx> [--type Conv] [--limit N]");
     Console.WriteLine("                                      # 导入为图并打印每个节点的推断输出形状");
+    Console.WriteLine("  OnnxSharp.Cli run <model.onnx> --input <file.bin> [--input name=file.bin]");
+    Console.WriteLine("                     [--compare <golden.bin>] [--repeat N]");
+    Console.WriteLine("                                      # 跑一次前向，打印输出统计/耗时");
+    Console.WriteLine("  OnnxSharp.Cli bench <model.onnx> --input <file.bin> [--iters N] [--warmup N]");
+    Console.WriteLine("                                      # 计时迭代");
+    Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> --input <file.bin> [--conf 0.25] [--iou 0.45]");
+    Console.WriteLine("                                      # 调用示例：YOLO decode + NMS（不写进产品库）");
     return 2;
 }
 
@@ -193,3 +203,323 @@ static int DumpGraph(string[] args)
 /// </summary>
 static string Describe(ArgData data)
     => $"{data.DType} [{string.Join(",", data.Shape.ToArray())}]";
+
+// ---------------- run / bench ----------------
+
+static int Run(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: run <model.onnx> --input <file.bin> [--compare <golden.bin>] [--repeat N]");
+        return 2;
+    }
+
+    string path = args[1];
+    var options = ParseOptions(args, 2);
+    if (!File.Exists(path))
+    {
+        Console.Error.WriteLine($"model not found: {path}");
+        return 2;
+    }
+
+    var loadWatch = System.Diagnostics.Stopwatch.StartNew();
+    var net = Net.ReadModel(path);
+    loadWatch.Stop();
+
+    var feeds = BindInputs(net, options.Inputs);
+    int repeat = options.GetInt("--repeat", 1);
+
+    Console.WriteLine($"model     : {path}");
+    Console.WriteLine($"imported  : {loadWatch.ElapsedMilliseconds} ms    ops: {net.MainGraph?.Prog.Count}");
+
+    var first = (List<Tensor>?)null;
+    var watch = System.Diagnostics.Stopwatch.StartNew();
+    for (int i = 0; i < repeat; i++)
+        first = net.ForwardAll();
+    watch.Stop();
+
+    Console.WriteLine($"forward   : {watch.Elapsed.TotalMilliseconds / repeat:F1} ms/iter ({repeat} iter)");
+
+    var outputs = net.OutputNames;
+    for (int i = 0; i < first!.Count; i++)
+    {
+        var tensor = first[i];
+        var span = tensor.AsSpan<float>();
+        double sum = 0;
+        float min = float.MaxValue, max = float.MinValue;
+
+        for (int j = 0; j < span.Length; j++)
+        {
+            float value = span[j];
+            sum += value;
+            if (value < min) min = value;
+            if (value > max) max = value;
+        }
+
+        Console.WriteLine($"output[{i}] : {outputs[i],-12}{Describe(net.Impl.GetArgData(net.Impl.Require(outputs[i])))}  " +
+                          $"min={min:F4} max={max:F4} mean={sum / Math.Max(1, span.Length):F6}");
+
+        if (options.Compare is not null && i == 0)
+            CompareWithGolden(span, options.Compare);
+    }
+
+    _ = feeds;
+    return 0;
+}
+
+static int Bench(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: bench <model.onnx> --input <file.bin> [--iters N] [--warmup N]");
+        return 2;
+    }
+
+    string path = args[1];
+    var options = ParseOptions(args, 2);
+    if (!File.Exists(path))
+    {
+        Console.Error.WriteLine($"model not found: {path}");
+        return 2;
+    }
+
+    var net = Net.ReadModel(path);
+    BindInputs(net, options.Inputs);
+
+    int warmup = options.GetInt("--warmup", 1);
+    int iters = options.GetInt("--iters", 5);
+
+    for (int i = 0; i < warmup; i++)
+        net.ForwardAll();
+
+    var samples = new double[iters];
+    for (int i = 0; i < iters; i++)
+    {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        net.ForwardAll();
+        watch.Stop();
+        samples[i] = watch.Elapsed.TotalMilliseconds;
+    }
+
+    Array.Sort(samples);
+    Console.WriteLine($"model     : {path}");
+    Console.WriteLine($"iters     : {iters}  (warmup {warmup})");
+    Console.WriteLine($"min       : {samples[0]:F1} ms");
+    Console.WriteLine($"median    : {samples[iters / 2]:F1} ms");
+    Console.WriteLine($"mean      : {samples.Average():F1} ms");
+    Console.WriteLine($"max       : {samples[^1]:F1} ms");
+    return 0;
+}
+
+// ---------------- YOLO decode + NMS（调用示例，不属于引擎） ----------------
+
+static int Detect(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: detect <yolo.onnx> --input <file.bin> [--conf 0.25] [--iou 0.45]");
+        return 2;
+    }
+
+    string path = args[1];
+    var options = ParseOptions(args, 2);
+    float conf = options.GetFloat("--conf", 0.25f);
+    float iou = options.GetFloat("--iou", 0.45f);
+
+    var net = Net.ReadModel(path);
+    BindInputs(net, options.Inputs);
+
+    var output = net.Forward();
+    var span = output.AsSpan<float>();
+
+    // YOLOv8/v11: output0 = [1, 4 + numClasses, numAnchors]（无 objectness，类别分数已 sigmoid）
+    if (output.Shape.Rank != 3 || output.Shape[1] < 5)
+        throw new OnnxSharpException($"detect: unexpected output shape {output.Shape}");
+
+    int attributes = output.Shape[1];
+    int anchors = output.Shape[2];
+    int classes = attributes - 4;
+
+    var candidates = new List<Detection>();
+
+    for (int a = 0; a < anchors; a++)
+    {
+        int best = -1;
+        float bestScore = conf;
+
+        for (int c = 0; c < classes; c++)
+        {
+            float score = span[(c + 4) * anchors + a];
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = c;
+            }
+        }
+
+        if (best < 0)
+            continue;
+
+        float cx = span[a];
+        float cy = span[anchors + a];
+        float w = span[2 * anchors + a];
+        float h = span[3 * anchors + a];
+
+        candidates.Add(new Detection
+        {
+            ClassId = best,
+            Score = bestScore,
+            X = cx - w * 0.5f,
+            Y = cy - h * 0.5f,
+            W = w,
+            H = h,
+        });
+    }
+
+    var kept = Nms(candidates, iou);
+
+    Console.WriteLine($"model     : {path}");
+    Console.WriteLine($"anchors   : {anchors}    classes: {classes}    candidates: {candidates.Count}    kept: {kept.Count}");
+
+    foreach (var detection in kept.Take(20))
+    {
+        Console.WriteLine($"  class {detection.ClassId,3}  score {detection.Score:F4}  " +
+                          $"box [{detection.X:F1}, {detection.Y:F1}, {detection.W:F1}, {detection.H:F1}]");
+    }
+
+    return 0;
+}
+
+static List<Detection> Nms(List<Detection> candidates, float iouThreshold)
+{
+    var sorted = new List<Detection>(candidates);
+    sorted.Sort((x, y) => y.Score.CompareTo(x.Score));
+
+    var kept = new List<Detection>();
+    var suppressed = new bool[sorted.Count];
+
+    for (int i = 0; i < sorted.Count; i++)
+    {
+        if (suppressed[i])
+            continue;
+
+        kept.Add(sorted[i]);
+
+        for (int j = i + 1; j < sorted.Count; j++)
+        {
+            if (suppressed[j] || sorted[j].ClassId != sorted[i].ClassId)
+                continue;
+            if (Detection.IoU(sorted[i], sorted[j]) > iouThreshold)
+                suppressed[j] = true;
+        }
+    }
+
+    return kept;
+}
+
+// ---------------- 参数与输入绑定 ----------------
+
+static CliOptions ParseOptions(string[] args, int start)
+{
+    var options = new CliOptions();
+
+    for (int i = start; i < args.Length; i++)
+    {
+        string arg = args[i];
+        if (arg == "--input" && i + 1 < args.Length)
+            options.Inputs.Add(args[++i]);
+        else if (arg == "--compare" && i + 1 < args.Length)
+            options.Compare = args[++i];
+        else if (arg.StartsWith("--", StringComparison.Ordinal) && i + 1 < args.Length)
+            options.Add(arg, args[++i]);
+    }
+
+    return options;
+}
+
+/// <summary>
+/// 把 <c>--input file.bin</c>（按模型输入顺序）或 <c>--input name=file.bin</c> 绑定到图上。
+/// 只支持静态形状的 F32 输入 —— 这是「引擎外的预处理」边界，letterbox 由调用方完成。
+/// </summary>
+static List<Tensor> BindInputs(Net net, List<string> inputs)
+{
+    if (inputs.Count == 0)
+        throw new OnnxSharpException("no --input given");
+
+    var names = net.InputNames;
+    var tensors = new List<Tensor>(inputs.Count);
+
+    for (int i = 0; i < inputs.Count; i++)
+    {
+        string name;
+        string file;
+
+        int separator = inputs[i].IndexOf('=');
+        if (separator > 0)
+        {
+            name = inputs[i][..separator];
+            file = inputs[i][(separator + 1)..];
+        }
+        else
+        {
+            if (i >= names.Count)
+                throw new OnnxSharpException($"model has {names.Count} input(s), got {inputs.Count}");
+            name = names[i];
+            file = inputs[i];
+        }
+
+        var tensor = LoadTensor(net, name, file);
+        net.SetInput(name, tensor);
+        tensors.Add(tensor);
+    }
+
+    return tensors;
+}
+
+static Tensor LoadTensor(Net net, string name, string file)
+{
+    var data = net.Impl.GetArgData(net.Impl.Require(name));
+
+    if (data.DType != DType.F32)
+        throw new OnnxSharpException($"input '{name}': only F32 is supported for --input (got {data.DType})");
+
+    long count = data.Shape.Total();
+    if (count <= 0)
+        throw new OnnxSharpException($"input '{name}': shape {data.Shape} is not static; cannot bind a raw tensor");
+
+    var bytes = File.ReadAllBytes(file);
+    long expected = count * sizeof(float);
+
+    if (bytes.Length != expected)
+        throw new OnnxSharpException(
+            $"input '{name}': {file} is {bytes.Length} B, expected {expected} B for {data.Shape}");
+
+    var tensor = Tensor.Allocate(data.Shape, DType.F32);
+    bytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(tensor.AsSpan<float>()));
+    return tensor;
+}
+
+static void CompareWithGolden(ReadOnlySpan<float> actual, string goldenPath)
+{
+    var expected = new float[actual.Length];
+    var bytes = File.ReadAllBytes(goldenPath);
+
+    if (bytes.Length != expected.Length * sizeof(float))
+        throw new OnnxSharpException(
+            $"golden {goldenPath} is {bytes.Length} B, expected {expected.Length * sizeof(float)} B");
+
+    Buffer.BlockCopy(bytes, 0, expected, 0, bytes.Length);
+
+    double maxAbs = 0;
+    double sumAbs = 0;
+
+    for (int i = 0; i < expected.Length; i++)
+    {
+        double diff = Math.Abs((double)expected[i] - actual[i]);
+        sumAbs += diff;
+        if (diff > maxAbs) maxAbs = diff;
+    }
+
+    Console.WriteLine($"compare   : max|diff|={maxAbs:E3}  mean|diff|={sumAbs / expected.Length:E3}  " +
+                      $"({Path.GetFileName(goldenPath)})");
+}
