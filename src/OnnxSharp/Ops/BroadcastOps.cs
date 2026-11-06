@@ -172,6 +172,25 @@ internal static class BroadcastOps
             List<TensorShape> tempShapes)
             => outShapes.Add(new TensorShape(OpUtil.BroadcastDims(inShapes)));
 
+        public override void GetTypes(
+            IReadOnlyList<DType> inTypes,
+            int requiredOutputs,
+            int requiredTemps,
+            List<DType> outTypes,
+            List<DType> tempTypes)
+        {
+            // input[0] 是 Bool 条件，输出类型跟着 x（input[1]）走
+            var t = inTypes.Count > 1 ? inTypes[1] : DType.F32;
+
+            outTypes.Clear();
+            for (int i = 0; i < requiredOutputs; i++)
+                outTypes.Add(t);
+
+            tempTypes.Clear();
+            for (int i = 0; i < requiredTemps; i++)
+                tempTypes.Add(DType.F32);
+        }
+
         public override void Forward(
             IReadOnlyList<Tensor> inputs,
             IReadOnlyList<Tensor> outputs,
@@ -340,9 +359,44 @@ internal static class BroadcastOps
                 return;
             }
 
+            if (a.DType == DType.I64 && b.DType == DType.I64 && _kind != CompareKind.And)
+            {
+                // 形状链里的比较（如 Equal(shape_a, shape_b)）走整数路径
+                var la = a.AsSpan<long>();
+                var lb = b.AsSpan<long>();
+
+                for (int n = 0; n < target.Length; n++)
+                {
+                    long x = la[(int)offsetA];
+                    long y = lb[(int)offsetB];
+                    target[n] = _kind switch
+                    {
+                        CompareKind.Equal => x == y ? (byte)1 : (byte)0,
+                        CompareKind.Less => x < y ? (byte)1 : (byte)0,
+                        CompareKind.Greater => x > y ? (byte)1 : (byte)0,
+                        _ => (byte)0,
+                    };
+
+                    for (int axis = dims.Length - 1; axis >= 0; axis--)
+                    {
+                        cursor[axis]++;
+                        offsetA += stridesA[axis];
+                        offsetB += stridesB[axis];
+                        if (cursor[axis] < dims[axis])
+                            break;
+
+                        offsetA -= (long)stridesA[axis] * dims[axis];
+                        offsetB -= (long)stridesB[axis] * dims[axis];
+                        cursor[axis] = 0;
+                    }
+                }
+
+                return;
+            }
+
             if (_kind != CompareKind.And)
                 throw new OnnxSharpException(
-                    $"'{Type}' '{Name}': only F32 inputs are supported (got {a.DType}/{b.DType})");
+                    $"'{Type}' '{Name}': only F32/I64 inputs are supported (got {a.DType}/{b.DType})");
 
             var maskA = OpUtil.ReadBools(a);
             var maskB = OpUtil.ReadBools(b);

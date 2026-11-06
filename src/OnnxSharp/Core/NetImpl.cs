@@ -102,6 +102,7 @@ public sealed class NetImpl
         var data = GetArgData(arg);
         data.Const = value;
         data.Shape = value.Shape;
+        data.HasShape = true;
         data.DType = value.DType;
         data.Layout = value.Layout;
         return arg;
@@ -183,6 +184,7 @@ public sealed class NetImpl
     {
         var data = GetArgData(arg);
         data.Shape = shape;
+        data.HasShape = true;
         data.DType = dtype;
         data.Layout = Layout.NCHW;
 
@@ -234,6 +236,7 @@ public sealed class NetImpl
 
         data.Kind = ArgKind.Input;
         data.Shape = input.Shape;
+        data.HasShape = true;
         data.DType = input.DType;
         data.Layout = input.Layout;
         data.Runtime = input;

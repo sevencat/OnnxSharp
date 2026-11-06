@@ -99,6 +99,19 @@ public class LayerInfo
     /// <summary>输出形状依赖运行时数值（如 Where/Expand/ConstantOfShape）。</summary>
     public virtual bool DynamicOutputShapes() => false;
 
+    /// <summary>
+    /// 只凭输入<b>形状</b>（不需要输入数值）就能算出常量结果的算子在这里实现。
+    /// <para>
+    /// 常量折叠用：<c>Shape</c> 的输入常常是运行时张量，但只要它的形状静态已知，
+    /// <c>Shape</c> 的结果就是常量，下游 <c>Slice → Concat → Reshape</c> 链才能继续折叠。
+    /// </para>
+    /// </summary>
+    internal virtual bool TryFoldShapeOnly(IReadOnlyList<TensorShape> inShapes, out Tensor? result)
+    {
+        result = null;
+        return false;
+    }
+
     /// <summary>控制流子图（If/Loop/Scan）。首版不做。</summary>
     public virtual IReadOnlyList<Graph>? Subgraphs() => null;
 

@@ -42,6 +42,12 @@ public sealed class ArgData
 
     public TensorShape Shape = TensorShape.Scalar;
 
+    /// <summary>
+    /// <see cref="Shape"/> 是否已由可靠来源确定（value_info / SetInput / 常量 / 形状推断）。
+    /// 为 false 时 <see cref="Shape"/> 只是默认值，不能当静态形状用。
+    /// </summary>
+    public bool HasShape;
+
     public DType DType = DType.F32;
 
     /// <summary>存储布局（首版恒为 NCHW，仅预留）。</summary>

@@ -127,6 +127,7 @@ internal static class OnnxImporter
 
         var data = net.GetArgData(arg);
         data.Shape = new TensorShape(info.Dims);
+        data.HasShape = true;
         data.DType = info.Type;
         data.Layout = Layout.NCHW;
     }

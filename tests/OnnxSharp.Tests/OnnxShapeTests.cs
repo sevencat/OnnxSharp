@@ -11,10 +11,47 @@ namespace OnnxSharp.Tests;
 internal static class OnnxShapeTests
 {
     private const string Yolo11n = @"F:\ai\models\yolo\yolo11n.onnx";
+    private const string RfDetrSmall = @"F:\ai\rfdetr\onnx_model\rfdetr-small.onnx";
 
     public static IEnumerable<TestCase> Cases()
     {
         yield return new("shapes: yolo11n matches onnx.shape_inference", Yolo11nShapes);
+        yield return new("shapes: rfdetr-small imports after constant folding", RfDetrShapes);
+    }
+
+    /// <summary>
+    /// RF-DETR 没有 <c>value_info</c>，中间形状全靠「形状传播 + 常量折叠」逐步解出：
+    /// <c>Shape → Slice → Concat → Reshape</c> 链必须全部变成常量，形状推断才不会卡死。
+    /// </summary>
+    private static void RfDetrShapes()
+    {
+        if (!File.Exists(RfDetrSmall))
+            throw new TestSkipException($"model not found: {RfDetrSmall}");
+
+        var file = Onnx.OnnxFile.Load(RfDetrSmall);
+        var net = Net.ReadModel(RfDetrSmall);
+        var graph = net.MainGraph ?? throw new TestFailureException("no main graph");
+
+        // 折叠后节点数必然少于 ONNX 节点数（常量节点 + 形状链都被吃掉）
+        Assert.True(graph.Prog.Count < file.Nodes.Count,
+            $"expected folding to shrink the graph ({graph.Prog.Count} vs {file.Nodes.Count})");
+
+        Interpreter.Run(net.Impl, graph, executeLayers: false);
+
+        var expected = new Dictionary<string, int[]>(StringComparer.Ordinal)
+        {
+            ["dets"] = new[] { 1, 300, 4 },
+            ["labels"] = new[] { 1, 300, 91 },
+        };
+
+        foreach (var (name, dims) in expected)
+        {
+            var data = net.Impl.GetArgData(net.Impl.Require(name));
+            Assert.True(SameDims(dims, data.Shape.ToArray()),
+                $"output '{name}': want [{string.Join(",", dims)}], got {string.Join(",", data.Shape.ToArray())}");
+        }
+
+        Console.WriteLine($"        rfdetr-small: {file.Nodes.Count} nodes -> {graph.Prog.Count} ops after folding");
     }
 
     private static void Yolo11nShapes()

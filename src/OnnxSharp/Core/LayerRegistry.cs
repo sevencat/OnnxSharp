@@ -40,5 +40,6 @@ public static class LayerRegistry
         Ops.IndexOps.Register();
         Ops.BroadcastOps.Register();
         Ops.MiscOps.Register();
+        Ops.AttnOps.Register();
     }
 }

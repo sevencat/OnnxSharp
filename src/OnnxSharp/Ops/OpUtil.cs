@@ -6,7 +6,13 @@ namespace OnnxSharp.Ops;
 /// <summary>算子实现共用的形状/常量读取工具。</summary>
 internal static class OpUtil
 {
-    /// <summary>把常量张量读成 int[]（支持 I64 / I32 / F32，OpenCV 三种都接受）。</summary>
+    /// <summary>
+    /// 把常量张量读成 int[]（支持 I64 / I32 / F32，OpenCV 三种都接受）。
+    /// <para>
+    /// 越界值按 int 范围饱和：ONNX 的 <c>Slice</c> 用 <c>INT64_MAX</c> / <c>INT64_MIN</c>
+    /// 作为「到边界」的哨兵值，读取时会溢出，饱和后由各算子自行按维度裁剪。
+    /// </para>
+    /// </summary>
     public static int[] ReadInts(Tensor tensor)
     {
         int count = checked((int)tensor.Count);
@@ -16,7 +22,9 @@ internal static class OpUtil
         {
             var span = tensor.AsSpan<long>();
             for (int i = 0; i < count; i++)
-                result[i] = checked((int)span[i]);
+                result[i] = span[i] > int.MaxValue ? int.MaxValue
+                          : span[i] < int.MinValue ? int.MinValue
+                          : (int)span[i];
         }
         else if (tensor.DType == DType.I32)
         {
@@ -26,7 +34,9 @@ internal static class OpUtil
         {
             var span = tensor.AsSpan<float>();
             for (int i = 0; i < count; i++)
-                result[i] = (int)span[i];
+                result[i] = span[i] >= int.MaxValue ? int.MaxValue
+                          : span[i] <= int.MinValue ? int.MinValue
+                          : (int)span[i];
         }
         else
         {

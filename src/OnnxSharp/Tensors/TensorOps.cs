@@ -52,9 +52,15 @@ public static class TensorOps
         return i < offset ? 1 : shape[i - offset];
     }
 
-    /// <summary>c = op(a, b)，要求 c 的形状是 a/b 的广播结果。</summary>
+    /// <summary>c = op(a, b)，要求 c 的形状是 a/b 的广播结果。支持 F32 与 I64（后者供形状运算/常量折叠）。</summary>
     public static void ElementWiseBinary(BinaryOpKind op, Tensor a, Tensor b, Tensor c)
     {
+        if (a.DType == DType.I64 && b.DType == DType.I64 && c.DType == DType.I64)
+        {
+            ElementWiseBinaryInt64(op, a, b, c);
+            return;
+        }
+
         if (a.DType != DType.F32 || b.DType != DType.F32 || c.DType != DType.F32)
             throw new NotSupportedException($"element-wise kernel supports F32 only, got {a.DType}/{b.DType}/{c.DType}");
 
@@ -94,6 +100,48 @@ public static class TensorOps
             }
         }
     }
+
+    private static void ElementWiseBinaryInt64(BinaryOpKind op, Tensor a, Tensor b, Tensor c)
+    {
+        var sa = a.AsSpan<long>();
+        var sb = b.AsSpan<long>();
+        var sc = c.AsSpan<long>();
+
+        int rank = c.Shape.Rank;
+        var dims = c.Shape.ToArray();
+        var strideA = ComputeStrides(a.Shape, rank);
+        var strideB = ComputeStrides(b.Shape, rank);
+        var index = new int[rank];
+
+        int ia = 0, ib = 0;
+        for (int n = 0; n < sc.Length; n++)
+        {
+            sc[n] = ApplyInt64(op, sa[ia], sb[ib]);
+
+            for (int axis = rank - 1; axis >= 0; axis--)
+            {
+                index[axis]++;
+                ia += strideA[axis];
+                ib += strideB[axis];
+                if (index[axis] < dims[axis])
+                    break;
+                ia -= strideA[axis] * dims[axis];
+                ib -= strideB[axis] * dims[axis];
+                index[axis] = 0;
+            }
+        }
+    }
+
+    private static long ApplyInt64(BinaryOpKind op, long a, long b) => op switch
+    {
+        BinaryOpKind.Add => a + b,
+        BinaryOpKind.Sub => a - b,
+        BinaryOpKind.Mul => a * b,
+        BinaryOpKind.Div => b == 0 ? 0 : a / b,
+        BinaryOpKind.Max => Math.Max(a, b),
+        BinaryOpKind.Min => Math.Min(a, b),
+        _ => throw new OnnxSharpException($"integer element-wise op '{op}' is not supported"),
+    };
 
     /// <summary>
     /// erf(x) = 2/√π ∫₀ˣ e^(−t²) dt。Abramowitz &amp; Stegun 7.1.26 有理逼近，

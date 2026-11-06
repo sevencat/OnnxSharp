@@ -19,9 +19,19 @@ public sealed class Net
 
     public IReadOnlyList<string> OutputNames => _impl.GetOutputNames();
 
-    /// <summary>从 ONNX 文件加载模型。</summary>
+    /// <summary>
+    /// 从 ONNX 文件加载模型。导入后立刻做<b>常量折叠</b>：
+    /// RF-DETR 的 <c>Shape → Gather → Concat → Reshape</c> 链必须折叠掉，否则形状推断无从下手。
+    /// </summary>
     public static Net ReadModel(string path)
-        => new(Onnx.OnnxImporter.Build(Onnx.OnnxFile.Load(path)));
+    {
+        var impl = Onnx.OnnxImporter.Build(Onnx.OnnxFile.Load(path));
+
+        if (impl.MainGraph is { } graph)
+            ConstFolder.Run(impl, graph);
+
+        return new Net(impl);
+    }
 
     public void SetInput(string name, Tensor input) => _impl.SetInput(name, input);
 

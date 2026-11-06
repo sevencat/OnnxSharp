@@ -267,9 +267,6 @@ internal static class MiscOps
             var input = inputs[0];
             var output = outputs[0];
 
-            if (input.DType != DType.F32)
-                throw new OnnxSharpException($"'{Type}' '{Name}': only F32 is supported");
-
             var dims = input.Shape.ToArray();
             int rank = dims.Length;
             var reduced = ResolveMask(rank);
@@ -299,6 +296,15 @@ internal static class MiscOps
                 }
             }
 
+            if (input.DType == DType.I64)
+            {
+                ReduceInt64(input.AsSpan<long>(), output.AsSpan<long>(), dims, inStrides, map);
+                return;
+            }
+
+            if (input.DType != DType.F32)
+                throw new OnnxSharpException($"'{Type}' '{Name}': only F32/I64 is supported");
+
             var src = input.AsSpan<float>();
             var dst = output.AsSpan<float>();
 
@@ -322,6 +328,47 @@ internal static class MiscOps
                 }
 
                 float value = src[n];
+
+                if (_kind == ReduceKind.Max)
+                {
+                    if (value > dst[(int)target])
+                        dst[(int)target] = value;
+                }
+                else
+                {
+                    dst[(int)target] += value;
+                }
+            }
+        }
+
+        /// <summary>形状链里的整数归约（如 ReduceSum(shape, ...)）。</summary>
+        private void ReduceInt64(
+            ReadOnlySpan<long> src,
+            Span<long> dst,
+            int[] dims,
+            int[] inStrides,
+            int[] map)
+        {
+            if (_kind == ReduceKind.Max)
+                dst.Fill(long.MinValue);
+            else
+                dst.Clear();
+
+            var coords = new int[dims.Length];
+
+            for (int n = 0; n < src.Length; n++)
+            {
+                int rest = n;
+                long target = 0;
+
+                for (int d = 0; d < dims.Length; d++)
+                {
+                    coords[d] = rest / inStrides[d];
+                    rest -= coords[d] * inStrides[d];
+                    target += (long)coords[d] * map[d];
+                }
+
+                long value = src[n];
 
                 if (_kind == ReduceKind.Max)
                 {

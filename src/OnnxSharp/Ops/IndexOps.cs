@@ -22,19 +22,39 @@ internal static class IndexOps
 
     private sealed class ShapeLayer : Layer
     {
+        /// <summary>opset 15+ 的 <c>start</c> / <c>end</c>（裁剪输出的维度区间）。</summary>
+        private readonly long _start;
+        private readonly long _end;
+
         public ShapeLayer(LayerParams parameters)
         {
             Type = parameters.Type;
             Name = parameters.Name;
+            _start = parameters.GetInt("start", 0);
+            _end = parameters.GetInt("end", long.MaxValue);
         }
 
-        /// <summary>输出是 1-D I64：[rank]。</summary>
+        /// <summary>输出的维度个数（1-D I64）。</summary>
+        private static int Count(TensorShape shape, long start, long end)
+        {
+            int from = Clamp(start, shape.Rank);
+            int to = Clamp(end, shape.Rank);
+            return Math.Max(to - from, 0);
+        }
+
+        private static int Clamp(long value, int rank)
+        {
+            long v = value < 0 ? value + rank : value;
+            return v <= 0 ? 0 : v >= rank ? rank : (int)v;
+        }
+
+        /// <summary>输出是 1-D I64：[dimCount]。</summary>
         public override void GetMemoryShapes(
             IReadOnlyList<TensorShape> inShapes,
             int requiredOutputs,
             List<TensorShape> outShapes,
             List<TensorShape> tempShapes)
-            => outShapes.Add(new TensorShape(inShapes[0].Rank));
+            => outShapes.Add(new TensorShape(Count(inShapes[0], _start, _end)));
 
         public override void GetTypes(
             IReadOnlyList<DType> inTypes,
@@ -52,6 +72,23 @@ internal static class IndexOps
                 tempTypes.Add(DType.F32);
         }
 
+        /// <summary>形状静态已知时，<c>Shape</c> 的结果就是常量（RF-DETR 的形状链靠这条折叠掉）。</summary>
+        internal override bool TryFoldShapeOnly(IReadOnlyList<TensorShape> inShapes, out Tensor? result)
+        {
+            var shape = inShapes[0];
+            int count = Count(shape, _start, _end);
+
+            var tensor = Tensor.Allocate(new TensorShape(count), DType.I64);
+            var target = tensor.AsSpan<long>();
+
+            int from = Clamp(_start, shape.Rank);
+            for (int i = 0; i < count; i++)
+                target[i] = shape[from + i];
+
+            result = tensor;
+            return true;
+        }
+
         public override void Forward(
             IReadOnlyList<Tensor> inputs,
             IReadOnlyList<Tensor> outputs,
@@ -60,8 +97,9 @@ internal static class IndexOps
             var dims = inputs[0].Shape.Dims;
             var target = outputs[0].AsSpan<long>();
 
-            for (int i = 0; i < dims.Length; i++)
-                target[i] = dims[i];
+            int from = Clamp(_start, dims.Length);
+            for (int i = 0; i < target.Length; i++)
+                target[i] = dims[from + i];
         }
     }
 
