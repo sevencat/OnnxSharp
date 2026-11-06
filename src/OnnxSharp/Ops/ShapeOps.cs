@@ -326,31 +326,10 @@ internal static class ShapeOps
             var output = outputs[0];
             var perm = ResolvePerm(input.Shape.Rank);
 
-            var inStrides = OpUtil.Strides(input.Shape.Dims);
-            var outDims = output.Shape.ToArray();
-            var coords = new int[outDims.Length];
-
-            int elementSize = input.DType.SizeOf();
             var src = input.Buffer.AsSpan(input.ByteOffset, input.ByteLength);
             var dst = output.Buffer.AsSpan(output.ByteOffset, output.ByteLength);
 
-            long total = output.Shape.Total();
-            for (long n = 0; n < total; n++)
-            {
-                long source = 0;
-                for (int i = 0; i < coords.Length; i++)
-                    source += (long)coords[i] * inStrides[perm[i]];
-
-                src.Slice(checked((int)(source * elementSize)), elementSize)
-                   .CopyTo(dst.Slice(checked((int)(n * elementSize)), elementSize));
-
-                for (int i = coords.Length - 1; i >= 0; i--)
-                {
-                    if (++coords[i] < outDims[i])
-                        break;
-                    coords[i] = 0;
-                }
-            }
+            TransposeKernel.Transpose(src, dst, input.Shape.Dims, perm, input.DType.SizeOf());
         }
     }
 
