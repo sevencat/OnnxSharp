@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 
@@ -432,7 +433,7 @@ internal static class ShapeOps
             outShapes.Add(new TensorShape(dims));
         }
 
-        public override void Forward(
+        public override unsafe void Forward(
             IReadOnlyList<Tensor> inputs,
             IReadOnlyList<Tensor> outputs,
             IReadOnlyList<Tensor> temps)
@@ -460,25 +461,53 @@ internal static class ShapeOps
             }
 
             int elementSize = input.DType.SizeOf();
-            var src = input.Buffer.AsSpan(input.ByteOffset, input.ByteLength);
-            var dst = output.Buffer.AsSpan(output.ByteOffset, output.ByteLength);
-            var coords = new int[outDims.Length];
 
-            long total = output.Shape.Total();
-            for (long n = 0; n < total; n++)
+            // 尾部连续可整段拷贝的维数：从最内维往外，只要 step == 1 就能并进同一段；
+            // 遇到「被切过的维」时把它的长度也并进来再停。Slice 绝大多数是切
+            // 最外几维、保留末维连续（切 qkv / 切坐标），这样能把上百万次逐元素
+            // CopyTo 变成几十次 memcpy。
+            int firstInner = inDims.Length;
+            long runLength = 1;
+            for (int axis = inDims.Length - 1; axis >= 0; axis--)
             {
-                long source = 0;
-                for (int i = 0; i < coords.Length; i++)
-                    source += (long)(begin[i] + coords[i] * axisStep[i]) * inStrides[i];
+                if (axisStep[axis] != 1)
+                    break;
 
-                src.Slice(checked((int)(source * elementSize)), elementSize)
-                   .CopyTo(dst.Slice(checked((int)(n * elementSize)), elementSize));
+                runLength *= outDims[axis];
+                firstInner = axis;
 
-                for (int i = coords.Length - 1; i >= 0; i--)
+                if (begin[axis] != 0 || outDims[axis] != inDims[axis])
+                    break;
+            }
+
+            long innerBase = 0;
+            for (int axis = firstInner; axis < inDims.Length; axis++)
+                innerBase += (long)begin[axis] * inStrides[axis];
+
+            int innerBytes = checked((int)(runLength * elementSize));
+            var coords = new int[firstInner];
+
+            fixed (byte* src = input.Buffer.AsSpan(input.ByteOffset, input.ByteLength))
+            fixed (byte* dst = output.Buffer.AsSpan(output.ByteOffset, output.ByteLength))
+            {
+                long total = output.Shape.Total();
+                long written = 0;
+
+                while (written < total)
                 {
-                    if (++coords[i] < outDims[i])
-                        break;
-                    coords[i] = 0;
+                    long source = innerBase;
+                    for (int i = 0; i < firstInner; i++)
+                        source += (long)(begin[i] + coords[i] * axisStep[i]) * inStrides[i];
+
+                    Unsafe.CopyBlockUnaligned(dst + written * elementSize, src + source * elementSize, (uint)innerBytes);
+                    written += runLength;
+
+                    for (int i = firstInner - 1; i >= 0; i--)
+                    {
+                        if (++coords[i] < outDims[i])
+                            break;
+                        coords[i] = 0;
+                    }
                 }
             }
         }
