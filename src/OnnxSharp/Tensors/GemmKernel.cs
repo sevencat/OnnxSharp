@@ -1,5 +1,7 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace OnnxSharp.Tensors;
 
@@ -98,32 +100,14 @@ internal static class GemmKernel
     /// </summary>
     private static unsafe void MultiplyRow(float* a, float* b, float* c, int k, int width, int bStride)
     {
-        int vw = Vector<float>.Count;
         int j = 0;
 
-        for (; j + 4 * vw <= width; j += 4 * vw)
-        {
-            var c0 = Vector<float>.Zero;
-            var c1 = Vector<float>.Zero;
-            var c2 = Vector<float>.Zero;
-            var c3 = Vector<float>.Zero;
+        // AVX2+FMA：256 位、8 路 F32，显式 FMA 融合。
+        // Vector<float> 不保证被 JIT 融成 FMA，浮点语义上也不能随便融，所以这里手写。
+        if (Avx2.IsSupported && Fma.IsSupported)
+            j = MultiplyRowAvx2(a, b, c, k, width, bStride);
 
-            for (int t = 0; t < k; t++)
-            {
-                var avv = new Vector<float>(a[t]);
-                float* brow = b + (long)t * bStride + j;
-
-                c0 += avv * Unsafe.ReadUnaligned<Vector<float>>(brow);
-                c1 += avv * Unsafe.ReadUnaligned<Vector<float>>(brow + vw);
-                c2 += avv * Unsafe.ReadUnaligned<Vector<float>>(brow + 2 * vw);
-                c3 += avv * Unsafe.ReadUnaligned<Vector<float>>(brow + 3 * vw);
-            }
-
-            Unsafe.WriteUnaligned(c + j, c0);
-            Unsafe.WriteUnaligned(c + j + vw, c1);
-            Unsafe.WriteUnaligned(c + j + 2 * vw, c2);
-            Unsafe.WriteUnaligned(c + j + 3 * vw, c3);
-        }
+        int vw = Vector<float>.Count;
 
         // 剩余不足 4 个向量的部分：逐个向量处理（C 已清空，直接累加）
         int vectorEnd = width - vw;
@@ -145,6 +129,42 @@ internal static class GemmKernel
                 sum += a[t] * b[(long)t * bStride + j];
             c[j] += sum;
         }
+    }
+
+    /// <summary>
+    /// AVX2+FMA 主循环：一次算 4 个 <see cref="Vector256{T}"/>（32 个 float），
+    /// 累加器全在 ymm 寄存器里，k 轮下来 C 只写一次。返回已处理的列数。
+    /// </summary>
+    private static unsafe int MultiplyRowAvx2(float* a, float* b, float* c, int k, int width, int bStride)
+    {
+        const int vw = 8;   // Vector256<float>
+        int j = 0;
+
+        for (; j + 4 * vw <= width; j += 4 * vw)
+        {
+            var c0 = Vector256<float>.Zero;
+            var c1 = Vector256<float>.Zero;
+            var c2 = Vector256<float>.Zero;
+            var c3 = Vector256<float>.Zero;
+
+            for (int t = 0; t < k; t++)
+            {
+                var av = Vector256.Create(a[t]);
+                float* brow = b + (long)t * bStride + j;
+
+                c0 = Fma.MultiplyAdd(av, Avx.LoadVector256(brow), c0);
+                c1 = Fma.MultiplyAdd(av, Avx.LoadVector256(brow + vw), c1);
+                c2 = Fma.MultiplyAdd(av, Avx.LoadVector256(brow + 2 * vw), c2);
+                c3 = Fma.MultiplyAdd(av, Avx.LoadVector256(brow + 3 * vw), c3);
+            }
+
+            Avx.Store(c + j, c0);
+            Avx.Store(c + j + vw, c1);
+            Avx.Store(c + j + 2 * vw, c2);
+            Avx.Store(c + j + 3 * vw, c3);
+        }
+
+        return j;
     }
 
     /// <summary>
