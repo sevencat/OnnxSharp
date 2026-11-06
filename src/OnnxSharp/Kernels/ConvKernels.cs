@@ -67,13 +67,25 @@ internal static class ConvKernels
             return;
         }
 
-        int blockCount = (outH + BlockRows - 1) / BlockRows;
+        // 行块大小自适应：小特征图（如 patch_embedding 的 32×32）按 8 行切只有几个任务，
+        // 喂不满多核，这时把行块减小换取更多任务。
+        int rowsPerBlock = BlockRows;
+        int threads = Environment.ProcessorCount;
 
-        // 小特征图（如 80×80）只按行切只有十来个任务，喂不满多核；
-        // 再把输出宽度切开，让任务数达到线程数的 2 倍左右。
+        while (rowsPerBlock > 1)
+        {
+            int blocks = (outH + rowsPerBlock - 1) / rowsPerBlock;
+            if (batches * groups * blocks >= threads * 2)
+                break;
+            rowsPerBlock /= 2;
+        }
+
+        int blockCount = (outH + rowsPerBlock - 1) / rowsPerBlock;
+
+        // 行方向仍然不够时再把输出宽度切开（列切分要额外搬一次输出，代价更高）
         int spatialTasks = batches * groups * blockCount;
         int colSplits = 1;
-        while (spatialTasks * colSplits < Environment.ProcessorCount * 2
+        while (spatialTasks * colSplits < threads * 2
                && outW / (colSplits * 2) >= 32)
         {
             colSplits *= 2;
@@ -89,7 +101,7 @@ internal static class ConvKernels
             var biases = bias is null ? Span<float>.Empty : bias.AsSpan<float>();
             var dst = output.AsSpan<float>();
 
-            int maxPixels = BlockRows * tileWidth;
+            int maxPixels = rowsPerBlock * tileWidth;
             float[] pool = ArrayPool<float>.Shared.Rent(kernelSize * maxPixels);
             float[]? outPool = colSplits > 1
                 ? ArrayPool<float>.Shared.Rent(outPerGroup * maxPixels)
@@ -104,8 +116,8 @@ internal static class ConvKernels
                 int n = outer / groups;
                 int g = outer - n * groups;
 
-                int oyBegin = block * BlockRows;
-                int rows = Math.Min(BlockRows, outH - oyBegin);
+                int oyBegin = block * rowsPerBlock;
+                int rows = Math.Min(rowsPerBlock, outH - oyBegin);
 
                 int oxBegin = colSplit * tileWidth;
                 int colCount = Math.Min(tileWidth, outW - oxBegin);

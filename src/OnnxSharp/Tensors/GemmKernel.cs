@@ -91,28 +91,59 @@ internal static class GemmKernel
     /// <summary>
     /// 单行的一列块：<c>c[0,width) += a[0,k) · b[k,width)</c>。
     /// <paramref name="bStride"/> 是 B 的真实行步长（列块起点已在 b 里偏移过）。
+    /// <para>
+    /// 主循环一次算 <b>4 个向量（32 个 float）</b>：这 4 个向量全程留在寄存器里累加，
+    /// k 轮下来 C 只写一次。逐轮 load/store C 会让访存和 FMA 抢发射端口，是最容易踩的坑。
+    /// </para>
     /// </summary>
     private static unsafe void MultiplyRow(float* a, float* b, float* c, int k, int width, int bStride)
     {
-        int vecWidth = Vector<float>.Count;
-        int vectorEnd = width - vecWidth;
+        int vw = Vector<float>.Count;
+        int j = 0;
 
-        for (int t = 0; t < k; t++)
+        for (; j + 4 * vw <= width; j += 4 * vw)
         {
-            float av = a[t];
-            float* brow = b + (long)t * bStride;
-            var avv = new Vector<float>(av);
+            var c0 = Vector<float>.Zero;
+            var c1 = Vector<float>.Zero;
+            var c2 = Vector<float>.Zero;
+            var c3 = Vector<float>.Zero;
 
-            int j = 0;
-            for (; j <= vectorEnd; j += vecWidth)
+            for (int t = 0; t < k; t++)
             {
-                var bv = Unsafe.ReadUnaligned<Vector<float>>(brow + j);
-                var cv = Unsafe.ReadUnaligned<Vector<float>>(c + j);
-                Unsafe.WriteUnaligned(c + j, cv + avv * bv);
+                var avv = new Vector<float>(a[t]);
+                float* brow = b + (long)t * bStride + j;
+
+                c0 += avv * Unsafe.ReadUnaligned<Vector<float>>(brow);
+                c1 += avv * Unsafe.ReadUnaligned<Vector<float>>(brow + vw);
+                c2 += avv * Unsafe.ReadUnaligned<Vector<float>>(brow + 2 * vw);
+                c3 += avv * Unsafe.ReadUnaligned<Vector<float>>(brow + 3 * vw);
             }
 
-            for (; j < width; j++)
-                c[j] += av * brow[j];
+            Unsafe.WriteUnaligned(c + j, c0);
+            Unsafe.WriteUnaligned(c + j + vw, c1);
+            Unsafe.WriteUnaligned(c + j + 2 * vw, c2);
+            Unsafe.WriteUnaligned(c + j + 3 * vw, c3);
+        }
+
+        // 剩余不足 4 个向量的部分：逐个向量处理（C 已清空，直接累加）
+        int vectorEnd = width - vw;
+
+        for (; j <= vectorEnd; j += vw)
+        {
+            var acc = Vector<float>.Zero;
+
+            for (int t = 0; t < k; t++)
+                acc += new Vector<float>(a[t]) * Unsafe.ReadUnaligned<Vector<float>>(b + (long)t * bStride + j);
+
+            Unsafe.WriteUnaligned(c + j, acc);
+        }
+
+        for (; j < width; j++)
+        {
+            float sum = 0;
+            for (int t = 0; t < k; t++)
+                sum += a[t] * b[(long)t * bStride + j];
+            c[j] += sum;
         }
     }
 
