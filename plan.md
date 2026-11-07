@@ -345,7 +345,10 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 **未完成 / 重新排序**
 
 1. [x] **MatMul 合并 batch 维**：B 不广播时把 `(batch, m)` 拼成一次 GEMM。修掉 decoder q/k/v 投影「300 个 batch × m=1、权重被打包 300 遍」的浪费，单算子 4.06 → 0.13 ms，rfdetr-small -24%、medium -12%
-2. [ ] **逐元素融合（第二收益点）**：`Add 169 + Mul 114 + Div 35 + Sqrt 45` 占 DETR 约 20%，每次都是一遍全量读写。实测 56 GB/s ≈ 单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量，只能靠融合减少遍数**
+2. [x] **逐元素融合（第二收益点）** —— 2026-11-07 完成：`Core/GraphFusion.FuseElementWiseChains` 把「中间结果只有 1 个消费者、不是图输出、链上同形」的逐元素链编译成 `Ops/FusedEltwiseLayer`（寄存器机 `EltwiseStep[]`，中间值留在 YMM），rfdetr-small 12 条 GELU 链、节点 857 → 801，端到端 **small -7.4% / medium -9.1%**（min，交替 A/B），4 模型输出 `max|diff| = 0`。
+   - 关键教训：**通用解释型内核在 SIMD 上是反模式**。`Vector256[]` 用运行期下标访问会被 JIT 打回内存 + 每步一次 `switch`，实测比不融合还慢（1.65 vs 1.50 ms/层）。给 GELU 写手写内核后 0.30 ms/层。
+   - 短链要设门槛：`chain.Count < 4 && 元素数 < 1<<18` 不融合（否则 yolo median 反而 +4%）。
+   - 已贴带宽墙：融合后 42 GB/s，与拆分时一致，**这条线到头**。
 3. [ ] **静态形状图缓存逐算子的形状/类型推断**：`Interpreter.Run` 每 forward 对 **2064 个算子**重算 `GetMemoryShapes`/`GetTypes`/`BindArgTensor`/`FitTemps`，实测每 forward 分配 **113 MB**。代价目前很小（GC 暂停 0.7 ms/iter、无降频），所以排在逐元素融合之后，但属于纯收益
 4. [ ] **GEMM 多线程扩展性**：16 线程跑出机器峰值（753 GFLOPS）的 40%~46%：
    - [ ] 二维 cache blocking（m 块 × n 块都分块），让每个线程的 B 面板只读一遍
@@ -680,6 +683,8 @@ onnx.save(m, sys.argv[2])
 | MatMul **已经跑满**：133 ms / 54.1 GFLOP = **407 GFLOPS**，不低于同形状独立基准（386）。GEMM 不再是可挖的点 | `profile` + `gemmbench` |
 | decoder q/k/v 投影运行时是 `[300,1,256]×[256,256]`（300 个 batch × m=1），按 batch 逐个调内核会把权重重打包 300 遍，**已修为合并 batch 维**（4.06 → 0.13 ms/算子） | `profile` 逐算子 + 端到端 A/B（-24%） |
 | 逐元素算子已向量化+并行，实测 **56 GB/s**，是单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量**，只能靠**融合减少遍数** | 微模型 `add-1024x1024` + numpy memcpy 对照 |
+| 逐元素融合已落地并**贴到带宽墙**：GELU 五节点链 1.50 → 0.30 ms/层，但融合前后都是 **42 GB/s**（63 MB / 1.50 ms vs 12.6 MB / 0.30 ms），说明省下来的纯粹是趟数。rfdetr-small/medium 端到端 -7.4% / -9.1%，输出逐位不变 | `bench.md` 结论 2 + 交替 A/B |
+| 融合内核的形态决定成败：**通用 `EltwiseStep[]` 解释器比不融合还慢**（运行期下标的 `Vector256[]` 被 JIT 打回内存 + 每步 `switch`），固定形状必须手写内核。短链（<4 节点、<256K 元素）融合是负收益 | `profile` 逐算子 1.65 vs 1.50 vs 0.30 ms |
 | YOLO 侧差距集中在 `s` 档（层宽 128~256），是**大 GEMM 分块/打包**，不是单个卷积 | `bench.md` 相对倍率表 |
 | **独立内核吞吐无法预测端到端**：B 预打包、`mb` 扫参、列切分（+45%）三次都出现「微基准变快、端到端无变化」；且统计 FLOPs 时漏掉前置 batch 会凭空造出「慢 3 倍」的假象。只能用同会话交替 A/B 判定 | `bench.md` 结论 3 |
 | GC 与降频都已排除：GC 暂停 0.7 ms/iter；同一形状连续跑 3000 次不衰减（383 vs 386 GFLOPS）。**profile 与 bench 的唯一差别只是口径**：各算子均值之和 251 ms ≈ 端到端中位数，min 之和 215 ms 是下界 | `bench` 新增的 `alloc`/`gc`/`gc pause` 三行输出 |

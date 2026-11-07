@@ -41,5 +41,6 @@ public static class LayerRegistry
         Ops.BroadcastOps.Register();
         Ops.MiscOps.Register();
         Ops.AttnOps.Register();
+        Ops.FusedEltwiseLayer.Register();
     }
 }

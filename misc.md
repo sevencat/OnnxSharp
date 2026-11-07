@@ -566,6 +566,30 @@ Tile TopK Transpose Unsqueeze Where
 
 39. **`Parallel.For` 的固定开销约 7 µs**，小算子开线程反而更慢。当前阈值：`GemmKernel.ParallelThreshold = 1<<22` 乘加、`TensorOps.ParallelElementThreshold = 1<<16` 元素。副作用是 `300×32×300`（2.9M 乘加）这类形状被判定串行，只能跑 60 GFLOPS —— 更好的做法是「按 batch 并行」而不是整算子串行。
 
+### 6.6 逐元素融合（2026-11-07，全部踩过）
+
+42. **`Vector256<float>[]` 用运行期下标访问 = 全部溢到栈上**。通用「寄存器机」内核（`regs[dst] = op(regs[a], regs[b])`）看着很优雅，
+    但 JIT 不可能把「下标是变量」的数组元素提升到 YMM 寄存器，每一步都是「写回栈、下一步再读回来」，
+    再叠加每步一次 `switch` 分发 —— 实测比不融合还慢：每条 GELU 融合层 1.65 ms，而拆成五个算子是 1.50 ms，
+    **省下的 4 遍读写被内核自身的开销全部吃回去**。
+    修法不是优化通用内核，而是**给固定形状的链手写内核**（中间值全是本地变量）：1.65 → 0.30 ms，一步到位。
+    推论：算子融合的正确形态是「模式识别 + 代码生成/手写内核」，通用解释器（interpreter loop over steps）在 SIMD 上基本没用。
+43. **融合链的点数要设门槛**。2~3 节点的链只省 1~2 遍读写，抵不过 `GCHandle` pin×4、闭包分配、数组索引这些固定开销：
+    yolo 系列（链短、张量小）长跑 A/B 里 median 慢 4%。现在规则是
+    `chain.Count < 4 && shape.Total() < 1<<18` 就不融合；加上之后 yolo11n 变成 median -5%（不再是负收益）、rfdetr 不受影响。
+44. **GELU 在 ONNX 里是 `Div → Erf → Add → Mul → Mul`，顺序容易记错**。
+    实际导出是 `x/√2 → Erf → (erf+1) → x·(erf+1) → ·0.5`，
+    不是 `Mul(x,0.5)` 在前。做模式匹配时**不要硬编码操作数位置**（ONNX 不保证 `Mul` 的左右序），
+    也不要假设「被乘数就是 Div 的被除数」—— 要显式校验两个操作数指向同一个寄存器，否则会静默算错。
+    另外注意 `FusedEltwiseLayer` 构造函数里 `Inputs` 还是空的，`nIn` 只能用 `regCount - steps.Length` 反推。
+45. **融合的正确性不能只靠 golden 测试**。golden 只覆盖 yolo11n，而 rfdetr 上的 GELU 链是最激进的改动；
+    本轮曾出现过 8 节点错误链（同一节点重复 8 次）却没触发任何测试失败。
+    现在 `run --dump <dir>` 会把每个输出按 float 落盘，`bench/results/ab_dump.ps1` + `cmp_all.py`
+    对 base/fused 做逐值比对（rfdetr-small/medium + yolo11n/yolov8s 全部 max|diff| = 0）。
+46. **沿「消费者」前进，不是沿「生产者」**。第一版用 `producer[outIdx]` 找下一个节点，拿到的是节点自己，
+    于是构出「同一节点重复 N 次」的链（还真的跑出了结果）。正确做法是建 `consumerOf[argIdx]`
+    （一个 arg 只有一个消费者时才能延伸），并且要显式 `chain.Contains(next)` 防环。
+
 ---
 
 ## 7. 工具脚本
@@ -774,7 +798,7 @@ F:\code\OnnxSharp\
 │  ├─ Core\NetImpl.cs                    Arg 表 + 槽/池 + Declare/Require + PrepareForGraph [M0.5]
 │  ├─ Core\Net.cs                        门面（ReadModel / Forward / ForwardAll）
 │  ├─ Core\ConstFolder.cs                常量折叠（消除 shape 链）               [M3]
-│  ├─ Core\GraphFusion.cs                图级融合 pass（Mul 常量折叠等）          [M4]
+│  ├─ Core\GraphFusion.cs                图级融合 pass（Mul 常量折叠 / Silu / 逐元素链）[M4]
 │  ├─ Core\OnnxSharpException.cs
 │  ├─ Engine\BufferAllocator.cs          生命周期区间着色，共享缓冲槽             [M0.5]
 │  ├─ Onnx\Proto.cs                      protobuf 消息视图（零拷贝）             [M1]
@@ -789,7 +813,8 @@ F:\code\OnnxSharp\
 │  ├─ Ops\MiscOps.cs                     Cast/Erf/Sin/Cos/比较/逻辑 等杂项         [M3]
 │  ├─ Threading\ParallelRange.cs         parallel_for_ 等价物（小任务直接串行）
 │  ├─ Ops\NaryEltwiseLayer.cs            Add/Sub/Mul/Div/Max/Min
-│  └─ Ops\ActivationLayer.cs             Relu/Sigmoid/Sqrt/Exp/Neg/Abs
+│  ├─ Ops\ActivationLayer.cs             Relu/Sigmoid/Sqrt/Exp/Neg/Abs
+│  └─ Ops\FusedEltwiseLayer.cs           逐元素链融合执行器（寄存器机 + GELU 手写内核）[M4]
 ├─ tests\OnnxSharp.Tests\                零依赖测试运行器；29 个用例（net10.0）
 │  ├─ Harness.cs                         TestCase / Assert / RunAll / Skip
 │  ├─ ArgTableTests.cs                   Declare/Require/TryGetArg/常量元信息
@@ -853,6 +878,7 @@ SMOKE TEST: PASS
 | 2026-11-07 | **M1 第一批完成**：`Onnx/Proto.cs`（零拷贝 protobuf 视图）、`Onnx/OnnxFile.cs`（结构 + TensorProto 解码，含外部数据路径校验）、CLI `info` 子命令、`OnnxReaderTests`（7 个用例）。实测 yolo11n 22ms/320 节点/196 init，rfdetr-small 91ms/1539 节点/354 init。新增坑 #31（DataType 从 1 起）、#32（RF-DETR 双输出）、#33（Constant 才是 I64 来源） |
 | 2026-11-07 | **M0.5 落地完成**：`Engine/BufferAllocator.cs`（生命周期着色）、`LayerInfo.Net` + `In()/IsConstInput()`、`Graph.Version/Reset/RemoveAll`、`NetImpl` 槽池 + `FitTemps` + `Declare/Require/TryGetArg`、`Interpreter` 动态形状分支 + 类型签名、`Tensors/Layout.cs` 预留、`tests/OnnxSharp.Tests`（零依赖 16 用例）。`dotnet build` 0 警告 0 错误，16/16 PASS |
 | 2026-11-07 | **建立 `bench.md`（性能唯一事实源）+ `bench/` 脚本体系**：`run_all.py` 一条命令跑 4 引擎 × 6 模型（OnnxSharp / ORT CPU / OpenCV 5 dnn / SimdYolo，YOLO×4 + RF-DETR×2），输出 median/min 双指标；实测 yolo11n 43.4 ms、rfdetr-small 317.5 ms。新增坑 #36（分层编译按次数预热会低估 4 倍） |
+| 2026-11-07 | **逐元素图级融合落地**（`GraphFusion.FuseElementWiseChains` + `Ops/FusedEltwiseLayer.cs`）：GELU `Div→Erf→Add→Mul→Mul` 编译成单层，rfdetr-small 12 条链、节点 857→801，端到端 **-7.4% / medium -9.1%**，输出 max\|diff\|=0。新增 §6.6 坑 #42~#46（运行期下标的 `Vector256[]` 会被 JIT 打回内存、短链必须设门槛、GELU 实际算子顺序、golden 覆盖不足要用 `run --dump` 逐值 A/B、沿消费者而非生产者遍历）；§9 目录树补 `FusedEltwiseLayer.cs`；CLI `run` 新增 `--dump <dir>` |
 | 2026-11-07 | **上一轮：RF-DETR 瓶颈定位到 batched attention GEMM**（结论后被修正）。新增 §6.5 坑 #36~#39（分层编译预热、A/B 必须交替、两个已否决的内核方向、`Parallel.For` 7 µs 阈值）；`gemmbench` 加 `--batch` 并改为按时间预热；新增 `bench/make_micro_models.py` |
 | 2026-11-07 | **本轮：修正上一轮两个错误结论 + 修掉最大单点浪费**。① §3.10 重写：140 个 MatMul 里 MLP（`[257,384]×[384,1536]`）与投影都是真 MatMul，合计 **54.1 GFLOP**（前置 batch 4），in-situ 407 GFLOPS，GEMM 已到顶；② 机器上限用 `fma` 重新量：单线程 91 GFLOPS、16 线程 753 GFLOPS；③ `MatMul` 在 B 不广播时合并 `(batch, m)`（decoder q/k/v 投影是 `[300,1,256]×[256,256]`，权重曾被打包 300 遍，4.06 → 0.13 ms），rfdetr-small **356 → 270 ms（-24%）**、medium -12%；④ `ProfileAll` 加预热与每算子最小耗时（坑 #41）；⑤ 新增 `fma`、`gemmbench --threads`、逐元素带宽与链式 MLP 微模型、`bench` 的 `alloc`/`gc`/`gc pause` 诊断；⑥ 排除 GC（0.7 ms/iter）与降频（长跑不衰减）两个嫌疑，剩下的计时差指向 host 侧每 forward 重算 2064 个算子的形状并分配 113 MB；新增坑 #40（独立内核吞吐无法预测端到端） |
 

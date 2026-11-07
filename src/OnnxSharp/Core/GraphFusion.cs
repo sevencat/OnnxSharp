@@ -1,3 +1,4 @@
+using OnnxSharp.Ops;
 using OnnxSharp.Tensors;
 
 namespace OnnxSharp.Core;
@@ -21,7 +22,257 @@ internal static class GraphFusion
         total += FuseSilu(net, graph);
         total += FuseActivationIntoProducer(net, graph);
 
+        // 逐元素链融合放最后：前面两步可能已经把 Sigmoid+Mul 变成单个 Silu，
+        // 那样链里就少一个节点，融合结果的寄存器也更省。
+        total += FuseElementWiseChains(net, graph);
+
         return total;
+    }
+
+    /// <summary>可以进融合链的逐元素算子（都是同形状、无广播的 F32 运算）。</summary>
+    private static readonly Dictionary<string, EltwiseKind> FusableEltwise = new()
+    {
+        ["Add"] = EltwiseKind.Add,
+        ["Sub"] = EltwiseKind.Sub,
+        ["Mul"] = EltwiseKind.Mul,
+        ["Div"] = EltwiseKind.Div,
+        ["Min"] = EltwiseKind.Min,
+        ["Max"] = EltwiseKind.Max,
+        ["Sqrt"] = EltwiseKind.Sqrt,
+        ["Erf"] = EltwiseKind.Erf,
+        ["Exp"] = EltwiseKind.Exp,
+        ["Neg"] = EltwiseKind.Neg,
+        ["Abs"] = EltwiseKind.Abs,
+        ["Relu"] = EltwiseKind.Relu,
+        ["Sigmoid"] = EltwiseKind.Sigmoid,
+    };
+
+    /// <summary>一条融合链最多这么长（再长寄存器也不够用，收益也早饱和了）。</summary>
+    private const int MaxChainLength = 8;
+
+    /// <summary>达到这个长度的链无条件融合（省下的流量足够多）。</summary>
+    private const int MinChainLength = 4;
+
+    /// <summary>不足 <see cref="MinChainLength"/> 的短链，张量至少这么大才值得融合。</summary>
+    private const long MinShortChainElements = 1L << 18;
+
+    /// <summary>
+    /// 把同形状的逐元素算子链融合成一个 <see cref="FusedEltwiseLayer"/>。
+    /// <para>
+    /// 典型目标是 GELU：<c>Erf → Add → Mul → Mul</c> 四个节点各自「读一遍整张张量、写一遍」，
+    /// 融合后整条链只读外部输入一遍、写最终输出一遍，中间结果留在 YMM 寄存器里。
+    /// RF-DETR 有 12 条这样的链，每推理省 613 MB 内存流量。
+    /// </para>
+    /// <para>
+    /// 成立条件（任一不满足就停在那一步，只融已经确定安全的部分）：
+    /// 中间结果<b>只被链上下一个节点消费</b>、不是图输出、形状静态已知且整条链相同；
+    /// 链上的其它操作数要么同形，要么是元素数为 1 的常量（GELU 的 <c>+1</c>／<c>×0.5</c>）。
+    /// </para>
+    /// </summary>
+    private static int FuseElementWiseChains(NetImpl net, Graph graph)
+    {
+        var prog = graph.Prog;
+        if (prog.Count < 2)
+            return 0;
+
+        // 每个 Arg 被用了多少次、被谁用（多次消费时 consumerOf 的值不可信，用 count 判定）
+        var consumers = new Dictionary<int, int>();
+        var consumerOf = new Dictionary<int, LayerInfo>();
+
+        foreach (var op in prog)
+        {
+            foreach (var arg in op.Inputs)
+            {
+                if (arg.IsEmpty)
+                    continue;
+
+                consumers[arg.Idx] = consumers.TryGetValue(arg.Idx, out int count) ? count + 1 : 1;
+                consumerOf[arg.Idx] = op;
+            }
+        }
+
+        var graphOutputs = CollectOutputs(graph);
+        var consumed = new HashSet<LayerInfo>();
+
+        // 最后一个节点 → 融合层（融合层插在最后一个节点的位置，保证外部输入的产出都在它之前）
+        Dictionary<LayerInfo, LayerInfo>? replace = null;
+
+        foreach (var head in prog)
+        {
+            if (consumed.Contains(head) || !TryGetKind(head, out _))
+                continue;
+
+            if (!TryGetOutputShape(net, head, out var shape))
+                continue;
+
+            var chain = new List<LayerInfo> { head };
+
+            while (chain.Count < MaxChainLength)
+            {
+                var cur = chain[^1];
+                if (cur.Outputs.Count != 1 || cur.Outputs[0].IsEmpty)
+                    break;
+
+                int outIdx = cur.Outputs[0].Idx;
+                if (graphOutputs.Contains(outIdx))
+                    break;
+                if (!consumers.TryGetValue(outIdx, out int uses) || uses != 1)
+                    break;
+                if (!consumerOf.TryGetValue(outIdx, out var next) || !TryGetKind(next, out _))
+                    break;
+                if (next.Outputs.Count != 1 || !TryGetOutputShape(net, next, out var nextShape))
+                    break;
+                if (!nextShape.Equals(shape))
+                    break;
+                if (chain.Contains(next))
+                    break;   // 防环（推理图里不该有，但别让一个 bug 变成死循环）
+                if (!InputsCompatible(net, next, shape))
+                    break;
+
+                chain.Add(next);
+            }
+
+            if (chain.Count < 2)
+                continue;
+
+            // 短链（2~3 个节点）省下的流量本来就少，却要和通用内核的
+            // pin/闭包/寄存器数组索引开销对抵，小张量上净收益是负的（yolo 系列实测 median 变慢 4%）。
+            // 只有长链或大张量才值得。
+            if (chain.Count < MinChainLength && shape.Total() < MinShortChainElements)
+                continue;
+
+            // 链头自己的输入也要能同形处理，否则整条放弃
+            if (!InputsCompatible(net, chain[0], shape))
+                continue;
+
+            var fused = BuildFusedLayer(net, chain);
+            if (fused is null)
+                continue;
+
+            foreach (var op in chain)
+                consumed.Add(op);
+
+            (replace ??= new Dictionary<LayerInfo, LayerInfo>()).Add(chain[^1], fused);
+        }
+
+        if (replace is null)
+            return 0;
+
+        var result = new List<LayerInfo>(prog.Count);
+        foreach (var op in prog)
+        {
+            if (replace.TryGetValue(op, out var fused))
+                result.Add(fused);
+            else if (!consumed.Contains(op))
+                result.Add(op);
+        }
+
+        graph.Reset(result);
+        return consumed.Count - replace.Count;
+    }
+
+    private static bool TryGetKind(LayerInfo op, out EltwiseKind kind)
+    {
+        kind = default;
+        if (op.Inputs.Count is < 1 or > 2 || op.Outputs.Count != 1)
+            return false;
+        return FusableEltwise.TryGetValue(op.Type, out kind);
+    }
+
+    private static bool TryGetOutputShape(NetImpl net, LayerInfo op, out TensorShape shape)
+    {
+        var data = net.GetArgData(op.Outputs[0]);
+        shape = data.HasShape ? data.Shape : default;
+        return data.HasShape && data.DType == DType.F32;
+    }
+
+    /// <summary>输入的每个操作数：要么与链同形，要么元素数为 1（标量常量，splat 处理）。</summary>
+    private static bool InputsCompatible(NetImpl net, LayerInfo op, TensorShape shape)
+    {
+        long total = shape.Total();
+
+        foreach (var arg in op.Inputs)
+        {
+            var data = net.GetArgData(arg);
+            if (!data.HasShape || data.DType != DType.F32)
+                return false;
+
+            long t = data.Shape.Total();
+            if (t != total && t != 1)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static LayerInfo? BuildFusedLayer(NetImpl net, List<LayerInfo> chain)
+    {
+        // 链内中间结果：这些 Arg 不出现在融合层的输入里
+        var internalArgs = new HashSet<int>();
+        for (int i = 0; i < chain.Count - 1; i++)
+        {
+            if (chain[i].Outputs.Count == 1 && !chain[i].Outputs[0].IsEmpty)
+                internalArgs.Add(chain[i].Outputs[0].Idx);
+        }
+
+        // 第一遍：收集外部输入（按首次出现顺序分配寄存器 0..n-1）；
+        // 链内中间结果是上一字节点的产出，跳过，第二遍再按步骤序号编号。
+        var inputArgs = new List<Arg>();
+        var regOf = new Dictionary<int, int>();
+
+        foreach (var op in chain)
+        {
+            foreach (var arg in op.Inputs)
+            {
+                if (arg.IsEmpty)
+                    return null;
+                if (internalArgs.Contains(arg.Idx) || regOf.ContainsKey(arg.Idx))
+                    continue;
+
+                regOf[arg.Idx] = inputArgs.Count;
+                inputArgs.Add(arg);
+            }
+        }
+
+        // 第二遍：发指令。中间寄存器从 nIn 开始编号。
+        int nIn = inputArgs.Count;
+        var steps = new EltwiseStep[chain.Count];
+
+        for (int i = 0; i < chain.Count; i++)
+        {
+            var op = chain[i];
+            if (!FusableEltwise.TryGetValue(op.Type, out var kind))
+                return null;
+
+            // 操作数若由链内前序步骤产出，则取该步骤的目标寄存器
+            int RegOf(Arg arg)
+            {
+                if (regOf.TryGetValue(arg.Idx, out int r))
+                    return r;
+                throw new InvalidOperationException($"fused chain is not topologically ordered at {op.Name}");
+            }
+
+            int a = RegOf(op.Inputs[0]);
+            int b = op.Inputs.Count > 1 ? RegOf(op.Inputs[1]) : -1;
+
+            steps[i] = new EltwiseStep(kind, a, b, nIn + i);
+
+            if (op.Outputs.Count == 1 && !op.Outputs[0].IsEmpty)
+                regOf[op.Outputs[0].Idx] = nIn + i;
+        }
+
+        var last = chain[^1];
+        var fused = new FusedEltwiseLayer(
+            new LayerParams { Type = "FusedEltwise", Name = last.Name },
+            steps,
+            nIn + steps.Length,
+            nIn + steps.Length - 1);
+
+        foreach (var arg in inputArgs)
+            fused.Inputs.Add(arg);
+
+        fused.Outputs.Add(last.Outputs[0]);
+        return fused;
     }
 
     /// <summary>

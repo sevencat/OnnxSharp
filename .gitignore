@@ -10,3 +10,6 @@ artifacts/
 bench/inputs/
 bench/models/
 bench/bin/
+bench/bin-base/
+bench/bin-fused/
+bench/results/dump-*/

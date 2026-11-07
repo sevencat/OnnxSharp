@@ -252,6 +252,10 @@ static int Run(string[] args)
     Console.WriteLine($"forward   : {watch.Elapsed.TotalMilliseconds / repeat:F1} ms/iter ({repeat} iter)");
 
     var outputs = net.OutputNames;
+    string? dumpDir = options.GetString("--dump");
+    if (dumpDir is not null)
+        Directory.CreateDirectory(dumpDir);
+
     for (int i = 0; i < first!.Count; i++)
     {
         var tensor = first[i];
@@ -269,6 +273,13 @@ static int Run(string[] args)
 
         Console.WriteLine($"output[{i}] : {outputs[i],-12}{Describe(net.Impl.GetArgData(net.Impl.Require(outputs[i])))}  " +
                           $"min={min:F4} max={max:F4} mean={sum / Math.Max(1, span.Length):F6}");
+
+        if (dumpDir is not null)
+        {
+            var raw = new byte[span.Length * sizeof(float)];
+            System.Runtime.InteropServices.MemoryMarshal.AsBytes(span).CopyTo(raw);
+            File.WriteAllBytes(Path.Combine(dumpDir, $"out{i}.f32"), raw);
+        }
 
         if (options.Compare is not null && i == 0)
             CompareWithGolden(span, options.Compare);

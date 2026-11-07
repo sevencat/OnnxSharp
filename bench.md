@@ -48,6 +48,7 @@ python bench/run_all.py --names yolo11n,rfdetr-small --runtimes onnxsharp,opencv
 python bench/run_python_bench.py --runtime ort --iters 30 --warmup 10 --threads 16
 python bench/run_python_bench.py --runtime cv  --iters 30 --warmup 10 --threads 16
 tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe bench <model.onnx> --input <in.f32> --iters 30 --warmup 10
+tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe run  <model.onnx> --input <in.f32> --dump out/   # 输出按 F32 落盘（逐值 A/B 用）
 F:\code\SimdYolo\src\SimdYolo.Cli\bin\Release\net10.0\SimdYolo.Cli.exe bench <model.onnx> cpu 640 30 16 10
 ```
 
@@ -141,6 +142,34 @@ min（无干扰下限）：
    - **最大的一处浪费（已修复）**：DETR decoder 的 q/k/v 投影运行时是 `[300,1,256]×[256,256]`（300 个 batch、每 batch m=1）。
      引擎按 batch 逐个调内核，于是 256 KB 的权重被重新打包 300 遍，单个算子 4.06 ms；
      而 `(batch, m)` 合并后只是一次 `300×256×256` 的 GEMM，0.13 ms。9 个这样的算子，端到端 **356 → 270 ms（-24%）**。
+   - **逐元素图级融合（2026-11-07 新增，已落地）**：DETR 每个 transformer block 的 GELU 在图上就是
+     `Div → Erf → Add → Mul → Mul` 五个节点，每个节点都对 `[4,257,1536]`（1.58 M 元素）整读整写一遍。
+     `GraphFusion` 现在把满足「中间结果只有一个消费者、不是图输出、链上同形」的逐元素链编译成一个
+     `FusedEltwiseLayer`（寄存器机式：`reg[dst] = op(reg[a], reg[b])`），中间值全程留在 YMM 寄存器，整条链只读外部输入一遍、写最终输出一遍。
+     rfdetr-small 上 12 条 GELU 链，节点数 857 → 801。
+     - 端到端交替 A/B（同会话，base/fused 两个二进制各 3 轮 × 20 帧取 median）：
+
+       | 模型 | base min | fused min | min 收益 | base median | fused median | median 收益 |
+       | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+       | rfdetr-small | 243.0 | 224.9 | **-7.4%** | 254.1 | 236.1 | **-7.1%** |
+       | rfdetr-medium | 320.2 | 291.2 | **-9.1%** | 336.6 | 305.5 | **-9.2%** |
+       | yolo11n (5 轮×50 帧) | 33.3 | 32.5 | -2.4% | 36.0 | 34.2 | -5.0% |
+       | yolov8s (5 轮×50 帧) | 85.7 | 86.1 | ±0 | 88.7 | 88.4 | ±0 |
+
+     - 输出逐值比对（`run --dump` 落盘后按 float 比较）：4 个模型 **max|diff| = 0**，和未融合逐位一致。
+     - **真正的坑在实现，不在算法**：第一版通用寄存器机内核比不融合还慢（每条 GELU 1.65 ms vs 五个算子合计 1.50 ms）。
+       原因是 `Vector256<float>[] regs` 是**运行期下标**访问的数组，JIT 无法把它提升到 YMM 寄存器，
+       每步都要写回栈再读出来，再叠加每步一次 `switch` 分发，把省下的带宽全部吃掉。
+       解决办法是给 GELU 这一种固定形状写手写内核（中间值是**本地变量**），每条 1.65 → **0.30 ms**，
+       `FusedEltwise` 总耗时 21.5 → 3.5 ms。
+     - **短链要设门槛**：2~3 个节点的链省下的流量本来就少，抵不过 pin/闭包/数组索引的固定开销。
+       yolo 系列的长跑 A/B 里这类小链让 median 变慢 4%（min 持平）；加上「链长 < 4 时张量必须 ≥ 256 K 元素」的门槛后
+       yolo11n 变为 min -2.4% / median -5.0%，不再有回归。
+     - **融合后已经贴到带宽墙，这条链再无空间**：五算子拆分耗时是 `Div 0.30 + Erf 0.25 + Add 0.37 + Mul 0.20 + Mul 0.38 = 1.50 ms`，
+       而单层张量 1.58 M × 4 B = 6.3 MB，10 遍读写 = 63 MB / 1.50 ms = **42 GB/s**；
+       融合后只剩 1 读 1 写 = 12.6 MB / 0.30 ms，仍是 **42 GB/s** —— 完全重合。
+       也就是说这 12 条链已经跑到该机器的逐元素带宽上限，`Erf` 的算力开销（0.25 ms）与访存完全重叠、不可见。
+       继续在 GELU 上做文章没有意义，剩下的只能是**再减少别的算子的趟数**或回到 GEMM。
 3. **GEMM 微内核本身没问题，问题在并行扩展性**（`gemmbench` 与 `fma` 均为按时间预热后的稳态值；测量机状态会漂 ±10%，下表是同一时段的一组）：
 
    | 形状（batch） | 每 batch ms | 等效 GFLOPS |
@@ -175,9 +204,11 @@ min（无干扰下限）：
 
 ## 下一步（按收益排序）
 
-1. **逐元素融合**：`Add 169 + Mul 114 + Div 35 + Sqrt 45 + Erf` 全是全量读写，占 DETR 约 20%。
-   逐元素单个算子实测 56 GB/s，已到单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量，只能靠减少趟数**。
-   先做同形状二元链的原地融合。
+1. ~~**逐元素融合**~~ —— **已完成（2026-11-07，见结论 2）**：GELU 链 `Div→Erf→Add→Mul→Mul` 已融合，
+   rfdetr-small/medium 端到端 **-7.4% / -9.1%**（min），输出逐位不变。
+   注意结论 2 里的带宽核算：融合后已经贴在 42 GB/s 的逐元素带宽上限上，**这条路到头了**，
+   不要再往「更聪明的逐元素融合」投入。`Add 169 + Mul 114` 里剩下的多数节点不是链（每个中间结果有多个消费者），
+   要动只能动 `Sqrt + Div` 这类成对出现的规范化模式（下一轮可查，量级远小于 GELU）。
 2. **静态形状图可以缓存逐算子的形状/类型推断**：`Interpreter.Run` 每 forward 对全部 2064 个算子重算
    `GetMemoryShapes` / `GetTypes` / `BindArgTensor` / `FitTemps`，并实测**每 forward 分配 113 MB**。
    目前它的代价被证明很小（GC 暂停仅 0.7 ms/iter，`GC.GetTotalPauseDuration` 量的；也没有降频，同形状连续跑 3000 次 383 vs 386 GFLOPS），
@@ -194,6 +225,14 @@ min（无干扰下限）：
   修掉两个测量坑：`profile` 增加 `--warmup`（不预热时 tier-0 代码让 MatMul 份额虚高到 66%）、改用每算子最小耗时汇总（均值被后台负载重尾放大 20%+）。
   修复最大单点浪费：MatMul 在 B 不参与广播时把 `(batch, m)` 合并成一次 GEMM，decoder q/k/v 投影 4.06 → 0.13 ms，rfdetr-small -24%、medium -12%。
   验证并否决「按流量改切分方向」（内核 +45%，端到端 0）；新增 `fma` / `gemmbench --threads` 与逐元素带宽、链式 MLP 两个微模型。
+- 2026-11-07（第四轮）：**逐元素图级融合落地**。新增 `Core/GraphFusion.FuseElementWiseChains` 与 `Ops/FusedEltwiseLayer`
+  （寄存器机式 `EltwiseStep[]`，中间值留在 YMM），rfdetr-small 12 条 GELU 链、节点 857 → 801，
+  端到端 rfdetr-small **-7.4%**、rfdetr-medium **-9.1%**（min，交替 A/B 三轮），4 个模型输出 max|diff| = 0。
+  三个必须记住的教训：① 通用内核里**运行期下标的 `Vector256[]` 会被 JIT 打回内存**，固定形状的链（GELU）必须手写内核，
+  1.65 → 0.30 ms；② 2~3 节点短链融合在小张量上是**负收益**（yolo median +4%），要按链长/元素量设门槛；
+  ③ 融合后 42 GB/s 已贴带宽墙，GELU 这条线到头。
+  `run` 新增 `--dump <dir>`（把每个输出按 F32 落盘），配合 `bench/results/ab_dump.ps1` + `cmp_all.py` 做逐值 A/B；
+  交替 A/B 脚本见 `bench/results/ab_fuse.ps1`（4 模型）与 `ab_fuse_yolo.ps1`（小模型长跑）。
   全表重新测量（同会话），rfdetr 对 OpenCV 的倍率从 1.68/1.70 降到 1.41/1.37。
 - 2026-11-07（第三轮补）：再纠正一处算错的 FLOPs —— 主干 MLP/投影的 MatMul 带**前置 batch 4**（windowed attention 的 4 个窗口），
   MatMul 总量是 **54.1 GFLOP** 而不是 16.6，于是 in-situ 是 **407 GFLOPS**（高于同形状独立基准 386），
