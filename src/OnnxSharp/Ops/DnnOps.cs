@@ -1,4 +1,6 @@
 using System.Numerics;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 using OnnxSharp.Threading;
@@ -179,9 +181,15 @@ internal static class DnnOps
 
             Tensor? bias = Inputs.Count > 2 && Inputs[2].Idx != 0 && inputs[2].Count > 0 ? inputs[2] : null;
 
-            Kernels.ConvKernels.Im2Col(
-                input, weight, bias, output,
-                _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[2]);
+            // 3×3 / s1 / pad1 优先走 Winograd F(2,3)（乘法量只有 4/9），不适用再回退 im2col
+            if (!Kernels.Winograd.TryConv3x3(
+                    input, weight, bias, output,
+                    _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1]))
+            {
+                Kernels.ConvKernels.Im2Col(
+                    input, weight, bias, output,
+                    _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1]);
+            }
         }
     }
 
@@ -285,41 +293,59 @@ internal static class DnnOps
             int outH = output.Shape.Dims[2];
             int outW = output.Shape.Dims[3];
 
-            var src = input.AsSpan<float>();
-            var dst = output.AsSpan<float>();
+            int kH = kernel[0], kW = kernel[1];
+            int sH = strides[0], sW = strides[1];
+            int dH = dilations[0], dW = dilations[1];
+            int pT = pads[0], pL = pads[1];
 
-            for (int n = 0; n < batches; n++)
+            // 按 (batch, channel) 并行：SPPF 的三个 5×5 池化原来是整段串行，
+            // 内层还要对每个 tap 做一次边界判断。
+            ParallelRange.For(batches * channels, (begin, end) =>
             {
-                for (int c = 0; c < channels; c++)
+                var s = input.AsSpan<float>();
+                var d = output.AsSpan<float>();
+
+                for (int t = begin; t < end; t++)
                 {
-                    long inBase = ((long)n * channels + c) * inH * inW;
-                    long outBase = ((long)n * channels + c) * outH * outW;
+                    long inBase = (long)t * inH * inW;
+                    long outBase = (long)t * outH * outW;
 
                     for (int oy = 0; oy < outH; oy++)
                     {
+                        int y0 = oy * sH - pT;
+
                         for (int ox = 0; ox < outW; ox++)
                         {
+                            int x0 = ox * sW - pL;
+
+                            // 把左右越界的 tap 直接裁掉，内层循环里就没有分支了
+                            int kx0 = x0 >= 0 ? 0 : (-x0 + dW - 1) / dW;
+                            int limit = inW - x0;
+                            int kx1 = limit <= 0 ? 0 : Math.Min(kW, (limit + dW - 1) / dW);
+                            if (kx1 < kx0)
+                                kx1 = kx0;
+
                             float best = float.NegativeInfinity;
-                            for (int ky = 0; ky < kernel[0]; ky++)
+                            for (int ky = 0; ky < kH; ky++)
                             {
-                                int y = oy * strides[0] - pads[0] + ky * dilations[0];
+                                int y = y0 + ky * dH;
                                 if ((uint)y >= (uint)inH)
                                     continue;
-                                for (int kx = 0; kx < kernel[1]; kx++)
+
+                                long rowBase = inBase + (long)y * inW;
+                                for (int kx = kx0; kx < kx1; kx++)
                                 {
-                                    int x = ox * strides[1] - pads[1] + kx * dilations[1];
-                                    if ((uint)x >= (uint)inW)
-                                        continue;
-                                    float v = src[(int)(inBase + (long)y * inW + x)];
+                                    float v = s[(int)(rowBase + x0 + kx * dW)];
                                     if (v > best)
                                         best = v;
                                 }
                             }
-                            dst[(int)(outBase + (long)oy * outW + ox)] = best;
+
+                            d[(int)(outBase + (long)oy * outW + ox)] = best;
                         }
                     }
                 }
-            }
+            });
         }
     }
 
@@ -440,52 +466,84 @@ internal static class DnnOps
             int outH = output.Shape.Dims[2];
             int outW = output.Shape.Dims[3];
 
-            var src = input.AsSpan<float>();
-            var dst = output.AsSpan<float>();
             bool linear = _mode != "nearest";
 
-            for (int n = 0; n < batches; n++)
+            // 映射表只依赖输出坐标，先算一遍：原来每个输出像素都要做两次 double 除法
+            // 加 Math.Round（YOLO 的两个 2× 上采样共 40 万个输出点），这一步就是 7.8 ms。
+            var mapY = new int[outH];
+            var mapX = new int[outW];
+            var wyTab = linear ? new double[outH] : null;
+            var wxTab = linear ? new double[outW] : null;
+
+            for (int oy = 0; oy < outH; oy++)
             {
-                for (int c = 0; c < channels; c++)
+                double sy = SourceCoordinate(oy, inH, outH);
+                mapY[oy] = linear
+                    ? Math.Clamp((int)Math.Floor(Math.Clamp(sy, 0, inH - 1)), 0, inH - 1)
+                    : NearestIndex(sy, inH);
+                if (linear)
+                    wyTab![oy] = Math.Clamp(sy, 0, inH - 1) - mapY[oy];
+            }
+
+            for (int ox = 0; ox < outW; ox++)
+            {
+                double sx = SourceCoordinate(ox, inW, outW);
+                mapX[ox] = linear
+                    ? Math.Clamp((int)Math.Floor(Math.Clamp(sx, 0, inW - 1)), 0, inW - 1)
+                    : NearestIndex(sx, inW);
+                if (linear)
+                    wxTab![ox] = Math.Clamp(sx, 0, inW - 1) - mapX[ox];
+            }
+
+            ParallelRange.For(batches * channels, (begin, end) =>
+            {
+                var s = input.AsSpan<float>();
+                var d = output.AsSpan<float>();
+
+                for (int t = begin; t < end; t++)
                 {
-                    long inBase = ((long)n * channels + c) * inH * inW;
-                    long outBase = ((long)n * channels + c) * outH * outW;
+                    long inBase = (long)t * inH * inW;
+                    long outBase = (long)t * outH * outW;
+
+                    if (!linear)
+                    {
+                        for (int oy = 0; oy < outH; oy++)
+                        {
+                            long rowIn = inBase + (long)mapY[oy] * inW;
+                            long rowOut = outBase + (long)oy * outW;
+
+                            for (int ox = 0; ox < outW; ox++)
+                                d[(int)(rowOut + ox)] = s[(int)(rowIn + mapX[ox])];
+                        }
+
+                        continue;
+                    }
 
                     for (int oy = 0; oy < outH; oy++)
                     {
-                        double sy = SourceCoordinate(oy, inH, outH);
+                        int y0 = mapY[oy];
+                        int y1 = Math.Min(y0 + 1, inH - 1);
+                        double wy = wyTab![oy];
+                        double iwy = 1 - wy;
+                        long topBase = inBase + (long)y0 * inW;
+                        long bottomBase = inBase + (long)y1 * inW;
+                        long rowOut = outBase + (long)oy * outW;
 
                         for (int ox = 0; ox < outW; ox++)
                         {
-                            double sx = SourceCoordinate(ox, inW, outW);
-
-                            if (!linear)
-                            {
-                                int iy = NearestIndex(sy, inH);
-                                int ix = NearestIndex(sx, inW);
-                                dst[(int)(outBase + (long)oy * outW + ox)] = src[(int)(inBase + (long)iy * inW + ix)];
-                                continue;
-                            }
-
-                            double fy = Math.Clamp(sy, 0, inH - 1);
-                            double fx = Math.Clamp(sx, 0, inW - 1);
-                            int y0 = (int)Math.Floor(fy);
-                            int x0 = (int)Math.Floor(fx);
-                            int y1 = Math.Min(y0 + 1, inH - 1);
+                            int x0 = mapX[ox];
                             int x1 = Math.Min(x0 + 1, inW - 1);
-                            double wy = fy - y0;
-                            double wx = fx - x0;
+                            double wx = wxTab![ox];
+                            double iwx = 1 - wx;
 
-                            double top = src[(int)(inBase + (long)y0 * inW + x0)] * (1 - wx)
-                                       + src[(int)(inBase + (long)y0 * inW + x1)] * wx;
-                            double bottom = src[(int)(inBase + (long)y1 * inW + x0)] * (1 - wx)
-                                          + src[(int)(inBase + (long)y1 * inW + x1)] * wx;
+                            double top = s[(int)(topBase + x0)] * iwx + s[(int)(topBase + x1)] * wx;
+                            double bottom = s[(int)(bottomBase + x0)] * iwx + s[(int)(bottomBase + x1)] * wx;
 
-                            dst[(int)(outBase + (long)oy * outW + ox)] = (float)(top * (1 - wy) + bottom * wy);
+                            d[(int)(rowOut + ox)] = (float)(top * iwy + bottom * wy);
                         }
                     }
                 }
-            }
+            });
         }
     }
 
@@ -577,20 +635,40 @@ internal static class DnnOps
             VectorMath.Scale(dst, dst, 1f / sum);
         }
 
-        private static float MaxOf(ReadOnlySpan<float> values)
+        private static unsafe float MaxOf(ReadOnlySpan<float> values)
         {
-            int width = Vector<float>.Count;
+            int n = values.Length;
             int i = 0;
-            var accumulator = new Vector<float>(float.NegativeInfinity);
-
-            for (; i <= values.Length - width; i += width)
-                accumulator = Vector.Max(accumulator, new Vector<float>(values.Slice(i)));
-
             float max = float.NegativeInfinity;
-            for (int lane = 0; lane < width; lane++)
-                max = MathF.Max(max, accumulator[lane]);
 
-            for (; i < values.Length; i++)
+            // DFL 的 Softmax 是 33600 组 16 元素，每组都调这个函数：
+            // 用 256 位一次吃 8 个，横向归约也压到 3 条指令。
+            if (Avx.IsSupported && n >= 8)
+            {
+                fixed (float* p = values)
+                {
+                    var acc = Avx.LoadVector256(p);
+                    for (i = 8; i <= n - 8; i += 8)
+                        acc = Avx.Max(acc, Avx.LoadVector256(p + i));
+
+                    var lo = Avx.Max(acc.GetLower(), acc.GetUpper());
+                    lo = Vector128.Max(lo, Vector128.Shuffle(lo, Vector128.Create(2, 3, 0, 1)));
+                    max = MathF.Max(lo.GetElement(0), lo.GetElement(1));
+                }
+            }
+            else
+            {
+                int width = Vector<float>.Count;
+                var accumulator = new Vector<float>(float.NegativeInfinity);
+
+                for (; i <= n - width; i += width)
+                    accumulator = Vector.Max(accumulator, new Vector<float>(values.Slice(i)));
+
+                for (int lane = 0; lane < width; lane++)
+                    max = MathF.Max(max, accumulator[lane]);
+            }
+
+            for (; i < n; i++)
                 max = MathF.Max(max, values[i]);
 
             return max;

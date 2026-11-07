@@ -67,10 +67,11 @@ internal static class ConvKernels
             return;
         }
 
-        // 行块大小自适应：小特征图（如 patch_embedding 的 32×32）按 8 行切只有几个任务，
-        // 喂不满多核，这时把行块减小换取更多任务。
-        int rowsPerBlock = BlockRows;
+        // 行块大小：先按列缓冲预算（约 2 MB）取尽量大的行块 —— 块内像素越多，
+        // GEMM 的 n 越大、A 的复用越高；任务数不够喂满多核时再减半。
         int threads = Environment.ProcessorCount;
+        int budgetPixels = Math.Max(threads * 64, (2 << 20) / (4 * Math.Max(1, kernelSize)));
+        int rowsPerBlock = Math.Min(outH, Math.Max(1, budgetPixels / Math.Max(1, outW)));
 
         while (rowsPerBlock > 1)
         {
@@ -141,10 +142,8 @@ internal static class ConvKernels
 
                     GemmKernel.Multiply(weightSlice, colSlice, target,
                         outPerGroup, kernelSize, pixels,
-                        ldc: outH * outW, parallel: false);
-
-                    if (biases.Length > 0)
-                        AddBias(target, biases, g * outPerGroup, outPerGroup, outH * outW, pixels);
+                        ldc: outH * outW, parallel: false,
+                        bias: biases.IsEmpty ? ReadOnlySpan<float>.Empty : biases.Slice(g * outPerGroup, outPerGroup));
                 }
                 else
                 {
@@ -154,10 +153,8 @@ internal static class ConvKernels
 
                     GemmKernel.Multiply(weightSlice, colSlice, scratch,
                         outPerGroup, kernelSize, pixels,
-                        ldc: pixels, parallel: false);
-
-                    if (biases.Length > 0)
-                        AddBias(scratch, biases, g * outPerGroup, outPerGroup, pixels, pixels);
+                        ldc: pixels, parallel: false,
+                        bias: biases.IsEmpty ? ReadOnlySpan<float>.Empty : biases.Slice(g * outPerGroup, outPerGroup));
 
                     for (int oc = 0; oc < outPerGroup; oc++)
                     {
@@ -215,17 +212,22 @@ internal static class ConvKernels
                     dst.Slice((int)dstBase, outPerGroup * pixels),
                     outPerGroup, inPerGroup, pixels,
                     ldc: pixels,
-                    parallel: innerParallel);
-
-                if (biases.Length > 0)
-                    AddBias(dst.Slice((int)dstBase, outPerGroup * pixels),
-                        biases, g * outPerGroup, outPerGroup, pixels, pixels);
+                    parallel: innerParallel,
+                    bias: biases.IsEmpty ? ReadOnlySpan<float>.Empty : biases.Slice(g * outPerGroup, outPerGroup));
             }
         });
     }
 
-    /// <summary>把一块输出区域的感受野摊平成 <c>col[K, pixels]</c>（越界填 0）。</summary>
-    private static void FillColumns(
+    /// <summary>
+    /// 把一块输出区域的感受野摊平成 <c>col[K, pixels]</c>（越界填 0）。
+    /// <para>
+    /// stride == 1 时一整个输出行就是一个输入行上的连续区间，只有左右两侧可能越界，
+    /// 所以中间用一次 <see cref="Buffer.MemoryCopy"/> 搬完、两侧各清零一次 —— 原来
+    /// 每个元素都要算一次 <c>(uint)x &lt; inW</c> 再逐元素写，3×3 conv 的这步占满了
+    /// 整层时间。stride &gt; 1 时无法整段搬，保留逐元素路径。
+    /// </para>
+    /// </summary>
+    private static unsafe void FillColumns(
         ReadOnlySpan<float> src,
         float[] col,
         int channels,
@@ -249,59 +251,72 @@ internal static class ConvKernels
         int outW,
         int pixels)
     {
-        for (int ic = 0; ic < inPerGroup; ic++)
+        int rowBytes = colCount * sizeof(float);
+
+        fixed (float* pin = src)
+        fixed (float* pcol = col)
         {
-            long channelBase = (long)(batch * channels + channelStart + ic) * inH * inW;
-
-            for (int ky = 0; ky < kernelH; ky++)
+            for (int ic = 0; ic < inPerGroup; ic++)
             {
-                for (int kx = 0; kx < kernelW; kx++)
+                float* channelBase = pin + (long)(batch * channels + channelStart + ic) * inH * inW;
+
+                for (int ky = 0; ky < kernelH; ky++)
                 {
-                    int colRow = (ic * kernelH + ky) * kernelW + kx;
-                    var target = col.AsSpan(colRow * pixels, pixels);
-
-                    for (int r = 0; r < rows; r++)
+                    for (int kx = 0; kx < kernelW; kx++)
                     {
-                        int y = (oyBegin + r) * strideH - padT + ky * dilH;
-                        var targetRow = target.Slice(r * colCount, colCount);
+                        int colRow = (ic * kernelH + ky) * kernelW + kx;
+                        float* target = pcol + (long)colRow * pixels;
 
-                        if ((uint)y >= (uint)inH)
+                        // 本核位置在输入行上的起点，对应输出块的第一个像素
+                        int x0 = oxBegin * strideW - padL + kx * dilW;
+
+                        for (int r = 0; r < rows; r++)
                         {
-                            targetRow.Clear();
-                            continue;
-                        }
+                            int y = (oyBegin + r) * strideH - padT + ky * dilH;
+                            float* row = target + (long)r * colCount;
 
-                        var sourceRow = src.Slice((int)(channelBase + (long)y * inW), inW);
-                        int rowStart = oxBegin * strideW - padL + kx * dilW;
+                            if ((uint)y >= (uint)inH)
+                            {
+                                new Span<float>(row, colCount).Clear();
+                                continue;
+                            }
 
-                        for (int i = 0; i < colCount; i++)
-                        {
-                            int x = rowStart + i * strideW;
-                            targetRow[i] = (uint)x < (uint)inW ? sourceRow[x] : 0f;
+                            float* source = channelBase + (long)y * inW;
+
+                            if (strideW == 1)
+                            {
+                                int first = Math.Max(x0, 0);
+                                int last = Math.Min(x0 + colCount, inW);
+
+                                if (last <= first)
+                                {
+                                    new Span<float>(row, colCount).Clear();
+                                    continue;
+                                }
+
+                                int head = first - x0;
+                                int body = last - first;
+                                if (head > 0)
+                                    new Span<float>(row, head).Clear();
+
+                                Buffer.MemoryCopy(source + first, row + head, body * sizeof(float), body * sizeof(float));
+
+                                int tail = colCount - head - body;
+                                if (tail > 0)
+                                    new Span<float>(row + head + body, tail).Clear();
+                            }
+                            else
+                            {
+                                for (int i = 0; i < colCount; i++)
+                                {
+                                    int x = x0 + i * strideW;
+                                    row[i] = (uint)x < (uint)inW ? source[x] : 0f;
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-    }
-
-    private static void AddBias(
-        Span<float> target,
-        ReadOnlySpan<float> bias,
-        int biasStart,
-        int outPerGroup,
-        int ldc,
-        int pixels)
-    {
-        for (int oc = 0; oc < outPerGroup; oc++)
-        {
-            float value = bias[biasStart + oc];
-            if (value == 0f)
-                continue;
-
-            var row = target.Slice(oc * ldc, pixels);
-            for (int i = 0; i < row.Length; i++)
-                row[i] += value;
         }
     }
 
