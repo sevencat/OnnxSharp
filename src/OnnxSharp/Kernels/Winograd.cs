@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 using OnnxSharp.Threading;
@@ -34,9 +36,22 @@ internal static unsafe class Winograd
     /// 允许走 Winograd 的最大输出空间像素数（默认 64×64）。超过就交回 im2col。
     /// 抬到 <see cref="long.MaxValue"/> 可以强制所有 3×3 层都走 Winograd（调参/基准用）。
     /// </summary>
-    internal static long MaxSpatialPixels = 4096;
+    internal static long MaxSpatialPixels =
+        long.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_WINO_MAX"), out long winoMax) ? winoMax : 4096;
 
     private static readonly ConditionalWeakTable<Tensor, float[]> WeightCache = new();
+
+    /// <summary>一次并行处理的 tile 数：8 个 tile 正好是一条 256 位向量。</summary>
+    private const int TileVector = 8;
+
+    /// <summary>抽取偶数位（0,2,4,6）——取出 tile 的第 0、2 列。</summary>
+    private static readonly Vector256<int> EvenLanes = Vector256.Create(0, 2, 4, 6, 0, 0, 0, 0);
+
+    /// <summary>抽取奇数位（1,3,5,7）——取出 tile 的第 1、3 列。</summary>
+    private static readonly Vector256<int> OddLanes = Vector256.Create(1, 3, 5, 7, 1, 1, 1, 1);
+
+    /// <summary>整条向量左移一个 lane（右端空出的 lane 后面用 blend 补）。</summary>
+    private static readonly Vector256<int> ShiftLanes = Vector256.Create(1, 2, 3, 4, 5, 6, 7, 7);
 
     /// <summary>判断这层能不能走 Winograd，能就执行并返回 true。</summary>
     public static bool TryConv3x3(
@@ -267,8 +282,23 @@ internal static unsafe class Winograd
                     int oy = (ty0 + ty) * TileOut;
                     int y0 = oy - 1;
                     int tileRow = ty * tilesX;
+                    int tx = 0;
 
-                    for (int tx = 0; tx < tilesX; tx++)
+                    // 一次 8 个 tile：4 行整块在界内时走向量化路径，边界与余数仍走标量
+                    if (y0 >= 0 && y0 + Alpha <= inH && tilesX >= TileVector)
+                    {
+                        for (; tx <= tilesX - TileVector; tx += TileVector)
+                        {
+                            int vx = tx * TileOut - 1;
+
+                            if (vx < 0 || vx + 2 * TileVector + 2 > inW)
+                                break;
+
+                            TransformTilesVector(channel, vBase, compStride, y0, vx, inW, tileRow + tx);
+                        }
+                    }
+
+                    for (; tx < tilesX; tx++)
                     {
                         int ox = tx * TileOut;
                         int x0 = ox - 1;
@@ -329,6 +359,80 @@ internal static unsafe class Winograd
         });
     }
 
+    /// <summary>
+    /// 一次变换 8 个连续 tile（<see cref="TileVector"/> 个）：
+    /// 每行读两整条向量，用 <c>PermuteVar8x32</c> 把 4 列按 lane 拆开，
+    /// 之后所有加减都是整条向量的运算，最后 16 条向量直接写进 16 个分量平面。
+    /// <para>
+    /// 调用方保证 <paramref name="y0"/> 与 <paramref name="y0"/>+3 在界内，
+    /// 且 <paramref name="x0"/> ≥ 0、<paramref name="x0"/>+17 &lt; inW。
+    /// </para>
+    /// </summary>
+    private static void TransformTilesVector(
+        float* channel,
+        float* vBase,
+        long compStride,
+        int y0,
+        int x0,
+        int inW,
+        int tile)
+    {
+        Vector256<float>* rows = stackalloc Vector256<float>[Alpha * Alpha];
+        Vector256<float>* t = stackalloc Vector256<float>[Alpha * Alpha];
+
+        for (int i = 0; i < Alpha; i++)
+        {
+            float* p = channel + (long)(y0 + i) * inW + x0;
+            var va = Avx.LoadVector256(p);
+            var vb = Avx.LoadVector256(p + 8);
+
+            // 偶数位 = tile 的第 0 列，奇数位 = 第 1 列
+            var c0 = Avx2.Permute2x128(
+                Avx2.PermuteVar8x32(va, EvenLanes),
+                Avx2.PermuteVar8x32(vb, EvenLanes), 0x20);
+            var c1 = Avx2.Permute2x128(
+                Avx2.PermuteVar8x32(va, OddLanes),
+                Avx2.PermuteVar8x32(vb, OddLanes), 0x20);
+
+            // 第 2、3 列是同一序列右移一个 tile
+            var c2 = Avx2.Blend(Avx2.PermuteVar8x32(c0, ShiftLanes), Vector256.Create(p[16]), 0x80);
+            var c3 = Avx2.Blend(Avx2.PermuteVar8x32(c1, ShiftLanes), Vector256.Create(p[17]), 0x80);
+
+            rows[i * Alpha] = c0;
+            rows[i * Alpha + 1] = c1;
+            rows[i * Alpha + 2] = c2;
+            rows[i * Alpha + 3] = c3;
+        }
+
+        // t = Bᵀ d
+        for (int j = 0; j < Alpha; j++)
+        {
+            var d0 = rows[j];
+            var d1 = rows[Alpha + j];
+            var d2 = rows[2 * Alpha + j];
+            var d3 = rows[3 * Alpha + j];
+
+            t[j] = Avx.Subtract(d0, d2);
+            t[Alpha + j] = Avx.Add(d1, d2);
+            t[2 * Alpha + j] = Avx.Subtract(d2, d1);
+            t[3 * Alpha + j] = Avx.Subtract(d1, d3);
+        }
+
+        // v = t B
+        for (int i = 0; i < Alpha; i++)
+        {
+            var a = t[i * Alpha];
+            var b = t[i * Alpha + 1];
+            var c2 = t[i * Alpha + 2];
+            var d3 = t[i * Alpha + 3];
+
+            Avx.Store(vBase + (long)(i * Alpha) * compStride + tile, Avx.Subtract(a, c2));
+            Avx.Store(vBase + (long)(i * Alpha + 1) * compStride + tile, Avx.Add(b, c2));
+            Avx.Store(vBase + (long)(i * Alpha + 2) * compStride + tile, Avx.Subtract(c2, b));
+            Avx.Store(vBase + (long)(i * Alpha + 3) * compStride + tile, Avx.Subtract(b, d3));
+        }
+    }
+
     /// <summary>Y = Aᵀ M A，把 16 个分量还原成 2×2 输出块。</summary>
     private static void TransformOutput(
         float* dst,
@@ -362,8 +466,23 @@ internal static unsafe class Winograd
                 {
                     int oy = (ty0 + ty) * TileOut;
                     int tileRow = ty * tilesX;
+                    int tx = 0;
 
-                    for (int tx = 0; tx < tilesX; tx++)
+                    // 一次 8 个 tile：输出正好是两行各 16 个连续像素
+                    if (oy + TileOut <= inH && tilesX >= TileVector)
+                    {
+                        for (; tx <= tilesX - TileVector; tx += TileVector)
+                        {
+                            int vox = tx * TileOut;
+
+                            if (vox + 2 * TileVector > inW)
+                                break;
+
+                            TransformOutputVector(channel, mRow, compStride, b, oy, vox, inW, tileRow + tx);
+                        }
+                    }
+
+                    for (; tx < tilesX; tx++)
                     {
                         int ox = tx * TileOut;
                         int tile = tileRow + tx;
@@ -407,5 +526,77 @@ internal static unsafe class Winograd
                 }
             }
         });
+    }
+
+    /// <summary>
+    /// 一次还原 8 个 tile（<see cref="TileVector"/> 个）：16 条分量向量做 Aᵀ M A，
+    /// 再把 y00/y01 交错回 16 个连续像素，两行各写两条整向量。
+    /// <para>调用方保证 <paramref name="oy"/>+1 &lt; inH 且 <paramref name="ox"/>+15 &lt; inW。</para>
+    /// </summary>
+    private static unsafe void TransformOutputVector(
+        float* channel,
+        float* mRow,
+        long compStride,
+        float bias,
+        int oy,
+        int ox,
+        int inW,
+        int tile)
+    {
+        var bv = Vector256.Create(bias);
+
+        Vector256<float> t00, t01, t02, t03, t10, t11, t12, t13;
+
+        {
+            var m0 = Avx.LoadVector256(mRow + (long)0 * compStride + tile);
+            var m1 = Avx.LoadVector256(mRow + (long)1 * compStride + tile);
+            var m2 = Avx.LoadVector256(mRow + (long)2 * compStride + tile);
+            var m3 = Avx.LoadVector256(mRow + (long)3 * compStride + tile);
+
+            var n0 = Avx.LoadVector256(mRow + (long)4 * compStride + tile);
+            var n1 = Avx.LoadVector256(mRow + (long)5 * compStride + tile);
+            var n2 = Avx.LoadVector256(mRow + (long)6 * compStride + tile);
+            var n3 = Avx.LoadVector256(mRow + (long)7 * compStride + tile);
+
+            var o0 = Avx.LoadVector256(mRow + (long)8 * compStride + tile);
+            var o1 = Avx.LoadVector256(mRow + (long)9 * compStride + tile);
+            var o2 = Avx.LoadVector256(mRow + (long)10 * compStride + tile);
+            var o3 = Avx.LoadVector256(mRow + (long)11 * compStride + tile);
+
+            var p0 = Avx.LoadVector256(mRow + (long)12 * compStride + tile);
+            var p1 = Avx.LoadVector256(mRow + (long)13 * compStride + tile);
+            var p2 = Avx.LoadVector256(mRow + (long)14 * compStride + tile);
+            var p3 = Avx.LoadVector256(mRow + (long)15 * compStride + tile);
+
+            // Aᵀ M
+            t00 = Avx.Add(Avx.Add(m0, n0), o0);
+            t01 = Avx.Add(Avx.Add(m1, n1), o1);
+            t02 = Avx.Add(Avx.Add(m2, n2), o2);
+            t03 = Avx.Add(Avx.Add(m3, n3), o3);
+
+            t10 = Avx.Subtract(Avx.Subtract(n0, o0), p0);
+            t11 = Avx.Subtract(Avx.Subtract(n1, o1), p1);
+            t12 = Avx.Subtract(Avx.Subtract(n2, o2), p2);
+            t13 = Avx.Subtract(Avx.Subtract(n3, o3), p3);
+        }
+
+        // 运算顺序与标量路径保持一致，免得引入额外的舍入偏差
+        var y00 = Avx.Add(Avx.Add(Avx.Add(t00, t01), t02), bv);
+        var y01 = Avx.Add(Avx.Subtract(Avx.Subtract(t01, t02), t03), bv);
+        var y10 = Avx.Add(Avx.Add(Avx.Add(t10, t11), t12), bv);
+        var y11 = Avx.Add(Avx.Subtract(Avx.Subtract(t11, t12), t13), bv);
+
+        float* top = channel + (long)oy * inW + ox;
+        float* bottom = top + inW;
+
+        var lo = Avx2.Permute2x128(Avx.UnpackLow(y00, y01), Avx.UnpackHigh(y00, y01), 0x20);
+        var hi = Avx2.Permute2x128(Avx.UnpackLow(y00, y01), Avx.UnpackHigh(y00, y01), 0x31);
+        Avx.Store(top, lo);
+        Avx.Store(top + 8, hi);
+
+        lo = Avx2.Permute2x128(Avx.UnpackLow(y10, y11), Avx.UnpackHigh(y10, y11), 0x20);
+        hi = Avx2.Permute2x128(Avx.UnpackLow(y10, y11), Avx.UnpackHigh(y10, y11), 0x31);
+        Avx.Store(bottom, lo);
+        Avx.Store(bottom + 8, hi);
     }
 }

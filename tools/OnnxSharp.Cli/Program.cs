@@ -19,6 +19,9 @@ return args[0].ToLowerInvariant() switch
     "bench" => Bench(args),
     "profile" => Profile(args),
     "detect" => Detect(args),
+    "gemmbench" => GemmBench(args),
+    "parbench" => ParBench(args),
+    "convbench" => ConvBench(args),
     "help" or "-h" or "--help" => Usage(),
     _ => Usage(),
 };
@@ -41,6 +44,8 @@ static int Usage()
     Console.WriteLine("                                      # 逐算子耗时排行（找热点）");
     Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> --input <file.bin> [--conf 0.25] [--iou 0.45]");
     Console.WriteLine("                                      # 调用示例：YOLO decode + NMS（不写进产品库）");
+    Console.WriteLine("  OnnxSharp.Cli gemmbench [--iters N] [--shape m,k,n]");
+    Console.WriteLine("                                      # GEMM 微内核吞吐（GFLOPS），调优用");
     return 2;
 }
 
@@ -311,6 +316,244 @@ static int Bench(string[] args)
     Console.WriteLine($"median    : {samples[iters / 2]:F1} ms");
     Console.WriteLine($"mean      : {samples.Average():F1} ms");
     Console.WriteLine($"max       : {samples[^1]:F1} ms");
+    return 0;
+}
+
+/// <summary>
+/// GEMM 微内核基准：<c>c[m,n] = a[m,k]·b[k,n]</c> 在典型 Conv 形状上的吞吐（GFLOPS）。
+/// <para>
+/// n 用「一次 im2col 任务内的像素数」而不是整层像素数 —— Conv 主路径是按输出行块
+/// 切开后逐块调 GEMM 的，用整层像素会高估微内核的收益。
+/// </para>
+/// </summary>
+static int GemmBench(string[] args)
+{
+    var options = ParseOptions(args, 1);
+    int iters = options.GetInt("--iters", 50);
+
+    var shapes = new List<(int M, int K, int N)>();
+    string? single = options.GetString("--shape");
+
+    if (!string.IsNullOrEmpty(single))
+    {
+        var parts = single.Split(',', StringSplitOptions.RemoveEmptyEntries);
+        shapes.Add((int.Parse(parts[0]), int.Parse(parts[1]), int.Parse(parts[2])));
+    }
+    else
+    {
+        // yolo11n/640 上几类典型 Conv 的行块形状
+        shapes.Add((16, 27, 2240));     // 3x3  c3->16   80x80
+        shapes.Add((32, 144, 1600));    // 3x3  16->32   40x40
+        shapes.Add((64, 144, 800));     // 3x3  32->64   40x40(down)
+        shapes.Add((64, 576, 400));     // 3x3  64->64   20x20
+        shapes.Add((64, 1152, 1600));   // 3x3 128->64   40x40
+        shapes.Add((128, 576, 200));    // 3x3  64->128  20x20
+        shapes.Add((128, 1152, 200));   // 3x3 128->128  10x10
+        shapes.Add((256, 1152, 100));   // 3x3 128->256  10x10
+        shapes.Add((64, 64, 6400));     // 1x1  64->64   80x80
+        shapes.Add((256, 256, 6400));   // 1x1 256->256  80x80
+    }
+
+    Console.WriteLine($"threads : {OnnxSharp.Threading.ParallelRange.Threads}");
+    Console.WriteLine($"iters   : {iters}");
+    Console.WriteLine();
+    Console.WriteLine("     m       k       n       min ms    GFLOPS");
+
+    foreach (var (m, k, n) in shapes)
+    {
+        var a = new float[m * k];
+        var b = new float[k * n];
+        var c = new float[m * n];
+        var rng = new Random(12345);
+        for (int i = 0; i < a.Length; i++) a[i] = (float)rng.NextDouble();
+        for (int i = 0; i < b.Length; i++) b[i] = (float)rng.NextDouble();
+
+        for (int i = 0; i < 3; i++)
+            GemmKernel.Multiply(a, b, c, m, k, n);
+
+        double best = double.MaxValue;
+        for (int i = 0; i < iters; i++)
+        {
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            GemmKernel.Multiply(a, b, c, m, k, n);
+            watch.Stop();
+            if (watch.Elapsed.TotalMilliseconds < best)
+                best = watch.Elapsed.TotalMilliseconds;
+        }
+
+        double gflops = 2.0 * m * k * n / (best * 1e6);
+        Console.WriteLine($"{m,6}  {k,6}  {n,6}   {best,8:F3}  {gflops,8:F1}");
+    }
+
+    return 0;
+}
+
+/// <summary>
+/// 并行调度开销基准：测「一次并行调用」本身的固定成本（不含实际工作）。
+/// 推理一帧有几百次并行调用，这个数字直接决定小算子的下限。
+/// </summary>
+static int ParBench(string[] args)
+{
+    var options = ParseOptions(args, 1);
+    int iters = options.GetInt("--iters", 2000);
+    int threads = OnnxSharp.Threading.ParallelRange.Threads;
+
+    Console.WriteLine($"threads : {threads}");
+    Console.WriteLine($"iters   : {iters}");
+
+    var acc = new long[1];
+
+    void Body(int begin, int end)
+    {
+        for (int t = begin; t < end; t++)
+            Interlocked.Add(ref acc[0], t);
+    }
+
+    for (int i = 0; i < 200; i++)
+        OnnxSharp.Threading.ParallelRange.For(threads * 4, Body);
+
+    var watch = System.Diagnostics.Stopwatch.StartNew();
+    for (int i = 0; i < iters; i++)
+        OnnxSharp.Threading.ParallelRange.For(threads * 4, Body);
+    watch.Stop();
+
+    double us = watch.Elapsed.TotalMilliseconds * 1000 / iters;
+    Console.WriteLine($"ParallelRange.For : {watch.Elapsed.TotalMilliseconds,8:F1} ms / {iters} 次 = {us,7:F1} µs/次");
+
+    for (int i = 0; i < 200; i++)
+        System.Threading.Tasks.Parallel.For(0, threads * 4, t => Interlocked.Add(ref acc[0], t));
+
+    watch.Restart();
+    for (int i = 0; i < iters; i++)
+        System.Threading.Tasks.Parallel.For(0, threads * 4, t => Interlocked.Add(ref acc[0], t));
+    watch.Stop();
+
+    double us2 = watch.Elapsed.TotalMilliseconds * 1000 / iters;
+    Console.WriteLine($"Parallel.For      : {watch.Elapsed.TotalMilliseconds,8:F1} ms / {iters} 次 = {us2,7:F1} µs/次");
+
+    Console.WriteLine($"acc={acc[0]}");
+    return 0;
+}
+
+/// <summary>
+/// convbench：单层卷积内核对比（im2col / 面板打包 / Winograd）。
+/// 形状描述为 <c>ic,oc,h,w,k,s,p</c>，不给就按 yolo11n 640 的层跑一遍。
+/// </summary>
+static int ConvBench(string[] args)
+{
+    var options = ParseOptions(args, 0);
+    int iters = options.GetInt("--iters", 20);
+
+    var configs = new List<(int Ic, int Oc, int H, int W, int K, int S, int P)>();
+    string? single = options.GetString("--shape");
+
+    if (!string.IsNullOrEmpty(single))
+    {
+        var p = single.Split(',', StringSplitOptions.RemoveEmptyEntries);
+        configs.Add((int.Parse(p[0]), int.Parse(p[1]), int.Parse(p[2]), int.Parse(p[3]),
+            int.Parse(p[4]), int.Parse(p[5]), int.Parse(p[6])));
+    }
+    else
+    {
+        configs.Add((3, 16, 640, 640, 3, 2, 1));
+        configs.Add((16, 32, 320, 320, 3, 2, 1));
+        configs.Add((32, 64, 160, 160, 3, 2, 1));
+        configs.Add((64, 64, 160, 160, 3, 1, 1));
+        configs.Add((64, 128, 80, 80, 3, 2, 1));
+        configs.Add((128, 128, 80, 80, 3, 1, 1));
+        configs.Add((128, 256, 40, 40, 3, 2, 1));
+        configs.Add((256, 256, 40, 40, 3, 1, 1));
+        configs.Add((256, 256, 20, 20, 3, 1, 1));
+        configs.Add((64, 64, 160, 160, 1, 1, 0));
+        configs.Add((128, 128, 80, 80, 1, 1, 0));
+        configs.Add((256, 256, 40, 40, 1, 1, 0));
+        configs.Add((256, 256, 20, 20, 1, 1, 0));
+    }
+
+    Console.WriteLine($"threads : {OnnxSharp.Threading.ParallelRange.Threads}");
+    Console.WriteLine($"iters   : {iters}");
+    Console.WriteLine();
+
+    double Best(Action body)
+    {
+        for (int i = 0; i < 3; i++) body();
+
+        double best = double.MaxValue;
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+
+        for (int i = 0; i < iters; i++)
+        {
+            watch.Restart();
+            body();
+            watch.Stop();
+            best = Math.Min(best, watch.Elapsed.TotalMilliseconds);
+        }
+
+        return best;
+    }
+
+    foreach (var (ic, oc, h, w, k, s, p) in configs)
+    {
+        int oh = (h + 2 * p - k) / s + 1;
+        int ow = (w + 2 * p - k) / s + 1;
+
+        var input = Tensor.Allocate(new TensorShape(1, ic, h, w), DType.F32);
+        var weight = Tensor.Allocate(new TensorShape(oc, ic, k, k), DType.F32);
+        var bias = Tensor.Allocate(new TensorShape(oc), DType.F32);
+        var output = Tensor.Allocate(new TensorShape(1, oc, oh, ow), DType.F32);
+
+        var rng = new Random(1234);
+        var xs = input.AsSpan<float>();
+        var ws = weight.AsSpan<float>();
+        var bs = bias.AsSpan<float>();
+
+        for (int i = 0; i < xs.Length; i++) xs[i] = (float)rng.NextDouble();
+        for (int i = 0; i < ws.Length; i++) ws[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < bs.Length; i++) bs[i] = (float)(rng.NextDouble() - 0.5);
+
+        double macs = (double)oc * ic * k * k * oh * ow;
+
+        double im2col = Best(() => OnnxSharp.Kernels.ConvKernels.Im2Col(
+            input, weight, bias, output, 1, s, s, 1, 1, p, p));
+
+        bool packedUsed = false;
+        double packed = double.NaN;
+
+        if (OnnxSharp.Kernels.PackedConv.TryConv(input, weight, bias, output, 1, s, s, 1, 1, p, p))
+        {
+            packedUsed = true;
+            packed = Best(() => { OnnxSharp.Kernels.PackedConv.TryConv(input, weight, bias, output, 1, s, s, 1, 1, p, p); });
+        }
+
+        string line = $"ic={ic,-4} oc={oc,-4} {h}x{w} k{k}s{s}p{p} -> {oh}x{ow}  "
+            + $"im2col {im2col,7:F2} ms ({macs / im2col / 1e6,6:F1} GMAC/s)";
+
+        if (packedUsed)
+            line += $"  packed {packed,7:F2} ms ({macs / packed / 1e6,6:F1})";
+        else
+            line += "  packed     --";
+
+        // Winograd 默认只覆盖小特征图，这里放开上限量一下它在各尺寸上的真实水平
+        long saved = OnnxSharp.Kernels.Winograd.MaxSpatialPixels;
+        OnnxSharp.Kernels.Winograd.MaxSpatialPixels = long.MaxValue;
+
+        bool winogradAll = OnnxSharp.Kernels.Winograd.TryConv3x3(
+            input, weight, bias, output, 1, s, s, 1, 1, p, p);
+
+        if (winogradAll)
+        {
+            double winograd = Best(() => { OnnxSharp.Kernels.Winograd.TryConv3x3(input, weight, bias, output, 1, s, s, 1, 1, p, p); });
+            line += $"  winograd {winograd,7:F2} ms ({macs / winograd / 1e6,6:F1})";
+        }
+        else
+        {
+            line += "  winograd     --";
+        }
+
+        OnnxSharp.Kernels.Winograd.MaxSpatialPixels = saved;
+        Console.WriteLine(line);
+    }
+
     return 0;
 }
 

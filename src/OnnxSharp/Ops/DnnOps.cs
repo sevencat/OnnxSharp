@@ -189,8 +189,12 @@ internal static class DnnOps
 
             Tensor? bias = Inputs.Count > 2 && Inputs[2].Idx != 0 && inputs[2].Count > 0 ? inputs[2] : null;
 
-            // 3×3 / s1 / pad1 优先走 Winograd F(2,3)（乘法量只有 4/9），不适用再回退 im2col
+            // 3×3 / s1 / pad1 优先走 Winograd F(2,3)（乘法量只有 4/9），
+            // 其次走面板式直接卷积（不物化整幅 im2col），都不适用再回退 im2col
             if (!Kernels.Winograd.TryConv3x3(
+                    input, weight, bias, output,
+                    _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1])
+                && !Kernels.PackedConv.TryConv(
                     input, weight, bias, output,
                     _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1]))
             {
@@ -683,12 +687,40 @@ internal static class DnnOps
                     long inBase = (long)t * inH * inW;
                     long outBase = (long)t * outH * outW;
 
+                    // 步长 1、无横向膨胀时可以一次比较 8 个输出（SPPF 的 5×5/9×9/13×13 全走这条）
+                    bool vectorizable = dW == 1 && sW == 1;
+
+                    // 只有整块窗口都落在真实输入内才能向量化，含 pad 的边界列交回标量
+                    int vStart = vectorizable ? Math.Max(0, pL) : 0;
+                    int vLimit = vectorizable ? Math.Min(outW, inW - kW - (Vector256<float>.Count - 1) + pL) : 0;
+
                     for (int oy = 0; oy < outH; oy++)
                     {
                         int y0 = oy * sH - pT;
 
                         for (int ox = 0; ox < outW; ox++)
                         {
+                            if (vectorizable && ox >= vStart && ox + Vector256<float>.Count <= vLimit)
+                            {
+                                int vx = ox - pL;
+                                var acc = Vector256.Create(float.NegativeInfinity);
+
+                                for (int ky = 0; ky < kH; ky++)
+                                {
+                                    int y = y0 + ky * dH;
+                                    if ((uint)y >= (uint)inH)
+                                        continue;
+
+                                    long rowBase = inBase + (long)y * inW + vx;
+                                    for (int kx = 0; kx < kW; kx++)
+                                        acc = Vector256.Max(acc, Vector256.LoadUnsafe(ref s[(int)(rowBase + kx)]));
+                                }
+
+                                Vector256.StoreUnsafe(acc, ref d[(int)(outBase + (long)oy * outW + ox)]);
+                                ox += Vector256<float>.Count - 1;
+                                continue;
+                            }
+
                             int x0 = ox * sW - pL;
 
                             // 把左右越界的 tap 直接裁掉，内层循环里就没有分支了

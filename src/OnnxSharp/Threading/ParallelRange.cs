@@ -42,14 +42,18 @@ public static class ParallelRange
             return;
 
         int threads = Threads;
-        if (threads <= 1 || total < threads)
+
+        // 任务数不足时直接串行：Parallel.For 一趟就有 7 µs 左右的固定成本，
+        // 小任务（Concat 两路、几 KB 的 Reshape）并行只会更慢。
+        if (total <= 1 || threads <= 1 || total < threads)
         {
             body(0, total);
             return;
         }
 
         int chunk = (total + threads - 1) / threads;
-        Parallel.For(0, threads, t =>
+
+        System.Threading.Tasks.Parallel.For(0, threads, t =>
         {
             int begin = t * chunk;
             int end = Math.Min(begin + chunk, total);
