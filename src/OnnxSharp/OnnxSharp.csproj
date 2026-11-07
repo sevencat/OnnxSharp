@@ -14,12 +14,23 @@
     <PackageId>Sevencat.OnnxSharp</PackageId>
     <Version>0.0.1</Version>
     <Authors>Sevencat</Authors>
+    <PackageIcon>icon.png</PackageIcon>
+    <Description>Pure C# ONNX inference engine — CPU only (FP32), no CUDA / Vulkan / OpenCL / DirectML backends, zero third-party dependencies. Runs YOLO11 / YOLOv8 / RF-DETR exports, with an optional image-to-detections facade. The code is written by AI coding agents; requirements, reference material and review come from the maintainer.</Description>
+    <PackageTags>onnx;inference;yolo;yolo11;yolov8;rfdetr;object-detection;cpu;pure-csharp</PackageTags>
+    <PackageProjectUrl>https://github.com/sevencat/OnnxSharp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/sevencat/OnnxSharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- 测试与命令行工具需要访问 internal 的 protobuf/importer 细节，避免为工具扩大公开 API -->
     <InternalsVisibleTo Include="OnnxSharp.Tests" />
     <InternalsVisibleTo Include="OnnxSharp.Cli" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- NuGet 包图标：源文件放在仓库根部 assets/，打包时放到包根目录 -->
+    <None Include="..\..\assets\icon.png" Pack="true" PackagePath="\" Visible="false" />
   </ItemGroup>
 
 </Project>
