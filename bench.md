@@ -55,11 +55,23 @@ F:\code\SimdYolo\src\SimdYolo.Cli\bin\Release\net10.0\SimdYolo.Cli.exe bench <mo
 
 ```powershell
 # 微模型（单算子 / 少算子）用于定点测 GEMM 内核，产物在 bench/models/，可随时重建
+# attn / matmul / add / mulscalar / mlp 五类
 python bench/make_micro_models.py
 
 # GEMM 定点测量（--batch 模拟 batched attention；内部按时间预热）
 tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe gemmbench --shape 1028,64,1028 --batch 6 --iters 20
+# 指定线程数，用来区分「内核差」和「并行调度差」
+tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe gemmbench --shape 1028,64,1028 --threads 1,2,4,8,16
+
+# 机器算力上限（纯 FMA 微循环，用来看 GEMM 离上限还有多远）
+tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe fma --threads 1,8,16
+
+# 逐算子热点（务必给 --warmup：tier-0 代码会让计算密集算子虚高数倍）
+tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe profile <model.onnx> --input <in.f32> --iters 20 --warmup 10
 ```
+
+> `profile` 的绝对值也别信：后台负载会让均值比真实值高 20% 以上。
+> 输出里同时给了每算子的最小耗时，**把各算子 min 相加（rfdetr-small 约 215 ms）才和 `bench` 的中位数对得上**。
 
 ## 结果（2026-11-07，16 线程）
 
@@ -67,64 +79,78 @@ tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe gemmbench --shape 1028
 
 | 模型 | 输入 | OnnxSharp | ORT CPU | OpenCV dnn | SimdYolo |
 | --- | --- | ---: | ---: | ---: | ---: |
-| yolov8n | 640² | 35.1 | 53.5 | **29.5** | 32.0 |
-| yolo11n | 640² | 43.4 | 49.5 | **34.0** | 35.6 |
-| yolov8s | 640² | 88.0 | 151.1 | 77.3 | **52.1** |
-| yolo11s | 640² | 81.3 | 114.9 | 73.2 | **58.8** |
-| rfdetr-small | 512² | 317.5 | 366.1 | **188.8** | N/A |
-| rfdetr-medium | 512² | 411.8 | 514.6 | **241.9** | N/A |
+| yolov8n | 640² | 42.4 | 48.6 | **31.1** | 35.0 |
+| yolo11n | 640² | 36.5 | 44.6 | **31.7** | 39.3 |
+| yolov8s | 640² | 90.2 | 159.0 | 81.1 | **58.5** |
+| yolo11s | 640² | 88.3 | 135.0 | 75.1 | **59.0** |
+| rfdetr-small | 512² | 275.1 | 495.7 | **195.3** | N/A |
+| rfdetr-medium | 512² | 348.8 | 611.2 | **253.7** | N/A |
 
 min（无干扰下限）：
 
 | 模型 | OnnxSharp | ORT CPU | OpenCV dnn | SimdYolo |
 | --- | ---: | ---: | ---: | ---: |
-| yolov8n | 33.1 | **34.2** | **27.8** | 28.6 |
-| yolo11n | 37.6 | 34.6 | **28.3** | 31.1 |
-| yolov8s | 86.0 | 93.1 | 75.4 | **49.7** |
-| yolo11s | 78.9 | **63.4** | 71.6 | 56.3 |
-| rfdetr-small | 312.5 | 294.2 | **183.0** | N/A |
-| rfdetr-medium | 405.5 | 320.1 | **237.7** | N/A |
+| yolov8n | 35.0 | 33.2 | 29.8 | **28.9** |
+| yolo11n | 32.9 | 29.1 | **28.7** | 34.3 |
+| yolov8s | 88.3 | 113.6 | 78.4 | **54.8** |
+| yolo11s | 83.3 | 93.9 | 72.7 | **53.9** |
+| rfdetr-small | 268.1 | 349.2 | **190.9** | N/A |
+| rfdetr-medium | 329.2 | 492.1 | **248.8** | N/A |
 
 相对倍率（OnnxSharp ÷ 该引擎，>1 表示比它慢）：
 
 | 模型 | vs ORT | vs OpenCV dnn | vs SimdYolo |
 | --- | ---: | ---: | ---: |
-| yolov8n | 0.66 | 1.19 | 1.10 |
-| yolo11n | 0.88 | 1.28 | 1.22 |
-| yolov8s | 0.58 | 1.14 | 1.69 |
-| yolo11s | 0.71 | 1.11 | 1.38 |
-| rfdetr-small | 0.87 | 1.68 | N/A |
-| rfdetr-medium | 0.80 | 1.70 | N/A |
+| yolov8n | 0.87 | 1.36 | 1.21 |
+| yolo11n | 0.82 | 1.15 | 0.93 |
+| yolov8s | 0.57 | 1.11 | 1.54 |
+| yolo11s | 0.65 | 1.18 | 1.50 |
+| rfdetr-small | 0.55 | **1.41** | N/A |
+| rfdetr-medium | 0.57 | **1.37** | N/A |
+
+> **跨会话不要比绝对值**：同一份代码，机器状态不同时 yolo11n 能测出 36.5 / 43.4 / 50.2 三个数（±20%）。
+> 上表全部来自同一次 `run_all.py` 会话，所以引擎之间的**倍率**可信，绝对值只作趋势。
+> 与上一版相比 rfdetr 的倍率从 1.68/1.70 改善到 1.41/1.37，原因见结论 2。
 
 ## 结论
 
-1. **YOLO 侧**：OnnxSharp 稳定快于 ONNXRuntime CPU（0.58~0.88×），与 OpenCV 5 dnn 差 11%~28%，落后 SimdYolo 最大 1.69×（yolov8s）。
+1. **YOLO 侧**：OnnxSharp 稳定快于 ONNXRuntime CPU（0.57~0.87×），与 OpenCV 5 dnn 差 11%~36%，落后 SimdYolo 最大 1.54×（yolov8s）。
    - SimdYolo 在 `s` 档领先明显、`n` 档优势很小，说明差距不在"单个卷积"而在**通道数变大后的大 GEMM 分块/打包**：n 档层宽 64~128 时双方都喂不满 L1/L2，s 档 128~256 时我们的 `RowBlock=4 / Panel=16 / SliceDepth=128` 组合明显吃亏。
    - OpenCV dnn 的 `fastConv` 胜在按 `blocked` 布局一次性重排权重 + Winograd 覆盖更宽，是我们下一轮的主要参照。
-2. **RF-DETR 侧**：我们比 ORT 快（0.80~0.87×），但比 OpenCV dnn 慢 1.7×，是当前最大短板。
-   - profile 显示 DETR 的算力构成与 YOLO 完全不同（rfdetr-small，预热后，`profile` 有额外开销，只看占比）：
-     `MatMul 61.7%`、`Add 8.7%`、`Mul 4.9%`、`Transpose 4.9%`、`Softmax 3.9%`、`Conv 3.4%`、`LayerNormalization 2.5%`、`Erf 1.6%`、`GridSample 1.2%`。
+2. **RF-DETR 侧**：我们比 ORT 快（0.55~0.57×），比 OpenCV dnn 慢 1.37~1.41×，是当前最大短板。
+   - `profile`（rfdetr-small，预热 10 轮、20 轮统计、按每算子最小耗时汇总到 215 ms）的构成：
+     `MatMul 61.9%`、`Add 8.7%`、`Transpose 5.6%`、`Mul 5.4%`、`Conv 3.4%`、`Softmax 3.3%`、`LayerNormalization 2.3%`。
    - 也就是说 **Transformer 的 GEMM + 逐元素 + 转置**才是瓶颈，卷积优化（Winograd/面板打包）在 DETR 上只影响 3.4%。
    - 节点构成（rfdetr-small，共 2064 节点）：`Constant 459`、`Add 169`、`MatMul 140`、`Reshape 122`、`Mul 114`、`Transpose 113`、`Slice 62`、`LayerNormalization 49`、`Sqrt 45`、`Cast 36`、`Div 35`。
-   - **140 个 MatMul 全是 batched attention**（没有一个是 MLP 的 `[N,384]×[384,1536]`，那些已被导出成 `Conv`）：
-     `[6,1028,64]×[6,64,1028]`、`[6,1028,1028]×[6,1028,64]`、`[24,257,64]×[24,64,257]`、`[24,257,257]×[24,257,64]`、`[8,300,32]×[8,32,300]`、`[8,300,300]×[8,300,32]`。
-3. **GEMM 微内核本身没问题，问题在并行扩展性**（`gemmbench`，单算子模型与真实模型逐个对齐验证过，误差 <1%）：
+   - **140 个 MatMul 不全是 batched attention**（此前记错了）。按 `(a[-2:], b[-2:])` 统计真实形状，MLP 与投影都是货真价实的 MatMul 节点：
+     `[257,384]×[384,1536]` ×12（主干 fc1，单算子 1.26 GFLOP）、`[257,1536]×[1536,384]` ×12（fc2）、
+     `[1028,384]×[384,384]` ×6 等投影、以及 attention 的 `[6,1028,64]×[6,64,1028]`、`[24,257,64]×[24,64,257]`、`[8,300,32]×[8,32,300]`。
+     全部 140 个合计约 **16.6 GFLOP**，占模型约 92%。
+   - **最大的一处浪费（已修复）**：DETR decoder 的 q/k/v 投影运行时是 `[300,1,256]×[256,256]`（300 个 batch、每 batch m=1）。
+     引擎按 batch 逐个调内核，于是 256 KB 的权重被重新打包 300 遍，单个算子 4.06 ms；
+     而 `(batch, m)` 合并后只是一次 `300×256×256` 的 GEMM，0.13 ms。9 个这样的算子，端到端 **356 → 270 ms（-24%）**。
+3. **GEMM 微内核本身没问题，问题在并行扩展性**（`gemmbench` 与 `fma` 均为按时间预热后的稳态值）：
 
    | 形状（batch） | 每 batch ms | 等效 GFLOPS |
    | --- | ---: | ---: |
+   | `257×384×1536`（×1） | 0.88 | 343 |
+   | `257×1536×384`（×1） | 0.97 | 313 |
    | `1028×64×1028`（×6） | 0.49 | 276 |
    | `1028×1028×64`（×6） | 0.39 | 347 |
    | `257×64×257`（×24） | 0.054 | 156 |
-   | `257×257×64`（×24） | 0.041 | 205 |
    | `300×32×300`（×8） | 0.096 | 60（未过并行阈值，单线程） |
-   | `300×300×32`（×8） | 0.066 | 87（同上） |
 
-   - **单线程**下 `1028×64×1028` 是 136 GFLOPS，正好是 Zen4 单核 AVX2+FMA 的峰值（16 FLOP/cycle × 4.2 GHz ≈ 134）—— 微内核已经吃满单核。
-   - 16 线程只有 490 GFLOPS，约为 8 核理论值的 45%。原因有二：① 26~33 个行块分给 16 线程要跑两波，尾块浪费；② 每个行块都要把整个 B 重读一遍（`26 × 262 KB`），实际是 DRAM 带宽受限。
-   - 已试过但**没有收益**的两条路（别再重复）：
-     - 把整个 B 预打包成 `[列块][k][16]` 供所有行块复用：304 → 234 GFLOPS（打包本来就被 40 行摊薄到 5%，反而多付一份 B 的写回）。
-     - 微内核 k 方向 2 步展开：单线程 136 → 135 GFLOPS（JIT 已经展开，没有收益）。
-4. **ONNXRuntime 的 median 不可全信**：同一进程内 min 26~34 ms 而 median 49~54 ms（yolo11n），是它的 intra-op spin-wait 线程在后台负载下被抢占后的 barrier 放大效应。真实算力看 min，实际部署体验看 median —— 两者都列了。
+   - 机器上限：纯 FMA 微循环 `fma` 实测单线程 91 GFLOPS、16 线程 **753 GFLOPS**（16 线程靠 SMT 超过 8 个物理核）。
+     GEMM 最好也只到约 500 GFLOPS（`257,1536,384` 的列切分版），常规形状 300~350 GFLOPS，即机器峰值的 40%~46%。
+   - 26~33 个行块分给 16 线程要跑两波、尾块浪费，且每个行块都要把整个 B 重读一遍（`26 × 262 KB`），是 DRAM 带宽受限。
+   - **已试过但端到端没有收益的方案（别再重复）**：
+     - 把整个 B 预打包成 `[列块][k][16]` 供所有行块复用：微基准 304 → 234 GFLOPS（反而多付一份 B 的写回）。
+     - 微内核 k 方向 2 步展开：单线程 136 → 135 GFLOPS（JIT 已经展开）。
+     - 行块高度 `mb` 扫参（16/32/64/128）：微基准 250~340 GFLOPS 波动，端到端无差异。
+     - 按流量把切分方向从行切换成列切：微基准 `257,1536,384` 343 → **499 GFLOPS（+45%）**，但端到端交替 A/B 三轮完全一致（273~277 ms 双方相同）。
+   - 这三条合起来是这个项目最重要的一条经验：**独立内核吞吐无法预测端到端**（三次独立验证）。
+     微基准只能用来排除明显不合理的实现，任何优化都必须用「同会话、交替运行两个二进制」的端到端 A/B 来判定。
+4. **ONNXRuntime 的 median 不可全信**：同一进程内 min 29~33 ms 而 median 44~49 ms（yolo11n），是它的 intra-op spin-wait 线程在后台负载下被抢占后的 barrier 放大效应。真实算力看 min，实际部署体验看 median —— 两者都列了。
 
 ## 已知限制（不是失败，是能力边界）
 
@@ -134,16 +160,22 @@ min（无干扰下限）：
 
 ## 下一步（按收益排序）
 
-1. **GEMM 的多线程扩展性（当前最大收益点）**：微内核已经吃满单核，缺的是「16 线程只跑出 45%」。方向：
-   - 二维分块（m 块 × n 块都做 cache blocking），让每个线程的 B 面板只读一遍，而不是每个行块重读整个 B；
-   - batched attention 改成**一个** Parallel 区域里按 `(batch, 行块)` 展平调度，消掉 24 个连续的并行屏障（`257×…×24` 只有 156 GFLOPS，是最差的一组）；
-   - 把 `300×32×300` 这类 `m·n·k < 4M` 的形状从「串行」改成「按 batch 并行」。
-2. **逐元素融合**：`Add 169 + Mul 114 + Div 35 + Sqrt 45 + Erf` 全是全量读写，占 DETR 约 20%。先做同形状二元链的原地融合。
-3. **Transpose 优化**：113 个 Transpose（4.9%），主要是 `[B,H,S,D] ↔ [B,S,H,D]`，可做 8×8 块向量转置。
+1. **逐元素融合**：`Add 169 + Mul 114 + Div 35 + Sqrt 45 + Erf` 全是全量读写，占 DETR 约 20%。
+   逐元素单个算子实测 56 GB/s，已到单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量，只能靠减少趟数**。
+   先做同形状二元链的原地融合。
+2. **搞清「独立内核快 ≠ 端到端快」**（见结论 3）：MatMul 仍占 61.9%（133 ms / 16.6 GFLOP ≈ 125 GFLOPS），
+   而同样的形状独立跑是 313~343 GFLOPS。把链式 MLP 微模型（24 个 MatMul，实测 280 GFLOPS 与独立一致）
+   逐步加回真实模型里的其它算子，找出到底是谁把缓存挤掉了 —— 在此之前继续调 GEMM 内核都是白费。
+3. **Transpose**：113 个（5.6%），已是 8×8 向量分块 + 同布局 memcpy 快路径，剩余空间有限。
 4. **s 档大 GEMM 打包**：对照 SimdYolo `CpuPackedGemm` 与 OpenCV `fastConv` 的权重 block 布局，调 `Panel / RowBlock / SliceDepth`。
-5. 卷积侧：Conv+SiLU 融合、Winograd 覆盖 `5×5`。
+5. 卷积侧：Conv+SiLU 融合、Winograd 覆盖 `5×5` —— 但 DETR 上 Conv 只占 3.4%，收益上限很低。
 
 ## 变更记录
 
 - 2026-11-07：首次建立本文件，四个引擎 × 6 模型（4 YOLO + 2 RF-DETR）全量对照；新增 `bench/run_all.py`、`bench/run_python_bench.py`、`bench/models.json`。
 - 2026-11-07（第二轮）：`gemmbench` 支持 `--batch` 并按时间预热（此前预热不足导致数字偏低 4 倍）；定位 RF-DETR 瓶颈为 batched attention GEMM，实测微内核已达单核峰值但多线程只有 45%；验证并否决「B 全量预打包」「k 方向 2 步展开」两个方案。
+- 2026-11-07（第三轮）：纠正上一轮两个错误结论 —— ①「MatMul 全是 batched attention、MLP 已导出成 Conv」不成立，MLP 的 `[257,384]×[384,1536]` 就是 MatMul 节点，合计 16.6 GFLOP；② 单线程 GEMM 不是 136 GFLOPS，机器 16 线程 FMA 峰值 753 GFLOPS、GEMM 最好约 500。
+  修掉两个测量坑：`profile` 增加 `--warmup`（不预热时 tier-0 代码让 MatMul 份额虚高到 66%）、改用每算子最小耗时汇总（均值被后台负载重尾放大 20%+）。
+  修复最大单点浪费：MatMul 在 B 不参与广播时把 `(batch, m)` 合并成一次 GEMM，decoder q/k/v 投影 4.06 → 0.13 ms，rfdetr-small -24%、medium -12%。
+  验证并否决「按流量改切分方向」（内核 +45%，端到端 0）；新增 `fma` / `gemmbench --threads` 与逐元素带宽、链式 MLP 两个微模型。
+  全表重新测量（同会话），rfdetr 对 OpenCV 的倍率从 1.68/1.70 降到 1.41/1.37。

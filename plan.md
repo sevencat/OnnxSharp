@@ -31,7 +31,8 @@
 | 11 | `ConstFolder` 折叠集合补 `Transpose`（可消灭 1 处数据相关 `Where`） | 依赖追踪实测 |
 | 12 | 新增 **§13 上游同步机制**：后续更新/优化/bugfix 一律先跟 OpenCV 5 dnn 的 git | `misc.md §11`（基线 `5.x @ 43f8b1f5`） |
 | 13 | **性能结果全部搬进 `bench.md`**（唯一事实源），`plan.md` §9 只保留目标与口径；四引擎 × 6 模型可一条命令复现 | 原 §9 是 i7-8700K 的手抄数字，机器/口径都变了 |
-| 14 | M4 重排：**微内核已完成且已到单核峰值**，剩下的瓶颈是**多线程扩展性**，不是再调微内核 | `bench.md` 结论 3（单线程 136 GFLOPS ≈ Zen4 单核峰值，16 线程仅 45%） |
+| 14 | M4 重排：**微内核已完成**，GEMM 只跑到机器峰值的 40%~46%；但**任何内核级优化必须用端到端交替 A/B 判定** | `bench.md` 结论 3（`fma` 16 线程 753 GFLOPS vs GEMM 300~350；三次内核加速均无端到端收益） |
+| 15 | **`profile` 必须带 `--warmup` 且只看每算子最小耗时**，否则 tier-0 代码与后台负载重尾会把均值抬高 20%~4 倍 | `bench.md`「测量方法上的坑」 |
 
 ---
 
@@ -327,7 +328,7 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 - [x] **内存达标**：1:1 方案的 1381 MB 由 `BufferAllocator`（生命周期着色）+ 常量失效释放压到可接受范围（`misc.md §3.1.1` 有 1:1 的基准数）
 
 **验收**：`rfdetr-small/medium` 的 `dets` / `labels` 均已与 ORT golden 对齐，绝对误差在 1e-3 量级、相对误差 ~7e-6（与 yolo11n 同源：F32 累加顺序不同，不是实现错误）；测试见 `YoloGoldenTests`（29/29 PASS）。
-单张 512² 实测 **317.5 ms（small）/ 411.8 ms（medium）**，优于 1500 ms 的朴素版目标，见 `bench.md`。
+单张 512² 实测 **275 ms（small）/ 349 ms（medium）**，优于 1500 ms 的朴素版目标，见 `bench.md`。
 
 ### M4 — 性能
 
@@ -339,22 +340,26 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 - [x] Depthwise 专用 kernel、MaxPool 滑窗 AVX2
 - [x] 逐元素/Softmax/LayerNorm 的 `Span<float>` + 无广播快速路径（`ApplyContiguous` / `ApplyScalar` / `ApplyBroadcast` 三条快路径 + `ParallelRange`）
 - [x] 多线程：`ParallelRange` 按输出面板切分；**小任务（< 4M 乘加）直接串行**，避开 `Parallel.For` 的 ~7 µs 固定开销
-- [x] 性能记录体系：`bench/`（四引擎 × 6 模型）+ `bench.md`（唯一事实源）+ `gemmbench` / `convbench`（按时间预热）
+- [x] 性能记录体系：`bench/`（四引擎 × 6 模型）+ `bench.md`（唯一事实源）+ `gemmbench` / `convbench`（按时间预热）+ `fma`（机器算力上限）+ `profile`（带预热、每算子最小耗时）
 
 **未完成 / 重新排序**
 
-1. [ ] **GEMM 多线程扩展性（当前第一收益点）**：16 线程只有 8 核理论值的 45%。三件事，按性价比排：
-   - [ ] 二维 cache blocking（m 块 × n 块都分块），让每个线程的 B 面板只读一遍，而不是每个行块把整个 B 重读一遍（`26 × 262 KB`，实测已是 DRAM 带宽受限）
-   - [ ] batched attention 在**一个** `ParallelRange` 区域里按 `(batch, 行块)` 展平调度，消掉 24 个连续的并行屏障（`257×64×257 ×24` 只有 156 GFLOPS，是最差一组）
+1. [x] **MatMul 合并 batch 维**：B 不广播时把 `(batch, m)` 拼成一次 GEMM。修掉 decoder q/k/v 投影「300 个 batch × m=1、权重被打包 300 遍」的浪费，单算子 4.06 → 0.13 ms，rfdetr-small -24%、medium -12%
+2. [ ] **逐元素融合（第二收益点）**：`Add 169 + Mul 114 + Div 35 + Sqrt 45` 占 DETR 约 20%，每次都是一遍全量读写。实测 56 GB/s ≈ 单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量，只能靠融合减少遍数**
+3. [ ] **查清「独立内核快 ≠ 端到端快」**：MatMul 仍占 61.9%（≈125 GFLOPS），同形状独立跑是 313~343 GFLOPS。把链式 MLP 微模型（24 个 MatMul，280 GFLOPS 与独立一致）逐步加回真实模型的其他算子，找出谁把缓存挤掉了
+4. [ ] **GEMM 多线程扩展性**：16 线程跑出机器峰值（753 GFLOPS）的 40%~46%：
+   - [ ] 二维 cache blocking（m 块 × n 块都分块），让每个线程的 B 面板只读一遍
+   - [ ] batched attention 在**一个** `ParallelRange` 区域里按 `(batch, 行块)` 展平调度（`257×64×257 ×24` 只有 156 GFLOPS，是最差一组）
    - [ ] `m·n·k < 4M` 的形状按 batch 并行（`300×32×300 ×8` 现在是串行，仅 60 GFLOPS）
-2. [ ] **逐元素融合**：`Add 169 + Mul 114 + Div 35 + Sqrt 45` 占 DETR 约 20%，且每次都是一遍全量读写（实测 4.7 MB / 0.16 ms ≈ 29 GB/s，**已到内存带宽上限，只能靠减少遍数**）
-3. [ ] **Transpose**：113 个（4.9%），`[B,H,S,D] ↔ [B,S,H,D]` 可做 8×8 块向量转置
-4. [ ] **s 档大 GEMM**：对照 SimdYolo `CpuPackedGemm` / OpenCV `fastConv` 的权重 block 布局，调 `Panel / RowBlock / SliceDepth`
-5. [ ] Conv+SiLU 融合、Winograd 覆盖 `5×5`
+5. [ ] **Transpose**：113 个（5.6%），已是 8×8 向量分块 + 同布局 memcpy 快路径，空间有限
+6. [ ] **s 档大 GEMM**：对照 SimdYolo `CpuPackedGemm` / OpenCV `fastConv` 的权重 block 布局，调 `Panel / RowBlock / SliceDepth`
+7. [ ] Conv+SiLU 融合、Winograd 覆盖 `5×5`（DETR 上 Conv 仅 3.4%，收益上限低）
 
 > **已验证无效、不要再做**（详见 `bench.md` 结论 3）：
 > - 把整个 B 预打包成 `[列块][k][16]` 供所有行块复用：304 → 234 GFLOPS（行块 40 行已把打包摊薄到 5%）
 > - 微内核 k 方向 2 步展开：单线程 136 → 135 GFLOPS（JIT 已展开）
+> - 行块高度 `mb` 扫参（16/32/64/128）：微基准 250~340 GFLOPS 波动，端到端无差异
+> - 按流量改切分方向（行切→列切）：微基准 `257,1536,384` 343 → 499 GFLOPS，端到端交替 A/B 三轮完全相同
 
 - 目标见 §9，实测见 `bench.md`
 
@@ -566,7 +571,7 @@ public static class ParallelRange
 | Conv 1×1 | stride 1 | 等价 GEMM |
 | Conv 16×16 | stride 16 | 仅 RF-DETR patch-embed |
 | Depthwise 3×3 | stride 1 | 仅 YOLO（7 处） |
-| GEMM / MatMul | 2D、4D batched + broadcast、transB、3D `[1,T,C]×[C,C]` | YOLO 2 + RF-DETR 140（**全是 batched attention**，形状见 `misc.md §3.10`）。微内核已定稿：4 行×16 列 / AVX2+FMA；**剩余问题是并行扩展性，不是微内核**（`bench.md` 结论 3） |
+| GEMM / MatMul | 2D、4D batched + broadcast、transB、3D `[1,T,C]×[C,C]` | YOLO 2 + RF-DETR 140（MLP/投影/attention 都有，形状见 `misc.md §3.10`）。微内核已定稿：4 行×16 列 / AVX2+FMA；B 不广播时 `(batch, m)` 合并成一次 GEMM；剩余问题是并行扩展性与「独立内核快 ≠ 端到端快」 |
 | MaxPool | 5×5 s1 pad2，ceil_mode=0 | 仅 YOLO SPPF（3 处） |
 | Softmax | axis=-1（18 处）、axis=1（1 处） | |
 | LayerNorm | axis=-1，eps=1e-6 / 1e-5 | 仅 RF-DETR（49 处） |
@@ -651,12 +656,12 @@ onnx.save(m, sys.argv[2])
 
 | 模型 | 当前实测（median） | 优化后目标 |
 |---|---|---|
-| yolo11n 640² | 43.4 ms | **< 30 ms** |
-| yolo11s 640² | 81.3 ms | < 80 ms |
-| yolov8n 640² | 35.1 ms | < 30 ms |
-| yolov8s 640² | 88.0 ms | < 55 ms |
-| rfdetr-small 512² | 317.5 ms | **< 190 ms**（追平 OpenCV dnn） |
-| rfdetr-medium 576² | 411.8 ms | < 250 ms |
+| yolo11n 640² | 36.5 ms | **< 30 ms** |
+| yolo11s 640² | 88.3 ms | < 80 ms |
+| yolov8n 640² | 42.4 ms | < 30 ms |
+| yolov8s 640² | 90.2 ms | < 55 ms |
+| rfdetr-small 512² | 275.1 ms | **< 190 ms**（追平 OpenCV dnn） |
+| rfdetr-medium 576² | 348.8 ms | < 250 ms |
 
 > 口径说明：
 > - 原「首版 < 150 ms」对标标量 kernel 偏乐观，已放弃该阶段口径；现直接对标 OpenCV 5 dnn / SimdYolo 实测值。
@@ -669,11 +674,13 @@ onnx.save(m, sys.argv[2])
 
 | 结论 | 依据 |
 |---|---|
-| GEMM 微内核**已达 Zen4 单核峰值**（`1028×64×1028` 单线程 136 GFLOPS，理论 134） | `gemmbench --batch 1` |
-| 16 线程只有 8 核理论值的 **45%**：① 26~33 个行块分 16 线程要跑两波；② 每行块重读整个 B，DRAM 带宽受限 | 同上 + 手工估算 |
-| RF-DETR 的 **140 个 MatMul 全是 batched attention**（MLP 的被导出成 `Conv`），卷积优化对其只影响 3.4% | 微模型 `attn-6x1028x64` + 节点清单 |
-| 逐元素算子（`Add/Mul/Div`）已向量化+并行，**卡在内存带宽**（29 GB/s），只能靠**融合减少遍数** | `TensorOps.ApplyContiguous` 审读 + profile |
+| 机器上限：纯 FMA 单线程 **91 GFLOPS**、16 线程 **753 GFLOPS**（SMT）；GEMM 最好约 500 GFLOPS | `fma --threads 1,16` + `gemmbench` |
+| 16 线程 GEMM 只有峰值的 **40%~46%**：① 26~33 个行块分 16 线程要跑两波；② 每行块重读整个 B，DRAM 带宽受限 | `gemmbench --threads 1,2,4,8,16` + 手工估算 |
+| RF-DETR 的 140 个 MatMul **不全是 batched attention**：MLP 的 `[257,384]×[384,1536]` 就是 MatMul 节点，全部合计 16.6 GFLOP（约 92% 计算量）。卷积只影响 3.4% | 形状统计 + `profile` |
+| decoder q/k/v 投影运行时是 `[300,1,256]×[256,256]`（300 个 batch × m=1），按 batch 逐个调内核会把权重重打包 300 遍，**已修为合并 batch 维**（4.06 → 0.13 ms/算子） | `profile` 逐算子 + 端到端 A/B（-24%） |
+| 逐元素算子已向量化+并行，实测 **56 GB/s**，是单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量**，只能靠**融合减少遍数** | 微模型 `add-1024x1024` + numpy memcpy 对照 |
 | YOLO 侧差距集中在 `s` 档（层宽 128~256），是**大 GEMM 分块/打包**，不是单个卷积 | `bench.md` 相对倍率表 |
+| **独立内核吞吐无法预测端到端**：三次独立验证（B 预打包、`mb` 扫参、列切分 +45%）都出现「微基准变快/变慢、端到端无变化」，只能用同会话交替 A/B 判定 | `bench.md` 结论 3 |
 
 ---
 
@@ -686,8 +693,8 @@ onnx.save(m, sys.argv[2])
 | R3 | 4D batched MatMul + broadcast 做错 | YOLO C2PSA / RF-DETR 全崩 | M0.5 写通用广播迭代器；算子层先做单测 |
 | R4 | Shape 链折叠不完整（122 个 Reshape） | 形状推断失败 | 折叠集合含 `Transpose`；失败时回退 `DynamicOutputShapes` |
 | R5 | opset 17/19 参数走 **input 而非 attribute** | 解析出空属性 | `LayerParams` 统一"先看 const 输入，再看 attribute"；补 opset 18+ `Split.num_outputs` |
-| R6 | GEMM 性能不达预期 | 端到端慢 3~5× | ~~直接移植 SimdYolo packed GEMM~~ **已排除**：微内核已到单核峰值（`bench.md` 结论 3），真实风险转为**多线程扩展性只有 45%**，对策是二维 cache blocking + batched 展平调度 |
-| R10 | 逐元素算子按遍数堆叠（DETR 占 ~20%） | Transformer 模型永远追不上 OpenCV | 内存带宽已吃满（29 GB/s），只能靠**图级融合**减少遍数；M4 先做同形状二元链原地融合 |
+| R6 | GEMM 性能不达预期 | 端到端慢 3~5× | 微内核已不是主要矛盾（单算子 300~500 GFLOPS），真实风险是**多线程只跑出机器峰值的 40%~46%**，以及对「独立内核快 ≠ 端到端快」还没解释清楚（`bench.md` 结论 3）；对策是二维 cache blocking + batched 展平调度 |
+| R10 | 逐元素算子按遍数堆叠（DETR 占 ~20%） | Transformer 模型永远追不上 OpenCV | 实测 56 GB/s，是单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量**，只能靠**图级融合**减少遍数；M4 先做同形状二元链原地融合 |
 | R7 | 数值细节差异（`Resize` floor、`LayerNorm` eps、`GridSample` 边界） | MAE 超标 | 逐算子与 ORT 对齐；`misc.md` 记录每个坑 |
 | R8 | protobuf reader 出错（118 MB 模型） | 加载失败 | 直接移植 SimdYolo `Proto` 并在 4 个真实模型上跑 |
 | R9 | 别名冲突（零拷贝 Reshape 被下游覆盖） | 结果随机错 | 别名 Arg 必须由 Allocator 绑同一 buffer 且生命周期包含；否则退化为拷贝 |
