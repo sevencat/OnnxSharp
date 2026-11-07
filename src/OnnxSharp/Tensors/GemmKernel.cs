@@ -29,6 +29,14 @@ internal static class GemmKernel
     private const long ParallelThreshold = 1L << 22;
 
     /// <summary>
+    /// 并行度必须跟 <see cref="ParallelRange.Threads"/> 一致：行块是按它算的，
+    /// 若放任 <c>Parallel.For</c> 用满线程池，会出现「块按 4 线程切、实际 16 线程抢」的错配，
+    /// 测出来的扩展性曲线也是假的（<c>--threads 1</c> 实际跑 2 线程）。
+    /// </summary>
+    private static ParallelOptions ParallelOptions() =>
+        new() { MaxDegreeOfParallelism = Math.Max(1, ParallelRange.Threads) };
+
+    /// <summary>
     /// <c>c = a · b</c>。
     /// <para>
     /// <paramref name="ldc"/> 是 C 的行步长（元素数），0 表示紧凑 <c>n</c>。
@@ -81,6 +89,8 @@ internal static class GemmKernel
         fixed (float* pc = c)
         fixed (float* pbias = hasBias ? bias : ReadOnlySpan<float>.Empty)
         {
+            var popts = ParallelOptions();
+
             // 点卷积形态：m（输出通道）小、n（空间位置）大。
             // 按行切分时每个行块都要重新打包一整份 B（k×n），行块数越多 B 的搬运就
             // 被放大得越厉害 —— 1×1 conv 上实测并行后和串行一样快（各自 16 份 B）。
@@ -98,7 +108,7 @@ internal static class GemmKernel
                 int basePer = columnBlocks / threads;
                 int rem = columnBlocks % threads;
 
-                Parallel.For(0, threads, t =>
+                Parallel.For(0, threads, popts, t =>
                 {
                     int cb0 = t * basePer + Math.Min(t, rem);
                     int cb1 = cb0 + basePer + (t < rem ? 1 : 0);
@@ -130,7 +140,7 @@ internal static class GemmKernel
                 float* c0 = pc;
                 float* bias0 = pbias;
 
-                Parallel.For(0, rowBlocks, ib =>
+                Parallel.For(0, rowBlocks, popts, ib =>
                 {
                     int row0 = ib * mb;
                     int row1 = Math.Min(row0 + mb, m);

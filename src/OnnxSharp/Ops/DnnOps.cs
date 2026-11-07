@@ -1317,6 +1317,45 @@ internal static class DnnOps
             var srcB = b.AsSpan<float>();
             var dst = output.AsSpan<float>();
 
+            // B 没有 batch 维、A 也不做广播时，(batch, m) 可以合并成一个大 GEMM：
+            // 两者拼起来正好是 [batches*m, k] × [k, n]，A/C 本来就是连续存放的。
+            // 典型例子是 DETR decoder 的 q/k/v 投影，运行时形状 [300,1,256] × [256,256]：
+            // 按 batch 逐次调用会让内核把 256 KB 的权重重新打包 300 遍（实测单个算子 4.06 ms），
+            // 合并成一次 300×256×256 只要 0.13 ms —— 这是当前最大的单点浪费。
+            bool bBatched = false;
+            bool aBroadcast = false;
+            for (int i = 0; i < batchRank; i++)
+            {
+                if (bBatch[i] != 1)
+                {
+                    bBatched = true;
+                    break;
+                }
+            }
+
+            if (!bBatched)
+            {
+                for (int i = 0; i < batchRank; i++)
+                {
+                    if (aBatch[i] != outBatch[i])
+                    {
+                        aBroadcast = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!bBatched && !aBroadcast)
+            {
+                int rows = checked((int)(batches * m));
+                GemmKernel.Multiply(
+                    srcA.Slice(0, rows * k),
+                    srcB.Slice(0, k * n),
+                    dst.Slice(0, rows * n),
+                    rows, k, n);
+                return;
+            }
+
             for (long batch = 0; batch < batches; batch++)
             {
                 long aOffset = 0;

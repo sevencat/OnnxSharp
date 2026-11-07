@@ -1,4 +1,6 @@
-﻿using OnnxSharp.Core;
+﻿using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+using OnnxSharp.Core;
 using OnnxSharp.Onnx;
 using OnnxSharp.Tensors;
 
@@ -21,6 +23,7 @@ return args[0].ToLowerInvariant() switch
     "detect" => Detect(args),
     "gemmbench" => GemmBench(args),
     "parbench" => ParBench(args),
+    "flopsbench" => FlopsBench(args),
     "convbench" => ConvBench(args),
     "help" or "-h" or "--help" => Usage(),
     _ => Usage(),
@@ -332,6 +335,12 @@ static int GemmBench(string[] args)
     int iters = options.GetInt("--iters", 50);
     int batches = options.GetInt("--batch", 1);
 
+    // 线程数必须在这里设：GemmKernel 用 ParallelRange.Threads 决定分块和并行度，
+    // 而默认并行度是 ProcessorCount —— 测扩展性曲线时必须能压下来。
+    int threads = options.GetInt("--threads", 0);
+    if (threads > 0)
+        OnnxSharp.Threading.ParallelRange.MaxDegreeOfParallelism = threads;
+
     var shapes = new List<(int M, int K, int N)>();
     string? single = options.GetString("--shape");
 
@@ -455,6 +464,61 @@ static int ParBench(string[] args)
     Console.WriteLine($"Parallel.For      : {watch.Elapsed.TotalMilliseconds,8:F1} ms / {iters} 次 = {us2,7:F1} µs/次");
 
     Console.WriteLine($"acc={acc[0]}");
+    return 0;
+}
+
+/// <summary>
+/// 纯 FMA 峰值基准：只有寄存器里的独立累加链，零访存。
+/// <para>
+/// 它的意义是给 GEMM 一个**上限参照**：GEMM 跑到这个数的百分之多少，
+/// 决定了该继续调内核还是该承认是硬件（全核降频 / 后台负载）限制。
+/// 没有这个数就没法判断「45% 扩展性」是代码问题还是机器问题。
+/// </para>
+/// </summary>
+static int FlopsBench(string[] args)
+{
+    var options = ParseOptions(args, 1);
+    int iters = options.GetInt("--iters", 10);
+    int inner = options.GetInt("--inner", 500_000);
+    int threads = options.GetInt("--threads", 0);
+
+    if (threads > 0)
+        OnnxSharp.Threading.ParallelRange.MaxDegreeOfParallelism = threads;
+
+    int degree = OnnxSharp.Threading.ParallelRange.Threads;
+
+    Console.WriteLine($"threads : {degree}");
+    Console.WriteLine($"inner   : {inner}  x {FmaBench.Accumulators} FMA/轮");
+    Console.WriteLine();
+
+    var sink = new float[degree];
+
+    void Run(int t) => sink[t] = FmaBench.Run(inner);
+
+    // 预热走时间：分层编译要几十次调用才升到 tier-1。
+    var warm = System.Diagnostics.Stopwatch.StartNew();
+    do
+    {
+        System.Threading.Tasks.Parallel.For(0, degree,
+            new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = degree }, Run);
+    }
+    while (warm.Elapsed.TotalMilliseconds < 500);
+
+    double best = double.MaxValue;
+    for (int i = 0; i < iters; i++)
+    {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        System.Threading.Tasks.Parallel.For(0, degree,
+            new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = degree }, Run);
+        watch.Stop();
+        if (watch.Elapsed.TotalMilliseconds < best)
+            best = watch.Elapsed.TotalMilliseconds;
+    }
+
+    double flops = (double)degree * inner * FmaBench.Accumulators * 16;   // 每 FMA = 8 lane × 2
+    Console.WriteLine($"per-thread : {inner * FmaBench.Accumulators * 16.0 / (best * 1e6),8:F1} GFLOPS");
+    Console.WriteLine($"total      : {flops / (best * 1e6),8:F1} GFLOPS   ({best:F1} ms)");
+    Console.WriteLine($"sink       : {sink.Sum():F3}");
     return 0;
 }
 
@@ -605,27 +669,32 @@ static int Profile(string[] args)
     int iters = Math.Max(1, options.GetInt("--iters", 2));
     int top = options.GetInt("--top", 20);
 
+    // 预热不计入统计：前几次迭代是 tier-0 代码，会把计算密集算子的份额抬高一大截。
+    int warmup = Math.Max(0, options.GetInt("--warmup", 5));
+
     var watch = System.Diagnostics.Stopwatch.StartNew();
-    var timings = net.ProfileAll(iters);
+    var timings = net.ProfileAll(iters, warmup);
     watch.Stop();
 
     double total = timings.Sum(t => t.Milliseconds);
+    double totalMin = timings.Sum(t => t.MinMilliseconds);
 
     Console.WriteLine($"model     : {path}");
-    Console.WriteLine($"ops       : {net.MainGraph?.Prog.Count}    iters: {iters}    {watch.Elapsed.TotalMilliseconds:F0} ms");
-    Console.WriteLine($"total     : {total:F1} ms  ({total / iters:F1} ms/iter)");
+    Console.WriteLine($"ops       : {net.MainGraph?.Prog.Count}    iters: {iters}    warmup: {warmup}    {watch.Elapsed.TotalMilliseconds:F0} ms");
+    Console.WriteLine($"total     : {total / iters:F1} ms/iter (mean)   {totalMin:F1} ms/iter (sum of min)");
+    Console.WriteLine($"note      : share 按 sum-of-min 算；mean 会被后台负载的重尾放大，和 bench 的 median 对不上");
     Console.WriteLine();
-    Console.WriteLine($"{"#",4}  {"type",-18}{"avg ms",10}{"share",8}  name");
+    Console.WriteLine($"{"#",4}  {"type",-18}{"min ms",10}{"avg ms",10}{"share",8}  name");
 
     int index = 0;
     foreach (var timing in timings.Take(top < 1 ? timings.Count : top))
     {
-        Console.WriteLine($"{++index,4}  {timing.Type,-18}{timing.Average,10:F2}{timing.Milliseconds / total * 100,7:F1}%  {timing.Name}");
+        Console.WriteLine($"{++index,4}  {timing.Type,-18}{timing.MinMilliseconds,10:F2}{timing.Average,10:F2}{timing.MinMilliseconds / totalMin * 100,7:F1}%  {timing.Name}");
     }
 
     // 按算子类型汇总：热点分散时（几百个 op 各占 1%）看这个更有用
     Console.WriteLine();
-    Console.WriteLine($"{"type",-20}{"ops",6}{"avg ms",10}{"share",8}");
+    Console.WriteLine($"{"type",-20}{"ops",6}{"min ms",10}{"avg ms",10}{"share",8}");
 
     var byType = timings
         .GroupBy(t => t.Type)
@@ -633,13 +702,13 @@ static int Profile(string[] args)
         {
             Type = g.Key,
             Ops = g.Count(),
+            Min = g.Sum(t => t.MinMilliseconds),
             Milliseconds = g.Sum(t => t.Milliseconds) / iters,
-            Share = g.Sum(t => t.Milliseconds) / total * 100,
         })
-        .OrderByDescending(g => g.Milliseconds);
+        .OrderByDescending(g => g.Min);
 
     foreach (var group in byType)
-        Console.WriteLine($"{group.Type,-20}{group.Ops,6}{group.Milliseconds,10:F1}{group.Share,7:F1}%");
+        Console.WriteLine($"{group.Type,-20}{group.Ops,6}{group.Min,10:F1}{group.Milliseconds,10:F1}{group.Min / totalMin * 100,7:F1}%");
 
     return 0;
 }
