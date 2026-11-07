@@ -9,14 +9,21 @@
 
 | 项 | 值 |
 |---|---|
+| CPU | **AMD Ryzen 7 8845HS**（8C/16T，Zen4，AVX2 + **AVX-512**，L1D 32 KiB / L2 1 MiB / L3 16 MiB） |
+| 内存 | 47 GB |
 | .NET SDK | `7.0.410`, `8.0.416`, `10.0.101`, `10.0.402` |
 | .NET 运行时 | `Microsoft.NETCore.App 7.0.20 / 8.0.22 / 10.0.1 / 10.0.13` |
 | Python | `3.11.17` |
 | onnx | `1.23.2` |
-| onnxruntime | `1.31.1`（用作 golden oracle） |
-| cv2 | **未安装**（本项目不以 OpenCV 为 oracle，不需要） |
+| onnxruntime | `1.31.1`（golden oracle + 性能对照组） |
+| cv2 | **5.0.0**（仅 `bench/` 里作 OpenCV dnn 性能对照组，**不作 oracle**） |
 | OpenCV 参考源码 | `F:\code\opencv`（**5.2.0-dev**） |
+| SimdYolo | `0.11.3`（`CPU SIMD (256 bits)`，性能对照组） |
 | 本项目路径 | `F:\code\OnnxSharp` |
+
+> ⚠️ 测量机是**共享环境**（后台常驻约 1.5 核负载），同代码连跑三次能差 ±30%。做 A/B 必须交替跑（见坑 #37），绝对数字只作趋势看。
+>
+> 单核 AVX2+FMA 峰值参考：16 FLOP/cycle × 4.2 GHz ≈ **134 GFLOPS**（本轮实测 `1028×64×1028` 单线程 136 GFLOPS，即已到顶）。
 
 > 目标框架：`net8.0;net10.0`（SDK 8 与 10 均已安装，双目标可直接 build）。
 >
@@ -350,6 +357,24 @@ Tile TopK Transpose Unsqueeze Where
 > 原文档此列表数出 41，是因为漏写了 `Greater`。`rfdetr-small` 实测有 2 个 `Greater`，均在 transformer 的 mask 构造里：
 > - `/transformer/Greater`：`Reshape × Constant → Greater → And`
 > - `/transformer/Greater_1`：`ReduceSum × Constant → Greater → Not`
+
+### 3.10 RF-DETR 的 MatMul 全是 batched attention（2026-11-07 实测）
+
+**这是本轮最重要的结构发现**，直接决定了 M4 该往哪儿投。
+
+`rfdetr-small` 的 **140 个 `MatMul` 里，没有一个是 MLP 的 `[N,384]×[384,1536]`** —— 那些在导出时已经变成 `Conv`（1×1）。140 个全是 attention 的 `QKᵀ` 与 `AV`：
+
+| 形状（batch, m, k, n） | 组数 | 出现位置 |
+|---|---|---|
+| `(6, 1028, 64, 1028)` / `(6, 1028, 1028, 64)` | 若干 | ViT-S 主干，12 个 block × 2 |
+| `(24, 257, 64, 257)` / `(24, 257, 257, 64)` | 若干 | 主干 windowed attention |
+| `(8, 300, 32, 300)` / `(8, 300, 300, 32)` | 3 组 | decoder cross-attention |
+
+**含义**：
+- 卷积优化（Winograd / 面板打包）对 RF-DETR 只影响 **3.4%**，别再往那儿投；
+- 这 6 个形状的 `k` 只有 32/64/257，**K 方向根本喂不满流水线**，且 batch 维度是串行循环 → 24 个连续的并行屏障；
+- 逐元素 `Add 169 + Mul 114 + Div 35 + Sqrt 45` 合计约 20%，每次都是一遍全量读写。
+- 实测吞吐：`1028×64×1028` 单线程 **136 GFLOPS ≈ Zen4 单核峰值**，16 线程 276 GFLOPS（45%）；`257×64×257×24` 只有 156 GFLOPS。详见 `bench.md`。
 >
 > 两者都属于 §3.8 的 shape/mask 链（可被常量折叠吃掉），但**必须实现**。因此 `plan.md` §7 的分批数应为 A9 + B3 + C17 + D5 + **E8** = 42。
 
@@ -490,6 +515,26 @@ Tile TopK Transpose Unsqueeze Where
 
 35. **`ArgData.Shape` 与 `Tensor.Shape` 不是一回事**。共享缓冲槽会被后续算子反复 `Fit`，所以 `GetArgTensor(arg).Shape` 读到的是**该槽最后一次写入的形状**，而 `GetArgData(arg).Shape` 才是「这个 Arg 被生产时」的形状。凡是「事后」检查/打印中间张量形状的地方（形状对齐测试、`dump-graph`）都必须读 `ArgData`；第一版 `dump-graph` 就是踩了这个坑，打印出满屏相同的形状。
 
+### 6.5 性能测量与内核调优的坑（2026-11-07）
+
+36. **.NET 分层编译会让「按次数预热」的基准低 4 倍**（本轮最贵的一课）。热点方法要被调用几十次才会提升到 tier-1，tier-0 代码没有内联、没有 AVX 向量化。`gemmbench` 原来固定预热 3 次，同一个 `1028×64×1028` 测出 **50 GFLOPS，真实值 490 GFLOPS**。之前据此得出的「MatMul 只有 32~58 GFLOPS」「k 方向撞 L1」等结论**全部作废**。
+    ```csharp
+    // 正确做法：按时间预热，不是按次数
+    var warm = System.Diagnostics.Stopwatch.StartNew();
+    do { Run(); } while (warm.Elapsed.TotalMilliseconds < 400);
+    ```
+    推论：任何只看 5~10 次迭代的数字都不可信；同时 `--iters` 太小时中位数仍会被 tier-0 样本污染。`env COMPlus_TieredCompilation=0` 可以让结果更"干净"，但**那测量的不是实际运行时的性能**，不要用它出结论。
+
+37. **A/B 必须在同一会话里交替跑，否则会被后台负载骗**。测量机后台有 ~1.5 核常驻负载，同一份代码连跑 3 次能得到 197 / 243 / 331 GFLOPS。做法：把两个版本各编一份二进制到 `bench/bin/{plain,unroll}/`，然后**交替**调用，取中位数。只看单侧「改前 vs 改后」的两次独立测量，5~10% 的差异完全是噪声。
+
+38. **已验证无效的两个内核优化方向（不要再做）**：
+    - **B 全量预打包成 `[列块][k][16]` 供所有行块复用**：`1028×64×1028` 从 304 掉到 234 GFLOPS。原因是行块高 40 行，打包成本本来就只占 5%，却多付了一整份 B 的写回 + 每次 `Multiply` 一次 `ArrayPool` 大块租借。
+    - **微内核 k 方向 2 步展开**：单线程 136 → 135 GFLOPS，零收益。JIT 的循环展开 + 8 个独立累加器已经把 ILP 吃满，瓶颈在 FMA 端口不在循环开销。
+    
+    先把「单线程跑出多少」测出来再决定方向：**单线程已达 Zen4 峰值（136 GFLOPS / 理论 134）就说明微内核到头了**，剩下的只能在分块与线程调度上找。
+
+39. **`Parallel.For` 的固定开销约 7 µs**，小算子开线程反而更慢。当前阈值：`GemmKernel.ParallelThreshold = 1<<22` 乘加、`TensorOps.ParallelElementThreshold = 1<<16` 元素。副作用是 `300×32×300`（2.9M 乘加）这类形状被判定串行，只能跑 60 GFLOPS —— 更好的做法是「按 batch 并行」而不是整算子串行。
+
 ---
 
 ## 7. 工具脚本
@@ -601,7 +646,21 @@ python tools/scripts/gen_golden.py F:\ai\models\yolo\yolo11n.onnx F:\ai\models\y
 # 后续子命令
 dotnet run --project tools/OnnxSharp.Cli -- run F:\ai\models\yolo\yolo11n.onnx --input test.bin
 dotnet run --project tools/OnnxSharp.Cli -- bench F:\ai\rfdetr\onnx_model\rfdetr-small.onnx --iters 20
+
+# 性能基准（四引擎 × 6 模型，写 bench/results/latest.json，结果抄进 bench.md）
+python bench/run_all.py --iters 30 --warmup 10 --rounds 2 --threads 16
+
+# 单算子内核定点测量（--batch 模拟 batched attention；内部按时间预热，勿改成按次数）
+$cli = 'tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe'
+& $cli gemmbench --shape 1028,64,1028 --batch 6 --iters 20
+& $cli convbench --shape 1,128,80,80,128,3,3,1,1,1
+
+# 微模型（attn-6x1028x64 / matmul-1025x384x1536），产物在 bench/models/，可随时重建
+python bench/make_micro_models.py
+& $cli bench bench/models/attn-6x1028x64.onnx --input bench/inputs/i1x6x1028x64.f32 --iters 60 --warmup 10
 ```
+
+> **性能数字一律只抄进 `bench.md`**，本文件与 `plan.md` 只写方法、坑与结论。
 
 M1 + M2（Conv）完成时的实测输出：
 
@@ -650,19 +709,30 @@ $ dotnet run --project tests/OnnxSharp.Tests
 
 ---
 
-## 9. 当前代码结构（实测，M0 + M0.5 完成）
+## 9. 当前代码结构（实测，M0 ~ M3 完成 + M4 进行中）
 
 ```
 F:\code\OnnxSharp\
-├─ plan.md / misc.md / .gitignore
+├─ plan.md / misc.md / bench.md          三件套：计划 / 事实库 / 性能（性能唯一事实源）
 ├─ upstream.lock                         上游 OpenCV dnn 版本锁（JSON）
 ├─ OnnxSharp.slnx                        src / tests / tools 三个 Folder
+├─ bench\                                四引擎对照基准（结果抄进 bench.md）
+│  ├─ run_all.py                         编排 OnnxSharp / ORT / OpenCV dnn / SimdYolo × 6 模型
+│  ├─ run_python_bench.py                ORT 与 cv2.dnn 单独跑
+│  ├─ models.json                        模型清单（路径 / 输入形状 / 是否支持）
+│  └─ make_micro_models.py               生成定点测量用微模型（attn / 单 MatMul）
 ├─ src\OnnxSharp\OnnxSharp.csproj        net8.0;net10.0, AllowUnsafeBlocks, Nullable
 │  ├─ Tensors\DType.cs                   元素类型 + SizeOf/IsInteger/IsFloat
 │  ├─ Tensors\Layout.cs                  Layout 枚举（仅 NCHW，接口预留）        [M0.5]
 │  ├─ Tensors\TensorShape.cs             形状（值类型，params int[]）
 │  ├─ Tensors\Tensor.cs                  张量（Fit 复用 / AsSpan<T> / Clone / Layout）
-│  ├─ Tensors\TensorOps.cs               广播 + 逐元素（F32）
+│  ├─ Tensors\TensorOps.cs               广播 + 逐元素（F32）+ 三条快路径        [M4]
+│  ├─ Tensors\GemmKernel.cs              GEMM：4×16 AVX2/FMA 微内核 + B 面板打包  [M4]
+│  ├─ Tensors\TransposeKernel.cs         块向量转置                             [M4]
+│  ├─ Tensors\VectorMath.cs              共用 AVX2 工具（水平归约等）
+│  ├─ Kernels\ConvKernels.cs             直接卷积（group/stride/dilation/pad）+ MaxPool [M2+M4]
+│  ├─ Kernels\PackedConv.cs              面板打包卷积（16 空间位置，SliceDepth=128）[M4]
+│  ├─ Kernels\Winograd.cs                Winograd F(2×2,3×3) 8-tile 向量化        [M4]
 │  ├─ Core\Arg.cs                        Arg / ArgKind / ArgData（+ Layout / BufferIndex）
 │  ├─ Core\Graph.cs                      prog 线性表 + Version + Reset/RemoveAll   [M0.5]
 │  ├─ Core\LayerInfo.cs                  LayerInfo + Layer + Net 反查 + In() + GetLayouts [M0.5]
@@ -671,7 +741,9 @@ F:\code\OnnxSharp\
 │  ├─ Core\LayerRegistry.cs              显式字典注册（无反射，AOT 友好）
 │  ├─ Core\Interpreter.cs                解释循环 + 动态形状分支 + 类型签名         [M0.5]
 │  ├─ Core\NetImpl.cs                    Arg 表 + 槽/池 + Declare/Require + PrepareForGraph [M0.5]
-│  ├─ Core\Net.cs                        门面（ReadModel 待 M1）
+│  ├─ Core\Net.cs                        门面（ReadModel / Forward / ForwardAll）
+│  ├─ Core\ConstFolder.cs                常量折叠（消除 shape 链）               [M3]
+│  ├─ Core\GraphFusion.cs                图级融合 pass（Mul 常量折叠等）          [M4]
 │  ├─ Core\OnnxSharpException.cs
 │  ├─ Engine\BufferAllocator.cs          生命周期区间着色，共享缓冲槽             [M0.5]
 │  ├─ Onnx\Proto.cs                      protobuf 消息视图（零拷贝）             [M1]
@@ -679,23 +751,27 @@ F:\code\OnnxSharp\
 │  ├─ Onnx\OnnxImporter.cs               图导入：initializer/Constant→Const Arg、value_info、属性 [M1]
 │  ├─ Ops\OpUtil.cs                      广播/轴/常量读取等公共工具              [M1]
 │  ├─ Ops\ShapeOps.cs                    Shape/Reshape/Transpose/Concat/Split/Slice/Gather [M1]
-│  ├─ Ops\DnnOps.cs                      Conv/MaxPool/Resize/Softmax/MatMul        [M1+M2]
-│  ├─ Kernels\ConvKernels.cs             直接卷积（group/stride/dilation/pad）    [M2]
-│  ├─ Threading\ParallelRange.cs         parallel_for_ 等价物
+│  ├─ Ops\DnnOps.cs                      Conv/MaxPool/Resize/Softmax/MatMul/LayerNorm/GridSample [M1+M2+M3]
+│  ├─ Ops\AttnOps.cs                     Softmax/LayerNorm/Attention 相关          [M3]
+│  ├─ Ops\BroadcastOps.cs                Expand/Tile/Where/广播构造                [M3]
+│  ├─ Ops\IndexOps.cs                    Gather/GatherElements/TopK/Slice          [M3]
+│  ├─ Ops\MiscOps.cs                     Cast/Erf/Sin/Cos/比较/逻辑 等杂项         [M3]
+│  ├─ Threading\ParallelRange.cs         parallel_for_ 等价物（小任务直接串行）
 │  ├─ Ops\NaryEltwiseLayer.cs            Add/Sub/Mul/Div/Max/Min
 │  └─ Ops\ActivationLayer.cs             Relu/Sigmoid/Sqrt/Exp/Neg/Abs
-├─ tests\OnnxSharp.Tests\                零依赖测试运行器；25 个用例（net10.0）
+├─ tests\OnnxSharp.Tests\                零依赖测试运行器；29 个用例（net10.0）
 │  ├─ Harness.cs                         TestCase / Assert / RunAll / Skip
 │  ├─ ArgTableTests.cs                   Declare/Require/TryGetArg/常量元信息
 │  ├─ BufferAllocatorTests.cs            槽复用、并发分支、图输出存活、保守策略
 │  ├─ EngineTests.cs                     常量驱动形状、temp 池、动态形状、图变更
 │  ├─ OnnxReaderTests.cs                 protobuf/类型解码 + 两模型结构断言   [M1]
 │  ├─ OnnxShapeTests.cs                  333 张量形状 vs onnx.shape_inference [M1]
-│  ├─ YoloGoldenTests.cs                 yolo11n 端到端 vs ORT golden        [M2]
+│  ├─ TransposeKernelTests.cs            Transpose 全 rank/全 perm 对拍       [M4]
+│  ├─ YoloGoldenTests.cs                 yolo11n / yolov8 端到端 vs ORT golden [M2]
 │  └─ TestLayers.cs                      ReadConstShapeLayer / DynamicFillLayer
 ├─ tools\scripts\dump_shapes.py         生成形状 oracle（onnx.shape_inference）
 ├─ tools\scripts\gen_golden.py          生成 ORT golden 张量               [M2]
-└─ tools\OnnxSharp.Cli\                  冒烟测试（手工建图 Add+Relu）
+└─ tools\OnnxSharp.Cli\                  info / dump-graph / run / bench / gemmbench / convbench
 ```
 
 命名空间约定：`OnnxSharp.Tensors` / `OnnxSharp.Core` / `OnnxSharp.Ops` / `OnnxSharp.Threading`。
@@ -745,6 +821,8 @@ SMOKE TEST: PASS
 | 2026-11-07 | **M2 第一批完成**：`Kernels/ConvKernels.cs` 直接卷积；`tools/scripts/gen_golden.py` + `YoloGoldenTests` 打通 ORT 对照；**yolo11n 端到端跑通，max\\|diff\\|=1.9e-3 / mean\\|diff\\|=3.3e-6，耗时 5.4 s**（标量版，性能留给 M4）。25/25 PASS |
 | 2026-11-07 | **M1 第一批完成**：`Onnx/Proto.cs`（零拷贝 protobuf 视图）、`Onnx/OnnxFile.cs`（结构 + TensorProto 解码，含外部数据路径校验）、CLI `info` 子命令、`OnnxReaderTests`（7 个用例）。实测 yolo11n 22ms/320 节点/196 init，rfdetr-small 91ms/1539 节点/354 init。新增坑 #31（DataType 从 1 起）、#32（RF-DETR 双输出）、#33（Constant 才是 I64 来源） |
 | 2026-11-07 | **M0.5 落地完成**：`Engine/BufferAllocator.cs`（生命周期着色）、`LayerInfo.Net` + `In()/IsConstInput()`、`Graph.Version/Reset/RemoveAll`、`NetImpl` 槽池 + `FitTemps` + `Declare/Require/TryGetArg`、`Interpreter` 动态形状分支 + 类型签名、`Tensors/Layout.cs` 预留、`tests/OnnxSharp.Tests`（零依赖 16 用例）。`dotnet build` 0 警告 0 错误，16/16 PASS |
+| 2026-11-07 | **建立 `bench.md`（性能唯一事实源）+ `bench/` 脚本体系**：`run_all.py` 一条命令跑 4 引擎 × 6 模型（OnnxSharp / ORT CPU / OpenCV 5 dnn / SimdYolo，YOLO×4 + RF-DETR×2），输出 median/min 双指标；实测 yolo11n 43.4 ms、rfdetr-small 317.5 ms。新增坑 #36（分层编译按次数预热会低估 4 倍） |
+| 2026-11-07 | **本轮：RF-DETR 瓶颈定位到 batched attention GEMM**。新增 §3.10（140 个 MatMul 全是 attention，MLP 已导出成 Conv）；新增 §6.5 坑 #36~#39（分层编译预热、A/B 必须交替、两个已否决的内核方向、`Parallel.For` 7 µs 阈值）；`gemmbench` 加 `--batch` 并改为按时间预热；新增 `bench/make_micro_models.py`。结论：**微内核单线程 136 GFLOPS = Zen4 单核峰值，16 线程仅 45%**，下一步是二维 cache blocking 而非继续调内核 |
 
 ---
 

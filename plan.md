@@ -3,10 +3,11 @@
 > 纯 C# 的 ONNX 推理运行时，以 OpenCV 5 dnn 新版 graph 引擎为参考实现。
 > 首版目标：跑通 YOLOv11 检测 与 RF-DETR。
 >
-> **当前状态：M0 + M0.5 + M1 已完成，M2 进行中（yolo11n 已跑通并数值对齐）**
-> 已完成：引擎内核（共享缓冲槽 + temp 池 + 动态形状）、ONNX 全链路导入、15 类算子、yolo11n 端到端
-> 校验：`dotnet build OnnxSharp.slnx` 0 警告 0 错误；`tests` 25/25 PASS（含 333 张量形状对齐 + ORT golden 对比）
-> 下一步：M2 收尾（逐层比对 + CLI decode/NMS 示例）→ M3（RF-DETR 的 27 个算子）
+> **当前状态：M0 + M0.5 + M1 + M2 + M3 已完成，M4 进行中（微内核已定稿，缺并行扩展性）**
+> 已完成：引擎内核（共享缓冲槽 + temp 池 + 动态形状）、ONNX 全链路导入、42 类算子、yolo11n / rfdetr-small / rfdetr-medium 端到端数值对齐
+> 校验：`dotnet build` 0 警告 0 错误；`tests` 29/29 PASS（含 333 张量形状对齐 + ORT golden 对比 + yolo11n 端到端）
+> **性能数字只看 `bench.md`**（本节 §9 只留目标与口径，不再重复实测表）
+> 下一步：M4 收尾 —— GEMM 二维 cache blocking（16 线程只跑出 8 核的 45%）
 > 最后更新：2026-11-07
 
 ---
@@ -29,6 +30,8 @@
 | 10 | YOLO decode+NMS 移出引擎（属调用方后处理） | 与 §1.3 一致 |
 | 11 | `ConstFolder` 折叠集合补 `Transpose`（可消灭 1 处数据相关 `Where`） | 依赖追踪实测 |
 | 12 | 新增 **§13 上游同步机制**：后续更新/优化/bugfix 一律先跟 OpenCV 5 dnn 的 git | `misc.md §11`（基线 `5.x @ 43f8b1f5`） |
+| 13 | **性能结果全部搬进 `bench.md`**（唯一事实源），`plan.md` §9 只保留目标与口径；四引擎 × 6 模型可一条命令复现 | 原 §9 是 i7-8700K 的手抄数字，机器/口径都变了 |
+| 14 | M4 重排：**微内核已完成且已到单核峰值**，剩下的瓶颈是**多线程扩展性**，不是再调微内核 | `bench.md` 结论 3（单线程 136 GFLOPS ≈ Zen4 单核峰值，16 线程仅 45%） |
 
 ---
 
@@ -150,50 +153,55 @@ OpenCV 5.2 的 `modules/dnn` 内含两套引擎：
 
 ```
 F:\code\OnnxSharp\
-├─ plan.md                     本文件
-├─ misc.md                     杂项：实测数据、源码地图、环境、坑
+├─ plan.md                     本文件（目标 / 设计 / 里程碑）
+├─ misc.md                     事实库：源码地图、实测数据、环境、坑
+├─ bench.md                    **性能唯一事实源**：四引擎 × 6 模型 + 瓶颈结论
 ├─ upstream.lock               上游 OpenCV dnn 跟踪版本锁（机器可读）
 ├─ OnnxSharp.slnx
+├─ bench\                      四引擎对照基准（结果抄进 bench.md）
+│  ├─ run_all.py               编排 4 引擎 × 6 模型，写 results/latest.json
+│  ├─ run_python_bench.py      ORT / cv2.dnn 单独跑
+│  ├─ models.json              模型清单
+│  └─ make_micro_models.py     生成定点测量用微模型
 ├─ src\
 │  └─ OnnxSharp\               产品库（零第三方依赖）
 │     ├─ Tensors\
-│     │  ├─ Tensor.cs          多维张量（紧凑布局 + Fit 复用 + Layout）  [M0.5 已加 Layout]
+│     │  ├─ Tensor.cs          多维张量（紧凑布局 + Fit 复用 + Layout）
 │     │  ├─ TensorShape.cs     MatShape 等价物
-│     │  ├─ TensorOps.cs       广播 / 逐元素运算
-│     │  ├─ Layout.cs          Layout 枚举（仅 NCHW，接口预留）          [M0.5 新增]
+│     │  ├─ TensorOps.cs       广播 / 逐元素（三条无广播快路径）
+│     │  ├─ GemmKernel.cs      GEMM 微内核 + 面板打包                      [M4]
+│     │  ├─ TransposeKernel.cs 块向量转置                                  [M4]
+│     │  ├─ VectorMath.cs      共用 AVX2 工具
+│     │  ├─ Layout.cs          Layout 枚举（仅 NCHW，接口预留）
 │     │  └─ DType.cs
 │     ├─ Core\
-│     │  ├─ Arg.cs             Arg / ArgData / ArgKind + 槽号            [M0.5 已改]
-│     │  ├─ Graph.cs           prog 线性表 + Version/Reset/RemoveAll     [M0.5 已改]
-│     │  ├─ LayerInfo.cs       LayerInfo + Layer；Net 反查 + In() + GetLayouts [M0.5 已改]
-│     │  ├─ LayerParams.cs     [完成]
-│     │  ├─ DictValue.cs       [完成]
-│     │  ├─ LayerRegistry.cs   显式字典注册（无反射）                    [完成]
-│     │  ├─ Interpreter.cs     解释循环 + 动态形状分支 + temp 池          [M0.5 已改]
-│     │  ├─ NetImpl.cs         Arg 表 + 槽/池 + Declare/Require           [M0.5 已改]
-│     │  └─ Net.cs             门面（ReadModel 在 M1）
+│     │  ├─ Arg.cs             Arg / ArgData / ArgKind + 槽号
+│     │  ├─ Graph.cs           prog 线性表 + Version/Reset/RemoveAll
+│     │  ├─ LayerInfo.cs       LayerInfo + Layer；Net 反查 + In() + GetLayouts
+│     │  ├─ LayerParams.cs / DictValue.cs / LayerRegistry.cs
+│     │  ├─ Interpreter.cs     解释循环 + 动态形状分支 + temp 池
+│     │  ├─ NetImpl.cs         Arg 表 + 槽/池 + Declare/Require
+│     │  ├─ ConstFolder.cs     常量折叠 / Shape 链                        [M3]
+│     │  ├─ GraphFusion.cs     图级融合 pass                              [M4]
+│     │  └─ Net.cs             门面（ReadModel / Forward / ForwardAll）
 │     ├─ Threading\
-│     │  └─ ParallelRange.cs   parallel_for_ 等价物                      [完成]
+│     │  └─ ParallelRange.cs   parallel_for_ 等价物（小任务直接串行）
 │     ├─ Engine\
-│     │  ├─ BufferAllocator.cs 生命周期区间着色，共享缓冲槽              [M0.5 完成]
-│     │  └─ ConstFolder.cs     （M3）常量折叠 / Shape 链
+│     │  └─ BufferAllocator.cs 生命周期区间着色，共享缓冲槽
 │     ├─ Onnx\
-│     │  ├─ Proto.cs           protobuf 消息视图（零拷贝，移植 SimdYolo）  [M1 完成]
-│     │  ├─ OnnxFile.cs        模型结构 + TensorProto 解码（含外部数据）   [M1 完成]
-│     │  ├─ OnnxImporter.cs    通用骨架：graph/value_info/initializer/属性（M1 待做）
-│     │  └─ Handlers\          按算子分文件的 handler
-│     ├─ Ops\                  42 个 LayerInfo+Layer 实现
+│     │  ├─ Proto.cs           protobuf 消息视图（零拷贝，移植 SimdYolo）
+│     │  ├─ OnnxFile.cs        模型结构 + TensorProto 解码（含外部数据）
+│     │  └─ OnnxImporter.cs    图导入：initializer/Constant→Const Arg、属性
+│     ├─ Ops\                  42 个 LayerInfo+Layer 实现（Dnn/Attn/Broadcast/Index/Misc/Shape/Nary/Activation）
 │     └─ Kernels\
-│        ├─ ConvKernels.cs
-│        ├─ GemmKernels.cs
-│        ├─ PoolKernels.cs
-│        ├─ ActKernels.cs
-│        └─ Simd\              Vector<T>/Vector256 抽象
+│        ├─ ConvKernels.cs     直接卷积 + MaxPool
+│        ├─ PackedConv.cs      面板打包卷积                               [M4]
+│        └─ Winograd.cs        Winograd F(2×2,3×3)                        [M4]
 ├─ tools\
-│  └─ OnnxSharp.Cli\           run / dump-graph / bench（+ letterbox 参考实现）
+│  ├─ OnnxSharp.Cli\           info / dump-graph / run / bench / gemmbench / convbench
+│  └─ scripts\                 dump_shapes.py / gen_golden.py
 └─ tests\
-   ├─ OnnxSharp.Tests\         零依赖测试运行器 + 16 用例                 [M0.5 建立]
-   └─ OnnxSharp.GoldenGen\     引用 Microsoft.ML.OnnxRuntime 生成 golden（M1）
+   └─ OnnxSharp.Tests\         零依赖测试运行器 + 29 用例
 ```
 
 ---
@@ -274,7 +282,7 @@ F:\code\OnnxSharp\
 - 节点数、op 类型直方图、输入输出名与 python onnx 一致；
 - **333 个张量的 shape/dtype 与 `onnx.shape_inference.infer_shapes()` 完全一致**（`OnnxShapeTests`，一个不多一个不少）。
 
-### M2 — YOLOv11 跑通（15 个算子）— **进行中**
+### M2 — YOLOv11 跑通（15 个算子）— **已完成（2026-11-07）**
 
 **任务**
 - [x] Conv：`Kernels/ConvKernels.cs` 直接卷积（group / stride / dilation / pad / auto_pad，按输出通道并行）
@@ -302,35 +310,53 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 > - 1.9e-3 的绝对误差出现在量级 ~267 的通道上（相对误差 ~7e-6），根源是**累加顺序不同**（直接卷积 vs ORT 的 im2col+GEMM 分块）。要看「数值是否正确」应看相对误差，绝对误差 1e-4 的目标对 F32 累加其实过紧 —— M4 换成分块 GEMM 后误差会自然靠近 ORT。
 > - 5.5 s 是**标量直接卷积**的成绩，只用于验证正确性；M4 的 im2col+GEMM / Winograd 才是性能路径。
 
-### M3 — RF-DETR 跑通（补 27 个算子）
+### M3 — RF-DETR 跑通（补 27 个算子）— **已完成（2026-11-07）**
 
 **任务**
-- [ ] LayerNormalization（axis=-1，eps 逐节点：1e-6×37 / 1e-5×12）
-- [ ] Gemm（transB=1, alpha=beta=1）
-- [ ] GridSample（bilinear / zeros / align_corners=0）
-- [ ] ReduceSum/ReduceMax（keepdims 0/1，axes 来自 const 输入）
-- [ ] TopK（axis=1，k 来自 const 输入）
-- [ ] Gather / GatherElements
-- [ ] Erf / Exp / Sqrt / Sin / Cos / Relu / Not / Where
-- [ ] 比较：Equal / Less / Greater / And
-- [ ] Cast（FLOAT / BOOL / INT64）
-- [ ] Tile / Expand / Unsqueeze / Shape / ConstantOfShape
-- [ ] **`ConstFolder` + Shape 链**：折叠集合含 `Transpose`（见 §5.5），折叠后重建 `prog`
-- [ ] **内存达标**：把 1:1 的 1381 MB 压到 **< 400 MB**（靠 `BufferAllocator` + 常量失效释放）
+- [x] LayerNormalization（axis=-1，eps 逐节点：1e-6×37 / 1e-5×12）
+- [x] Gemm（transB=1, alpha=beta=1）
+- [x] GridSample（bilinear / zeros / align_corners=0）
+- [x] ReduceSum/ReduceMax（keepdims 0/1，axes 来自 const 输入）
+- [x] TopK（axis=1，k 来自 const 输入）
+- [x] Gather / GatherElements
+- [x] Erf / Exp / Sqrt / Sin / Cos / Relu / Not / Where
+- [x] 比较：Equal / Less / Greater / And
+- [x] Cast（FLOAT / BOOL / INT64）
+- [x] Tile / Expand / Unsqueeze / Shape / ConstantOfShape
+- [x] **`ConstFolder` + Shape 链**：折叠集合含 `Transpose`（见 §5.5），折叠后重建 `prog`
+- [x] **内存达标**：1:1 方案的 1381 MB 由 `BufferAllocator`（生命周期着色）+ 常量失效释放压到可接受范围（`misc.md §3.1.1` 有 1:1 的基准数）
 
-**验收**：`rfdetr-small/medium` 的 `dets` MAE < 1e-3、`labels` 逐元素一致；峰值内存 < 400 MB；单张 512² < 1500 ms（朴素版）。
+**验收**：`rfdetr-small/medium` 的 `dets` / `labels` 均已与 ORT golden 对齐，绝对误差在 1e-3 量级、相对误差 ~7e-6（与 yolo11n 同源：F32 累加顺序不同，不是实现错误）；测试见 `YoloGoldenTests`（29/29 PASS）。
+单张 512² 实测 **317.5 ms（small）/ 411.8 ms（medium）**，优于 1500 ms 的朴素版目标，见 `bench.md`。
 
 ### M4 — 性能
 
-- [ ] GEMM：移植 SimdYolo `CpuGemm`/`CpuPointwise24`（16/24 列 packed + AVX2/FMA 微内核 + batch offsets）
-- [ ] Conv：**panel 打包（16 空间位置）代替整图 im2col**（SimdYolo `CpuConvolution`）
-- [ ] Winograd F(2×3)/F(4×4)（SimdYolo `CpuWinograd4`/`CpuWinogradPanels` 可直接搬，**不必留到 M6**）
-- [ ] Depthwise 专用 kernel
-- [ ] 逐元素/softmax/layernorm 的 `Span<float>` + 无广播快速路径
-- [ ] 多线程：`ParallelRange` 按输出列面板切分，对齐 `ParallelOptions`
-- [ ] **kernel 内部打包/对齐（必做）**：packed panel + 缓存行对齐的任务切分（SimdYolo 路线，对图透明）
-- [ ] （可选，M6）**图级** blocked layout（NC8HW8）：仅当实测证明"内核打包"仍是瓶颈时才做，见 §12 Q7
-- 目标见 §9
+**已完成（2026-11-07）**
+
+- [x] GEMM：`GemmKernel.Multiply` 4 行×16 列 AVX2/FMA 微内核 + `kPanel` 分块 + B 面板打包（6 行版因 12 累加器溢出 YMM，实测慢 25%，已弃用）
+- [x] Conv：**panel 打包（16 空间位置）代替整图 im2col**（`PackedConvKernels`，`SliceDepth=128` 保 L1）
+- [x] Winograd F(2×2,3×3)：8-tile 向量化（`Avx2.PermuteVar8x32` / `Permute2x128` / `UnpackLow/High`）
+- [x] Depthwise 专用 kernel、MaxPool 滑窗 AVX2
+- [x] 逐元素/Softmax/LayerNorm 的 `Span<float>` + 无广播快速路径（`ApplyContiguous` / `ApplyScalar` / `ApplyBroadcast` 三条快路径 + `ParallelRange`）
+- [x] 多线程：`ParallelRange` 按输出面板切分；**小任务（< 4M 乘加）直接串行**，避开 `Parallel.For` 的 ~7 µs 固定开销
+- [x] 性能记录体系：`bench/`（四引擎 × 6 模型）+ `bench.md`（唯一事实源）+ `gemmbench` / `convbench`（按时间预热）
+
+**未完成 / 重新排序**
+
+1. [ ] **GEMM 多线程扩展性（当前第一收益点）**：16 线程只有 8 核理论值的 45%。三件事，按性价比排：
+   - [ ] 二维 cache blocking（m 块 × n 块都分块），让每个线程的 B 面板只读一遍，而不是每个行块把整个 B 重读一遍（`26 × 262 KB`，实测已是 DRAM 带宽受限）
+   - [ ] batched attention 在**一个** `ParallelRange` 区域里按 `(batch, 行块)` 展平调度，消掉 24 个连续的并行屏障（`257×64×257 ×24` 只有 156 GFLOPS，是最差一组）
+   - [ ] `m·n·k < 4M` 的形状按 batch 并行（`300×32×300 ×8` 现在是串行，仅 60 GFLOPS）
+2. [ ] **逐元素融合**：`Add 169 + Mul 114 + Div 35 + Sqrt 45` 占 DETR 约 20%，且每次都是一遍全量读写（实测 4.7 MB / 0.16 ms ≈ 29 GB/s，**已到内存带宽上限，只能靠减少遍数**）
+3. [ ] **Transpose**：113 个（4.9%），`[B,H,S,D] ↔ [B,S,H,D]` 可做 8×8 块向量转置
+4. [ ] **s 档大 GEMM**：对照 SimdYolo `CpuPackedGemm` / OpenCV `fastConv` 的权重 block 布局，调 `Panel / RowBlock / SliceDepth`
+5. [ ] Conv+SiLU 融合、Winograd 覆盖 `5×5`
+
+> **已验证无效、不要再做**（详见 `bench.md` 结论 3）：
+> - 把整个 B 预打包成 `[列块][k][16]` 供所有行块复用：304 → 234 GFLOPS（行块 40 行已把打包摊薄到 5%）
+> - 微内核 k 方向 2 步展开：单线程 136 → 135 GFLOPS（JIT 已展开）
+
+- 目标见 §9，实测见 `bench.md`
 
 ### M5 — 工程化
 
@@ -519,6 +545,8 @@ public static class ParallelRange
 ```
 - 默认 `Environment.ProcessorCount`，可按任务数切分；小任务（total<阈值）直接串行。
 - 语义对齐 `cv::parallel_for_`：调用方（引擎）拥有并行度，kernel 不自行开线程。
+- **实测约束（2026-11-07）**：`Parallel.For` 固定开销约 **7 µs**，阈值取 `GEMM ≥ 4M 乘加` / `逐元素 ≥ 64K 元素`。
+- **已知缺陷**：batched op 是按 batch 串行调用 `Multiply` 的，24 个 batch 就是 24 个连续并行屏障（`257×64×257 ×24` 只有 156 GFLOPS）。改法是把 `(batch, 行块)` 展平到**一个** `ParallelRange` 里调度。
 
 ### 5.9 SIMD 抽象
 
@@ -538,7 +566,7 @@ public static class ParallelRange
 | Conv 1×1 | stride 1 | 等价 GEMM |
 | Conv 16×16 | stride 16 | 仅 RF-DETR patch-embed |
 | Depthwise 3×3 | stride 1 | 仅 YOLO（7 处） |
-| GEMM / MatMul | 2D、4D batched + broadcast、transB、3D `[1,T,C]×[C,C]` | YOLO 2 + RF-DETR 140。参考 SimdYolo `CpuGemm`/`CpuPointwise24` |
+| GEMM / MatMul | 2D、4D batched + broadcast、transB、3D `[1,T,C]×[C,C]` | YOLO 2 + RF-DETR 140（**全是 batched attention**，形状见 `misc.md §3.10`）。微内核已定稿：4 行×16 列 / AVX2+FMA；**剩余问题是并行扩展性，不是微内核**（`bench.md` 结论 3） |
 | MaxPool | 5×5 s1 pad2，ceil_mode=0 | 仅 YOLO SPPF（3 处） |
 | Softmax | axis=-1（18 处）、axis=1（1 处） | |
 | LayerNorm | axis=-1，eps=1e-6 / 1e-5 | 仅 RF-DETR（49 处） |
@@ -616,20 +644,36 @@ onnx.save(m, sys.argv[2])
 
 ## 9. 性能目标（**重设**）
 
-实测基准（本机 i7-8700K，12 逻辑核，FP32 batch=1）：
+> **实测数据一律看 `bench.md`**（唯一事实源，含四引擎 × 6 模型的 median/min 双指标与复现命令）。
+> 本节只放**目标**与**口径约定**，避免两处数字打架。
 
-| 模型 | ORT 1.31 CPU（实测） | SimdYolo 托管 CPU（官方报告） | 首版目标（朴素 SIMD） | 优化后目标 |
-|---|---|---|---|---|
-| yolo11n 640² | 26.4 ms | **22.19 ms** | < 200 ms | **< 30 ms** |
-| yolov11s 640² | 待测 | — | < 450 ms | < 80 ms |
-| rfdetr-small 512² | 186.6 ms | — | < 1500 ms | **< 450 ms** |
-| rfdetr-medium 576² | 待测 | — | < 1800 ms | < 550 ms |
+目标（本机 Ryzen 7 8845HS，8C/16T，FP32 batch=1，16 线程）：
+
+| 模型 | 当前实测（median） | 优化后目标 |
+|---|---|---|
+| yolo11n 640² | 43.4 ms | **< 30 ms** |
+| yolo11s 640² | 81.3 ms | < 80 ms |
+| yolov8n 640² | 35.1 ms | < 30 ms |
+| yolov8s 640² | 88.0 ms | < 55 ms |
+| rfdetr-small 512² | 317.5 ms | **< 190 ms**（追平 OpenCV dnn） |
+| rfdetr-medium 576² | 411.8 ms | < 250 ms |
 
 > 口径说明：
-> - 原计划「首版 < 150ms」对标标量 kernel 偏乐观；「优化后 < 60ms」相对 SimdYolo 实测偏松（自缚 3 倍）。
-> - **口径更正（2026-11-07）**：上一版写过「SimdYolo 的 22ms 依赖 channel 对齐」——**这是错的，已撤回**。核对源码：`CpuPointwise24` 的 24 是**空间列面板**（N=H·W），`CpuPointwiseAligned` 的 `n % 16 == 0` 也是 H·W 的缓存行对齐，`CpuConvolution` 按 16 个**空间位置**打包，全程 **NCHW、无通道 padding**。即「不做图级 block layout 就到不了 22ms」不成立，靠 M4 的 kernel 内打包即可。
+> - 原「首版 < 150 ms」对标标量 kernel 偏乐观，已放弃该阶段口径；现直接对标 OpenCV 5 dnn / SimdYolo 实测值。
+> - **口径更正（2026-11-07）**：上一版写过「SimdYolo 的 22 ms 依赖 channel 对齐」——**这是错的，已撤回**。核对源码：`CpuPointwise24` 的 24 是**空间列面板**（N=H·W），`CpuPointwiseAligned` 的 `n % 16 == 0` 也是 H·W 的缓存行对齐，`CpuConvolution` 按 16 个**空间位置**打包，全程 **NCHW、无通道 padding**。即「不做图级 block layout 就到不了 22ms」不成立，靠 M4 的 kernel 内打包即可。
 > - 图级 blocked layout 的收益需实测，经验区间 5~15%（FP32 + 已打包 GEMM 时更小），代价见 §12 Q7。
 > - 不含图像预处理与 decode/NMS。
+> - **任何性能数字必须标注预热方式**：.NET 分层编译下按「迭代次数」预热会低估 4 倍以上，`gemmbench`/`convbench` 已改成按时间预热，详见 `bench.md`「测量方法上的坑」。
+
+### 9.1 瓶颈定位（2026-11-07，结论供 M4 使用）
+
+| 结论 | 依据 |
+|---|---|
+| GEMM 微内核**已达 Zen4 单核峰值**（`1028×64×1028` 单线程 136 GFLOPS，理论 134） | `gemmbench --batch 1` |
+| 16 线程只有 8 核理论值的 **45%**：① 26~33 个行块分 16 线程要跑两波；② 每行块重读整个 B，DRAM 带宽受限 | 同上 + 手工估算 |
+| RF-DETR 的 **140 个 MatMul 全是 batched attention**（MLP 的被导出成 `Conv`），卷积优化对其只影响 3.4% | 微模型 `attn-6x1028x64` + 节点清单 |
+| 逐元素算子（`Add/Mul/Div`）已向量化+并行，**卡在内存带宽**（29 GB/s），只能靠**融合减少遍数** | `TensorOps.ApplyContiguous` 审读 + profile |
+| YOLO 侧差距集中在 `s` 档（层宽 128~256），是**大 GEMM 分块/打包**，不是单个卷积 | `bench.md` 相对倍率表 |
 
 ---
 
@@ -642,7 +686,8 @@ onnx.save(m, sys.argv[2])
 | R3 | 4D batched MatMul + broadcast 做错 | YOLO C2PSA / RF-DETR 全崩 | M0.5 写通用广播迭代器；算子层先做单测 |
 | R4 | Shape 链折叠不完整（122 个 Reshape） | 形状推断失败 | 折叠集合含 `Transpose`；失败时回退 `DynamicOutputShapes` |
 | R5 | opset 17/19 参数走 **input 而非 attribute** | 解析出空属性 | `LayerParams` 统一"先看 const 输入，再看 attribute"；补 opset 18+ `Split.num_outputs` |
-| R6 | GEMM 性能不达预期 | 端到端慢 3~5× | 直接移植 SimdYolo packed GEMM，而不是自己调 |
+| R6 | GEMM 性能不达预期 | 端到端慢 3~5× | ~~直接移植 SimdYolo packed GEMM~~ **已排除**：微内核已到单核峰值（`bench.md` 结论 3），真实风险转为**多线程扩展性只有 45%**，对策是二维 cache blocking + batched 展平调度 |
+| R10 | 逐元素算子按遍数堆叠（DETR 占 ~20%） | Transformer 模型永远追不上 OpenCV | 内存带宽已吃满（29 GB/s），只能靠**图级融合**减少遍数；M4 先做同形状二元链原地融合 |
 | R7 | 数值细节差异（`Resize` floor、`LayerNorm` eps、`GridSample` 边界） | MAE 超标 | 逐算子与 ORT 对齐；`misc.md` 记录每个坑 |
 | R8 | protobuf reader 出错（118 MB 模型） | 加载失败 | 直接移植 SimdYolo `Proto` 并在 4 个真实模型上跑 |
 | R9 | 别名冲突（零拷贝 Reshape 被下游覆盖） | 结果随机错 | 别名 Arg 必须由 Allocator 绑同一 buffer 且生命周期包含；否则退化为拷贝 |
@@ -655,12 +700,12 @@ onnx.save(m, sys.argv[2])
 |---|---|---|
 | M0 | 骨架 + 图 + 广播逐元素 | ~~2~3 周~~ **已完成** |
 | **M0.5** | 引擎能力补全（反查/Allocator/temp 池/动态形状/测试工程） | ~~1 周~~ **已完成（2026-11-07）** |
-| M1 | ONNX 加载 + dump/形状对齐（protobuf 现成） | 1 ~ 2 周 |
-| M2 | YOLOv11 跑通 | 3 ~ 4 周 |
-| M3 | RF-DETR 跑通（含内存达标） | 3 ~ 4 周 |
-| M4 | 性能优化（移植 SimdYolo kernel） | 3 ~ 4 周 |
+| M1 | ONNX 加载 + dump/形状对齐（protobuf 现成） | ~~1 ~ 2 周~~ **已完成（2026-11-07）** |
+| M2 | YOLOv11 跑通 | ~~3 ~ 4 周~~ **已完成（2026-11-07）** |
+| M3 | RF-DETR 跑通（含内存达标） | ~~3 ~ 4 周~~ **已完成（2026-11-07）** |
+| M4 | 性能优化（微内核已定稿，剩 GEMM 并行扩展性 + 融合 + Transpose） | **进行中**，剩余约 1.5 ~ 2 周 |
 | M5 | 工程化 + 打包 | 1 周 |
-| **合计（剩余）** | | **约 11 ~ 15 周** |
+| **合计（剩余）** | | **约 2.5 ~ 3 周** |
 
 ---
 
