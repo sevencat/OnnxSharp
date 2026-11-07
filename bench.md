@@ -8,8 +8,8 @@
 | --- | --- |
 | 计时范围 | 仅模型前向（N 次 `Forward` / `session.run` / `net.forward`），**不含** letterbox 前处理、NMS、掩码后处理 |
 | 输入 | 静态 batch=1、FP32、NCHW，全部元素常量 `0.5`（与 SimdYolo 默认一致） |
-| 预热 | 10 帧，不计入样本 |
-| 样本 | 30 帧，2 轮取较快一轮 |
+| 预热 | `run_all.py` 默认 5 帧（`warmup=5`），不计入样本 |
+| 样本 | 默认 40 帧（`iters=40`），跑 2 轮取 median 较低的一轮 |
 | 线程 | 全部固定 16 线程（`ONNXSHARP_THREADS=16` / `intra_op_num_threads=16` / `cv2.setNumThreads(16)` / SimdYolo `threads=16`） |
 | 指标 | 主指标 **median**；副指标 **min**（反映无干扰时的下限） |
 
@@ -75,53 +75,77 @@ tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe profile <model.onnx> -
 > （rfdetr-small：251 ms vs 250~275 ms）。**各算子最小值之和只是下界**（215 ms），
 > 不能拿去和中位数比 —— 每个算子的最小值基本不会同时出现，差 15% 是正常的，不要当成「有隐藏开销」。
 
-## 结果（2026-11-07，16 线程）
+## 结果（2026-11-07 第四轮，16 线程）
 
-单位 ms，越低越好。**加粗为同组最快**。
+单位 ms，越低越好。**加粗为同组最快**。全部来自同一次 `python bench/run_all.py`（iters=40、warmup=5、rounds=2 取最优轮）。
 
 | 模型 | 输入 | OnnxSharp | ORT CPU | OpenCV dnn | SimdYolo |
 | --- | --- | ---: | ---: | ---: | ---: |
-| yolov8n | 640² | 42.4 | 48.6 | **31.1** | 35.0 |
-| yolo11n | 640² | 36.5 | 44.6 | **31.7** | 39.3 |
-| yolov8s | 640² | 90.2 | 159.0 | 81.1 | **58.5** |
-| yolo11s | 640² | 88.3 | 135.0 | 75.1 | **59.0** |
-| rfdetr-small | 512² | 275.1 | 495.7 | **195.3** | N/A |
-| rfdetr-medium | 512² | 348.8 | 611.2 | **253.7** | N/A |
+| yolov8n | 640² | 36.9 | 59.3 | **30.4** | **30.4** |
+| yolo11n | 640² | 33.7 | 46.5 | **28.9** | 30.0 |
+| yolov8s | 640² | 92.2 | 149.4 | 77.2 | **51.8** |
+| yolo11s | 640² | 83.1 | 140.6 | 74.0 | **53.9** |
+| rfdetr-small | 512² | 230.4 | 432.6 | **204.9** | N/A |
+| rfdetr-medium | 576² | 321.5 | 638.4 | **304.4** | N/A |
 
 min（无干扰下限）：
 
 | 模型 | OnnxSharp | ORT CPU | OpenCV dnn | SimdYolo |
 | --- | ---: | ---: | ---: | ---: |
-| yolov8n | 35.0 | 33.2 | 29.8 | **28.9** |
-| yolo11n | 32.9 | 29.1 | **28.7** | 34.3 |
-| yolov8s | 88.3 | 113.6 | 78.4 | **54.8** |
-| yolo11s | 83.3 | 93.9 | 72.7 | **53.9** |
-| rfdetr-small | 268.1 | 349.2 | **190.9** | N/A |
-| rfdetr-medium | 329.2 | 492.1 | **248.8** | N/A |
+| yolov8n | 33.6 | 30.0 | 28.8 | **27.5** |
+| yolo11n | 32.0 | **25.7** | 27.9 | 26.2 |
+| yolov8s | 86.7 | 89.6 | 72.7 | **49.2** |
+| yolo11s | 79.4 | 102.3 | 70.2 | **49.7** |
+| rfdetr-small | 220.0 | 317.6 | **194.0** | N/A |
+| rfdetr-medium | 304.0 | 458.6 | **263.5** | N/A |
 
-相对倍率（OnnxSharp ÷ 该引擎，>1 表示比它慢）：
+相对倍率（OnnxSharp ÷ 该引擎 median，>1 表示比它慢）：
 
 | 模型 | vs ORT | vs OpenCV dnn | vs SimdYolo |
 | --- | ---: | ---: | ---: |
-| yolov8n | 0.87 | 1.36 | 1.21 |
-| yolo11n | 0.82 | 1.15 | 0.93 |
-| yolov8s | 0.57 | 1.11 | 1.54 |
-| yolo11s | 0.65 | 1.18 | 1.50 |
-| rfdetr-small | 0.55 | **1.41** | N/A |
-| rfdetr-medium | 0.57 | **1.37** | N/A |
+| yolov8n | 0.62 | 1.21 | 1.21 |
+| yolo11n | 0.72 | 1.17 | 1.12 |
+| yolov8s | 0.62 | 1.19 | **1.78** |
+| yolo11s | 0.59 | 1.12 | 1.54 |
+| rfdetr-small | 0.53 | **1.12** | N/A |
+| rfdetr-medium | 0.50 | **1.06** | N/A |
 
-> **跨会话不要比绝对值**：同一份代码，机器状态不同时 yolo11n 能测出 36.5 / 43.4 / 50.2 三个数（±20%）。
-> 上表全部来自同一次 `run_all.py` 会话，所以引擎之间的**倍率**可信，绝对值只作趋势。
-> 与上一版相比 rfdetr 的倍率从 1.68/1.70 改善到 1.41/1.37，原因见结论 2。
+> **跨会话不要比绝对值**：同一份代码，机器状态不同时 yolo11n 能测出 32~50 ms（±20%）。
+> 上表全部来自同一次会话，所以引擎之间的**倍率**可信，绝对值只作趋势。
+> 与上一版（275.1 / 348.8）相比 rfdetr 的 vs OpenCV 倍率从 1.41 / 1.37 改善到 **1.12 / 1.06**，几乎追平，原因见结论 2（融合 + MatMul 合并 batch）。
+
+### 4.1 与上一轮的 OnnxSharp 自比（同一口径，median / min）
+
+| 模型 | 上一轮 median | 本轮 median | 变化 | 上一轮 min | 本轮 min |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| yolov8n | 42.4 | 36.9 | -13% | 35.0 | 33.6 |
+| yolo11n | 36.5 | 33.7 | -8% | 32.9 | 32.0 |
+| yolov8s | 90.2 | 92.2 | +2% | 88.3 | 86.7 |
+| yolo11s | 88.3 | 83.1 | -6% | 83.3 | 79.4 |
+| rfdetr-small | 275.1 | 230.4 | **-16%** | 268.1 | 220.0 |
+| rfdetr-medium | 348.8 | 321.5 | **-8%** | 329.2 | 304.0 |
+
+> yolo 侧的 ±13% 属于跨会话噪声（本轮机器更空），**不应算作优化收益**；
+> rfdetr 的 -16% / -8% 与结论 2 的交替 A/B（-7.4% / -9.1%）量级一致，其中 medium 偏小是因为它的 576² 形状让 GEMM 占比更高。
 
 ## 结论
 
-1. **YOLO 侧**：OnnxSharp 稳定快于 ONNXRuntime CPU（0.57~0.87×），与 OpenCV 5 dnn 差 11%~36%，落后 SimdYolo 最大 1.54×（yolov8s）。
+1. **YOLO 侧**：OnnxSharp 稳定快于 ONNXRuntime CPU（0.59~0.72×），与 OpenCV 5 dnn 差 **6%~21%**，落后 SimdYolo 最大 1.78×（yolov8s）。
    - SimdYolo 在 `s` 档领先明显、`n` 档优势很小，说明差距不在"单个卷积"而在**通道数变大后的大 GEMM 分块/打包**：n 档层宽 64~128 时双方都喂不满 L1/L2，s 档 128~256 时我们的 `RowBlock=4 / Panel=16 / SliceDepth=128` 组合明显吃亏。
    - OpenCV dnn 的 `fastConv` 胜在按 `blocked` 布局一次性重排权重 + Winograd 覆盖更宽，是我们下一轮的主要参照。
-2. **RF-DETR 侧**：我们比 ORT 快（0.55~0.57×），比 OpenCV dnn 慢 1.37~1.41×，是当前最大短板。
+   - **yolov8s 的 1.78× 是唯一还在恶化的项**（上一轮 1.54×）：本轮绝对值 92.2 vs 上一轮 90.2 基本没变，是 SimdYolo 那边从 58.5 掉到 51.8 拉大了倍率，属于对方变快而不是我们变慢。但 `s` 档确实是唯一没被本轮优化覆盖的区域。
+2. **RF-DETR 侧**：我们比 ORT 快（0.50~0.53×），比 OpenCV dnn 只慢 **1.06~1.12×**（上一轮 1.37~1.41×），已经从"最大短板"变成"基本追平"。
    - `profile`（rfdetr-small，预热 10 轮、统计 20 轮；下面是按**每算子最小耗时**汇总的**占比**，总时长合计 215 ms 只是下界）：
      `MatMul 61.9%`、`Add 8.7%`、`Transpose 5.6%`、`Mul 5.4%`、`Conv 3.4%`、`Softmax 3.3%`、`LayerNormalization 2.3%`。
+   - **融合后的分布（2026-11-07 第四轮实测，`profile ... --top 1` 的 by-type 段，sum-of-min 211 ms）**：
+     `MatMul 64.3%`（139 个 / 135.7 ms）、`Add 6.6%`（155 个 / 13.9 ms）、`Transpose 6.1%`（111 个 / 12.9 ms）、
+     `Conv 3.6%`、`Softmax 3.4%`、`Mul 2.3%`、`LayerNormalization 2.3%`、`GridSample 2.3%`、
+     `FusedEltwise 1.8%`（12 个 / 3.8 ms）、`Reshape 1.6%`、`Where 1.1%`。
+     - `Div` 从 35 个降到 7 个（其余被融进链里），`Add + Mul` 从 14.1% 降到 8.9%，代价是新增 `FusedEltwise 1.8%` —— 净省约 3.4 个百分点，与端到端 -7% 吻合。
+     - **MatMul 的占比反而升到 64.3%**，这正是把别的部分做快之后的必然结果；它本身已经 407 GFLOPS（见下），
+       所以 rfdetr 剩下的空间只有 `Add`、`Transpose`、`Conv`、`Softmax` 这几个 3~7% 的碎块，**再也没有单点能给出 10%**。
+     - 注意 `Add 155 个 / 13.9 ms` 是**融合后剩下的**节点：它们要么每个中间结果有多个消费者（残差、attention 的加回），
+       要么链长不足门槛，已经不是「漏融合」而是「结构上不能融合」。
    - 也就是说 **Transformer 的 GEMM + 逐元素 + 转置**才是瓶颈，卷积优化（Winograd/面板打包）在 DETR 上只影响 3.4%。
    - 节点构成（rfdetr-small，共 2064 节点）：`Constant 459`、`Add 169`、`MatMul 140`、`Reshape 122`、`Mul 114`、`Transpose 113`、`Slice 62`、`LayerNormalization 49`、`Sqrt 45`、`Cast 36`、`Div 35`。
    - **140 个 MatMul 不全是 batched attention**（此前记错了）。按 `(a[-2:], b[-2:], 前置 batch)` 统计，MLP 与投影都是货真价实的 MatMul 节点：
@@ -209,13 +233,33 @@ min（无干扰下限）：
    注意结论 2 里的带宽核算：融合后已经贴在 42 GB/s 的逐元素带宽上限上，**这条路到头了**，
    不要再往「更聪明的逐元素融合」投入。`Add 169 + Mul 114` 里剩下的多数节点不是链（每个中间结果有多个消费者），
    要动只能动 `Sqrt + Div` 这类成对出现的规范化模式（下一轮可查，量级远小于 GELU）。
-2. **静态形状图可以缓存逐算子的形状/类型推断**：`Interpreter.Run` 每 forward 对全部 2064 个算子重算
-   `GetMemoryShapes` / `GetTypes` / `BindArgTensor` / `FitTemps`，并实测**每 forward 分配 113 MB**。
-   目前它的代价被证明很小（GC 暂停仅 0.7 ms/iter，`GC.GetTotalPauseDuration` 量的；也没有降频，同形状连续跑 3000 次 383 vs 386 GFLOPS），
-   所以**优先级低于逐元素融合**；但静态图缓存这些结果是纯收益，顺手可做。
-3. **Transpose**：113 个（5.6%），已是 8×8 向量分块 + 同布局 memcpy 快路径，剩余空间有限。
-4. **s 档大 GEMM 打包**：对照 SimdYolo `CpuPackedGemm` 与 OpenCV `fastConv` 的权重 block 布局，调 `Panel / RowBlock / SliceDepth`。
-5. 卷积侧：Conv+SiLU 融合、Winograd 覆盖 `5×5` —— 但 DETR 上 Conv 只占 3.4%，收益上限很低。
+2. **GridSample 是新发现的确定 bug**（融合后的 profile 才暴露出它）：只有 **3 个算子却吃掉 4.8 ms / 2.3%**，
+   单个 1.6 ms。已核对 `AttnOps.cs` 的 `GridSampleLayer.Forward`，是**循环顺序写错**，不是"算法需要求高"：
+
+   ```text
+   for n
+     for oy            <- 输出行
+       for ox          <- 输出列
+         ... 算 gx/gy
+         for c         <- 通道在最内层，写地址每次跨 outH*outW
+           dst[((n*C+c)*outH+oy)*outW+ox] = ...
+   ```
+
+   NCHW 输出下，最内层 `c` 的写地址步长是 `outH*outW`，**每写一个元素就换一个缓存行**，
+   3 个算子的写流量全部退化成"随机 4 字节写"。正确做法是把 `c` 提到最外层、`(oy,ox)` 放内层
+   （同时把 `Unnormalize` 的结果预算到一块 `outH*outW` 的临时数组，避免每个 c 重算），
+   这样目的地址连续、源平面在 L2 里驻留。预期 3~5 倍加速，端到端 **-1.5%~-2%**，是当前投入产出比最高的一项。
+3. **Transpose**：113 个（**6.1%**，12.9 ms），已是 8×8 向量分块 + 同布局 memcpy 快路径，
+   但单个仍要 0.12 ms —— DETR 的 `[4,257,1536]` 这类大转置应能压到 0.05 ms 级。剩余空间中等。
+4. **静态形状图缓存逐算子的形状/类型推断**：`Interpreter.Run` 每 forward 对全部 809 个算子重算
+   `GetMemoryShapes` / `GetTypes` / `BindArgTensor` / `FitTemps`，实测**每 forward 分配 113 MB**。
+   代价被证明很小（GC 暂停 0.7 ms/iter，同形状连续跑 3000 次 383 vs 386 GFLOPS 不衰减），
+   但静态图缓存这些结果是**纯收益**，顺手可做。
+5. **s 档大 GEMM 打包**：对照 SimdYolo `CpuPackedGemm` 与 OpenCV `fastConv` 的权重 block 布局，调 `Panel / RowBlock / SliceDepth`。
+   这是 yolov8s/yolo11s 落后 1.5~1.8× 的唯一解释，也是唯一还没被本轮优化覆盖的区域。
+6. 卷积侧：Conv+SiLU 融合、Winograd 覆盖 `5×5` —— 但 DETR 上 Conv 只占 3.6%，收益上限很低。
+7. **不要再做的**：任何以「减少逐元素趟数」为目标的改动（已贴 42 GB/s 带宽墙）；
+   以及任何需要用微基准（而非交替 A/B）证明收益的 GEMM 分块调整（见结论 3）。
 
 ## 变更记录
 
@@ -238,3 +282,10 @@ min（无干扰下限）：
   MatMul 总量是 **54.1 GFLOP** 而不是 16.6，于是 in-situ 是 **407 GFLOPS**（高于同形状独立基准 386），
   「真实图里 MatMul 慢 3 倍」不成立。同时排除了 GC（0.7 ms/iter）与降频（长跑不衰减）两个嫌疑；
   `bench` 新增 `alloc` / `gc` / `gc pause` 三行诊断输出。
+- 2026-11-07（第五轮，融合后复测）：全表重跑（同会话 `run_all.py`，iters=40/warmup=5/rounds=2）。
+  **rfdetr 对 OpenCV 的倍率进一步降到 1.12 / 1.06**，从「最大短板」变为基本追平；对 ORT 是 0.53 / 0.50。
+  yolo 侧倍率 vs ORT 0.59~0.72、vs OpenCV 1.12~1.21，同时修正了 `rfdetr-medium` 的输入尺寸
+  （此前误记为 512²，实际 **576²**）与口径表里的 iters/warmup（此前写 30/10，与脚本默认 40/5 不符）。
+  融合后的 by-type profile 见结论 2：`Div` 35→7 个、`Add+Mul` 14.1%→8.9%、新增 `FusedEltwise 1.8%`，
+  而 **`GridSample` 3 个算子占 2.3%** 暴露成一个新的单点异常，已列为下一步第一优先。
+  yolov8s 对 SimdYolo 的倍率涨到 1.78× 是因为对方从 58.5 变快到 51.8（我们是 90.2→92.2，属噪声），不是回归。

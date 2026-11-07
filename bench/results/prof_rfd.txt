@@ -1,0 +1,59 @@
+model     : F:/ai/rfdetr/onnx_model/rfdetr-small.onnx
+ops       : 809    iters: 20    warmup: 10    7678 ms
+total     : 224.1 ms/iter (mean)   197.6 ms/iter (sum of min)
+note      : share 按 sum-of-min 算；mean 会被后台负载的重尾放大，和 bench 的 median 对不上
+
+   #  type                  min ms    avg ms   share  name
+   1  Where                   2.35      2.46    1.2%  /transformer/Where_1
+   2  MatMul                  2.30      2.42    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.5/mlp/fc1/MatMul
+   3  MatMul                  2.30      2.37    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.9/mlp/fc2/MatMul
+   4  MatMul                  2.29      2.45    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.2/mlp/fc1/MatMul
+   5  MatMul                  2.29      2.39    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.4/mlp/fc1/MatMul
+   6  MatMul                  2.29      2.41    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.2/mlp/fc2/MatMul
+   7  MatMul                  2.29      2.40    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.3/mlp/fc1/MatMul
+   8  MatMul                  2.28      2.43    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.4/mlp/fc2/MatMul
+   9  MatMul                  2.28      2.39    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.9/mlp/fc1/MatMul
+  10  MatMul                  2.28      2.43    1.2%  /backbone/backbone.0/encoder/encoder/encoder/layer.3/mlp/fc2/MatMul
+  11  MatMul                  2.27      2.41    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.8/mlp/fc2/MatMul
+  12  MatMul                  2.26      2.37    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.11/mlp/fc1/MatMul
+  13  MatMul                  2.26      2.49    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.0/mlp/fc1/MatMul
+  14  MatMul                  2.26      2.40    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.7/mlp/fc1/MatMul
+  15  MatMul                  2.26      2.36    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.1/mlp/fc2/MatMul
+  16  MatMul                  2.25      2.41    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.5/mlp/fc2/MatMul
+  17  MatMul                  2.25      2.53    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.3/attention/attention/MatMul
+  18  MatMul                  2.23      2.30    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.8/mlp/fc1/MatMul
+  19  MatMul                  2.22      2.35    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.6/mlp/fc1/MatMul
+  20  MatMul                  2.22      2.39    1.1%  /backbone/backbone.0/encoder/encoder/encoder/layer.10/mlp/fc1/MatMul
+
+type                   ops    min ms    avg ms   share
+MatMul                 139     126.1     141.1   63.8%
+Add                    155      13.0      15.3    6.6%
+Transpose              111      12.0      14.1    6.1%
+Conv                     9       7.2       8.1    3.6%
+Softmax                 18       6.9       8.0    3.5%
+LayerNormalization      49       5.1       5.7    2.6%
+GridSample               3       4.7       5.2    2.4%
+Mul                     76       4.7       5.4    2.4%
+Reshape                119       3.3       4.0    1.7%
+FusedEltwise            12       3.3       3.9    1.7%
+Where                    1       2.4       2.5    1.2%
+Concat                  12       2.0       2.2    1.0%
+Gemm                     3       1.3       1.6    0.6%
+Slice                   30       1.3       1.4    0.6%
+GatherElements           2       1.0       1.4    0.5%
+Div                      7       0.7       0.8    0.3%
+Expand                   4       0.6       0.7    0.3%
+ReduceSum                3       0.6       0.7    0.3%
+Silu                     8       0.3       0.3    0.2%
+Sin                      4       0.3       0.3    0.1%
+Cos                      4       0.3       0.3    0.1%
+Relu                     8       0.2       0.3    0.1%
+Cast                     2       0.2       0.3    0.1%
+Tile                     2       0.1       0.2    0.0%
+Split                    1       0.1       0.1    0.0%
+TopK                     1       0.1       0.1    0.0%
+Unsqueeze               16       0.0       0.0    0.0%
+ReduceMax                1       0.0       0.0    0.0%
+Gather                   4       0.0       0.0    0.0%
+Sub                      3       0.0       0.0    0.0%
+Exp                      2       0.0       0.0    0.0%

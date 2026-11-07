@@ -1,122 +1,122 @@
 {
-  "iters": 20,
-  "warmup": 8,
+  "iters": 40,
+  "warmup": 5,
   "threads": 16,
   "rounds": 2,
   "results": [
     {
       "model": "yolo11n",
       "runtime": "onnxsharp",
-      "median_ms": 36.5,
-      "min_ms": 32.9
+      "median_ms": 33.7,
+      "min_ms": 32.0
     },
     {
       "model": "yolo11n",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 44.64,
-      "min_ms": 29.11
+      "median_ms": 46.52,
+      "min_ms": 25.65
     },
     {
       "model": "yolo11n",
       "runtime": "opencv-dnn",
-      "median_ms": 31.71,
-      "min_ms": 28.66
+      "median_ms": 28.87,
+      "min_ms": 27.91
     },
     {
       "model": "yolo11n",
       "runtime": "simdyolo",
-      "median_ms": 39.26,
-      "min_ms": 34.28
+      "median_ms": 29.99,
+      "min_ms": 26.17
     },
     {
       "model": "yolov8n",
       "runtime": "onnxsharp",
-      "median_ms": 42.4,
-      "min_ms": 35.0
+      "median_ms": 36.9,
+      "min_ms": 33.6
     },
     {
       "model": "yolov8n",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 48.56,
-      "min_ms": 33.15
+      "median_ms": 59.32,
+      "min_ms": 29.95
     },
     {
       "model": "yolov8n",
       "runtime": "opencv-dnn",
-      "median_ms": 31.08,
-      "min_ms": 29.81
+      "median_ms": 30.45,
+      "min_ms": 28.84
     },
     {
       "model": "yolov8n",
       "runtime": "simdyolo",
-      "median_ms": 34.97,
-      "min_ms": 28.93
+      "median_ms": 30.37,
+      "min_ms": 27.49
     },
     {
       "model": "yolov8s",
       "runtime": "onnxsharp",
-      "median_ms": 90.2,
-      "min_ms": 88.3
+      "median_ms": 92.2,
+      "min_ms": 86.7
     },
     {
       "model": "yolov8s",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 158.99,
-      "min_ms": 113.55
+      "median_ms": 149.42,
+      "min_ms": 89.55
     },
     {
       "model": "yolov8s",
       "runtime": "opencv-dnn",
-      "median_ms": 81.06,
-      "min_ms": 78.44
+      "median_ms": 77.22,
+      "min_ms": 72.71
     },
     {
       "model": "yolov8s",
       "runtime": "simdyolo",
-      "median_ms": 58.46,
-      "min_ms": 54.77
+      "median_ms": 51.83,
+      "min_ms": 49.18
     },
     {
       "model": "yolo11s",
       "runtime": "onnxsharp",
-      "median_ms": 88.3,
-      "min_ms": 83.3
+      "median_ms": 83.1,
+      "min_ms": 79.4
     },
     {
       "model": "yolo11s",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 135.02,
-      "min_ms": 93.91
+      "median_ms": 140.62,
+      "min_ms": 102.34
     },
     {
       "model": "yolo11s",
       "runtime": "opencv-dnn",
-      "median_ms": 75.12,
-      "min_ms": 72.72
+      "median_ms": 73.95,
+      "min_ms": 70.2
     },
     {
       "model": "yolo11s",
       "runtime": "simdyolo",
-      "median_ms": 59.01,
-      "min_ms": 53.88
+      "median_ms": 53.85,
+      "min_ms": 49.73
     },
     {
       "model": "rfdetr-small",
       "runtime": "onnxsharp",
-      "median_ms": 275.1,
-      "min_ms": 268.1
+      "median_ms": 230.4,
+      "min_ms": 220.0
     },
     {
       "model": "rfdetr-small",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 495.72,
-      "min_ms": 349.15
+      "median_ms": 432.58,
+      "min_ms": 317.64
     },
     {
       "model": "rfdetr-small",
       "runtime": "opencv-dnn",
-      "median_ms": 195.3,
-      "min_ms": 190.93
+      "median_ms": 204.93,
+      "min_ms": 193.97
     },
     {
       "model": "rfdetr-small",
@@ -126,20 +126,20 @@
     {
       "model": "rfdetr-medium",
       "runtime": "onnxsharp",
-      "median_ms": 348.8,
-      "min_ms": 329.2
+      "median_ms": 321.5,
+      "min_ms": 304.0
     },
     {
       "model": "rfdetr-medium",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 611.24,
-      "min_ms": 492.08
+      "median_ms": 638.41,
+      "min_ms": 458.62
     },
     {
       "model": "rfdetr-medium",
       "runtime": "opencv-dnn",
-      "median_ms": 253.65,
-      "min_ms": 248.77
+      "median_ms": 304.45,
+      "min_ms": 263.5
     },
     {
       "model": "rfdetr-medium",

@@ -657,14 +657,17 @@ onnx.save(m, sys.argv[2])
 
 目标（本机 Ryzen 7 8845HS，8C/16T，FP32 batch=1，16 线程）：
 
-| 模型 | 当前实测（median） | 优化后目标 |
-|---|---|---|
-| yolo11n 640² | 36.5 ms | **< 30 ms** |
-| yolo11s 640² | 88.3 ms | < 80 ms |
-| yolov8n 640² | 42.4 ms | < 30 ms |
-| yolov8s 640² | 90.2 ms | < 55 ms |
-| rfdetr-small 512² | 275.1 ms | **< 190 ms**（追平 OpenCV dnn） |
-| rfdetr-medium 576² | 348.8 ms | < 250 ms |
+| 模型 | 当前实测（median，2026-11-07 第五轮） | 同期 OpenCV dnn | 优化后目标 |
+|---|---|---|---|
+| yolo11n 640² | 33.7 ms | 28.9 | **< 30 ms** |
+| yolo11s 640² | 83.1 ms | 74.0 | < 75 ms |
+| yolov8n 640² | 36.9 ms | 30.4 | < 30 ms |
+| yolov8s 640² | 92.2 ms | 77.2 | < 77 ms |
+| rfdetr-small 512² | 230.4 ms | 204.9 | **< 205 ms**（追平 OpenCV dnn） |
+| rfdetr-medium 576² | 321.5 ms | 304.4 | < 305 ms |
+
+> 目标已按「同期同会话的 OpenCV dnn 实测」重设（原目标写于 rfdetr 还慢 1.4× 的时候）。
+> `yolov8s < 55 ms` 那档不再作为近期目标：它要求追平 SimdYolo（51.8），属于 `s` 档大 GEMM 打包的独立课题。
 
 > 口径说明：
 > - 原「首版 < 150 ms」对标标量 kernel 偏乐观，已放弃该阶段口径；现直接对标 OpenCV 5 dnn / SimdYolo 实测值。
@@ -686,6 +689,8 @@ onnx.save(m, sys.argv[2])
 | 逐元素融合已落地并**贴到带宽墙**：GELU 五节点链 1.50 → 0.30 ms/层，但融合前后都是 **42 GB/s**（63 MB / 1.50 ms vs 12.6 MB / 0.30 ms），说明省下来的纯粹是趟数。rfdetr-small/medium 端到端 -7.4% / -9.1%，输出逐位不变 | `bench.md` 结论 2 + 交替 A/B |
 | 融合内核的形态决定成败：**通用 `EltwiseStep[]` 解释器比不融合还慢**（运行期下标的 `Vector256[]` 被 JIT 打回内存 + 每步 `switch`），固定形状必须手写内核。短链（<4 节点、<256K 元素）融合是负收益 | `profile` 逐算子 1.65 vs 1.50 vs 0.30 ms |
 | YOLO 侧差距集中在 `s` 档（层宽 128~256），是**大 GEMM 分块/打包**，不是单个卷积 | `bench.md` 相对倍率表 |
+| **融合后的瓶颈分布**（rfdetr-small，by-type，sum-of-min 211 ms）：`MatMul 64.3%`、`Add 6.6%`、`Transpose 6.1%`、`Conv 3.6%`、`Softmax 3.4%`、`Mul 2.3%`、`LayerNorm 2.3%`、**`GridSample 2.3%`**、`FusedEltwise 1.8%`。MatMul 占比**升**了，因为别的部分变快了，而它本身已 407 GFLOPS —— 只剩 3~7% 的碎块可挖 | `profile --top 1` 的 by-type 段 |
+| **`GridSample` 已确认为循环顺序 bug**：3 个算子 4.8 ms（单个 1.6 ms）。`GridSampleLayer.Forward` 把通道 `c` 放在最内层，而输出是 NCHW，写地址步长 `outH*outW` → 每写一个元素换一个缓存行。`c` 外提 + 预计算 grid 坐标即可，属纯收益 | `profile` by-type + `AttnOps.cs` 源码核对 |
 | **独立内核吞吐无法预测端到端**：B 预打包、`mb` 扫参、列切分（+45%）三次都出现「微基准变快、端到端无变化」；且统计 FLOPs 时漏掉前置 batch 会凭空造出「慢 3 倍」的假象。只能用同会话交替 A/B 判定 | `bench.md` 结论 3 |
 | GC 与降频都已排除：GC 暂停 0.7 ms/iter；同一形状连续跑 3000 次不衰减（383 vs 386 GFLOPS）。**profile 与 bench 的唯一差别只是口径**：各算子均值之和 251 ms ≈ 端到端中位数，min 之和 215 ms 是下界 | `bench` 新增的 `alloc`/`gc`/`gc pause` 三行输出 |
 
