@@ -690,7 +690,8 @@ onnx.save(m, sys.argv[2])
 | 融合内核的形态决定成败：**通用 `EltwiseStep[]` 解释器比不融合还慢**（运行期下标的 `Vector256[]` 被 JIT 打回内存 + 每步 `switch`），固定形状必须手写内核。短链（<4 节点、<256K 元素）融合是负收益 | `profile` 逐算子 1.65 vs 1.50 vs 0.30 ms |
 | YOLO 侧差距集中在 `s` 档（层宽 128~256），是**大 GEMM 分块/打包**，不是单个卷积 | `bench.md` 相对倍率表 |
 | **融合后的瓶颈分布**（rfdetr-small，by-type，sum-of-min 211 ms）：`MatMul 64.3%`、`Add 6.6%`、`Transpose 6.1%`、`Conv 3.6%`、`Softmax 3.4%`、`Mul 2.3%`、`LayerNorm 2.3%`、**`GridSample 2.3%`**、`FusedEltwise 1.8%`。MatMul 占比**升**了，因为别的部分变快了，而它本身已 407 GFLOPS —— 只剩 3~7% 的碎块可挖 | `profile --top 1` 的 by-type 段 |
-| **`GridSample` 已确认为循环顺序 bug**：3 个算子 4.8 ms（单个 1.6 ms）。`GridSampleLayer.Forward` 把通道 `c` 放在最内层，而输出是 NCHW，写地址步长 `outH*outW` → 每写一个元素换一个缓存行。`c` 外提 + 预计算 grid 坐标即可，属纯收益 | `profile` by-type + `AttnOps.cs` 源码核对 |
+| ~~`GridSample` 循环顺序 bug~~ **已修复**：原实现把通道 `c` 放最内层而输出是 NCHW（写步长 `outH*outW`，每元素换缓存行）。`c` 外提 + 采样坐标预算后 1.6 → 0.92 ms/个（**-48%**），端到端 rfdetr-small -1.4% / medium -1.1%（min），逐值 diff=0 | `profile` by-type 前后对比 + 6 轮交替 A/B |
+| 小改动（<2%）在本机**只能用 min 或逐算子 profile 判定**：同代码重跑 6 次，yolo11n median 抖 49.2~53.5、yolov8s 96.9~106.9（±8%），后台负载会把信号整个淹没 | `ab_fuse.ps1` 6 轮交替实测 |
 | **独立内核吞吐无法预测端到端**：B 预打包、`mb` 扫参、列切分（+45%）三次都出现「微基准变快、端到端无变化」；且统计 FLOPs 时漏掉前置 batch 会凭空造出「慢 3 倍」的假象。只能用同会话交替 A/B 判定 | `bench.md` 结论 3 |
 | GC 与降频都已排除：GC 暂停 0.7 ms/iter；同一形状连续跑 3000 次不衰减（383 vs 386 GFLOPS）。**profile 与 bench 的唯一差别只是口径**：各算子均值之和 251 ms ≈ 端到端中位数，min 之和 215 ms 是下界 | `bench` 新增的 `alloc`/`gc`/`gc pause` 三行输出 |
 

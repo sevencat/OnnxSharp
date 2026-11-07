@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Numerics;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
@@ -374,53 +375,71 @@ internal static class AttnOps
 
             int outH = grid.Shape[1];
             int outW = grid.Shape[2];
+            int spatial = outH * outW;
 
             var sx = x.AsSpan<float>();
             var sg = grid.AsSpan<float>();
             var dst = output.AsSpan<float>();
 
-            for (int n = 0; n < batches; n++)
+            // 采样坐标只与 (n, oy, ox) 有关，和通道无关，每个 batch 预算一次。
+            float[] sampleX = ArrayPool<float>.Shared.Rent(spatial);
+            float[] sampleY = ArrayPool<float>.Shared.Rent(spatial);
+            try
             {
-                for (int oy = 0; oy < outH; oy++)
+                for (int n = 0; n < batches; n++)
                 {
-                    for (int ox = 0; ox < outW; ox++)
+                    int gridBase = n * spatial * 2;
+                    for (int i = 0; i < spatial; i++)
                     {
-                        int gridIndex = ((n * outH + oy) * outW + ox) * 2;
-                        float gx = Unnormalize(sg[gridIndex], width);
-                        float gy = Unnormalize(sg[gridIndex + 1], height);
+                        sampleX[i] = Unnormalize(sg[gridBase + i * 2], width);
+                        sampleY[i] = Unnormalize(sg[gridBase + i * 2 + 1], height);
+                    }
 
-                        for (int c = 0; c < channels; c++)
+                    // 通道在最外层、空间点在最内层：输出按 NCHW 连续写，
+                    // 一轮内源平面固定（留在 L1/L2），不再每写一个元素跳一个缓存行。
+                    for (int c = 0; c < channels; c++)
+                    {
+                        int planeOffset = (n * channels + c) * height * width;
+                        var plane = sx.Slice(planeOffset, height * width);
+                        var target = dst.Slice((n * channels + c) * spatial, spatial);
+
+                        if (_nearest)
                         {
-                            int channelBase = (n * channels + c) * height * width;
-                            float value;
-
-                            if (_nearest)
+                            for (int i = 0; i < spatial; i++)
                             {
-                                int ix = (int)MathF.Round(gx);
-                                int iy = (int)MathF.Round(gy);
-                                value = Fetch(sx, channelBase, height, width, iy, ix);
+                                int ix = (int)MathF.Round(sampleX[i]);
+                                int iy = (int)MathF.Round(sampleY[i]);
+                                target[i] = Fetch(plane, 0, height, width, iy, ix);
                             }
-                            else
+                        }
+                        else
+                        {
+                            for (int i = 0; i < spatial; i++)
                             {
+                                float gx = sampleX[i];
+                                float gy = sampleY[i];
                                 int x0 = (int)MathF.Floor(gx);
                                 int y0 = (int)MathF.Floor(gy);
                                 float fx = gx - x0;
                                 float fy = gy - y0;
 
-                                float v00 = Fetch(sx, channelBase, height, width, y0, x0);
-                                float v01 = Fetch(sx, channelBase, height, width, y0, x0 + 1);
-                                float v10 = Fetch(sx, channelBase, height, width, y0 + 1, x0);
-                                float v11 = Fetch(sx, channelBase, height, width, y0 + 1, x0 + 1);
+                                float v00 = Fetch(plane, 0, height, width, y0, x0);
+                                float v01 = Fetch(plane, 0, height, width, y0, x0 + 1);
+                                float v10 = Fetch(plane, 0, height, width, y0 + 1, x0);
+                                float v11 = Fetch(plane, 0, height, width, y0 + 1, x0 + 1);
 
                                 float top = v00 + (v01 - v00) * fx;
                                 float bottom = v10 + (v11 - v10) * fx;
-                                value = top + (bottom - top) * fy;
+                                target[i] = top + (bottom - top) * fy;
                             }
-
-                            dst[((n * channels + c) * outH + oy) * outW + ox] = value;
                         }
                     }
                 }
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(sampleX);
+                ArrayPool<float>.Shared.Return(sampleY);
             }
         }
     }

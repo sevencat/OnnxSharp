@@ -589,6 +589,15 @@ Tile TopK Transpose Unsqueeze Where
 46. **沿「消费者」前进，不是沿「生产者」**。第一版用 `producer[outIdx]` 找下一个节点，拿到的是节点自己，
     于是构出「同一节点重复 N 次」的链（还真的跑出了结果）。正确做法是建 `consumerOf[argIdx]`
     （一个 arg 只有一个消费者时才能延伸），并且要显式 `chain.Contains(next)` 防环。
+47. **「算得对不对」的 bug 好抓，「写得顺不顺」的 bug 很难发现——它不报错、结果也全对，只是慢 2 倍**。
+    `GridSampleLayer.Forward` 原来按 `n → oy → ox → c` 遍历，看着很自然（先算一个采样点的坐标，再给所有通道用），
+    但输出是 NCHW：最内层的 `c` 每次跳 `outH*outW` 个元素，**每写一个 float 就换一个缓存行**。
+    改成 `n → c → (oy,ox)` 后目的地址连续、源平面一轮内驻留，单个算子 1.6 → 0.92 ms。
+    - 规律：**最内层循环必须对应张量最内层的连续维度**。NCHW 里就是 `W`，所以 `c` 永远不该在最内层。
+    - 同一类 bug 还藏在「先算标量、再广播到所有通道」的写法里 —— 坐标/索引这类与通道无关的量要**预算到数组**，
+      否则每个通道重算一遍（本例是 2 次 `Floor` + 2 次 `int` 转换 × 256 通道）。
+    - 排查手段只有 `profile` 的 by-type 表：**「算子个数少但耗时占比高」就是它**。
+      GridSample 只有 3 个却占 2.3%，而同耗时的 MatMul 有 139 个 —— 单算子效率差两个数量级，一眼可疑。
 
 ---
 
@@ -879,6 +888,7 @@ SMOKE TEST: PASS
 | 2026-11-07 | **M0.5 落地完成**：`Engine/BufferAllocator.cs`（生命周期着色）、`LayerInfo.Net` + `In()/IsConstInput()`、`Graph.Version/Reset/RemoveAll`、`NetImpl` 槽池 + `FitTemps` + `Declare/Require/TryGetArg`、`Interpreter` 动态形状分支 + 类型签名、`Tensors/Layout.cs` 预留、`tests/OnnxSharp.Tests`（零依赖 16 用例）。`dotnet build` 0 警告 0 错误，16/16 PASS |
 | 2026-11-07 | **建立 `bench.md`（性能唯一事实源）+ `bench/` 脚本体系**：`run_all.py` 一条命令跑 4 引擎 × 6 模型（OnnxSharp / ORT CPU / OpenCV 5 dnn / SimdYolo，YOLO×4 + RF-DETR×2），输出 median/min 双指标；实测 yolo11n 43.4 ms、rfdetr-small 317.5 ms。新增坑 #36（分层编译按次数预热会低估 4 倍） |
 | 2026-11-07 | **逐元素图级融合落地**（`GraphFusion.FuseElementWiseChains` + `Ops/FusedEltwiseLayer.cs`）：GELU `Div→Erf→Add→Mul→Mul` 编译成单层，rfdetr-small 12 条链、节点 857→801，端到端 **-7.4% / medium -9.1%**，输出 max\|diff\|=0。新增 §6.6 坑 #42~#46（运行期下标的 `Vector256[]` 会被 JIT 打回内存、短链必须设门槛、GELU 实际算子顺序、golden 覆盖不足要用 `run --dump` 逐值 A/B、沿消费者而非生产者遍历）；§9 目录树补 `FusedEltwiseLayer.cs`；CLI `run` 新增 `--dump <dir>` |
+| 2026-11-07 | **修 `GridSampleLayer` 的循环顺序 bug**：通道 `c` 原本在最内层而输出是 NCHW（写步长 `outH*outW`，每元素换缓存行），改为 `c` 外提 + 采样坐标预算到 `ArrayPool`。3 个算子 1.6 → 0.92 ms/个（-48%），端到端 rfdetr-small -1.4% / medium -1.1%（min），逐值 diff=0。新增坑 #47（「写得顺不顺」类 bug 不报错只是慢，"算子个数少但占比高"是唯一线索）；记录本机 median 抖动 ±8%，小改动只能用 min 或 profile 判定 |
 | 2026-11-07 | **上一轮：RF-DETR 瓶颈定位到 batched attention GEMM**（结论后被修正）。新增 §6.5 坑 #36~#39（分层编译预热、A/B 必须交替、两个已否决的内核方向、`Parallel.For` 7 µs 阈值）；`gemmbench` 加 `--batch` 并改为按时间预热；新增 `bench/make_micro_models.py` |
 | 2026-11-07 | **本轮：修正上一轮两个错误结论 + 修掉最大单点浪费**。① §3.10 重写：140 个 MatMul 里 MLP（`[257,384]×[384,1536]`）与投影都是真 MatMul，合计 **54.1 GFLOP**（前置 batch 4），in-situ 407 GFLOPS，GEMM 已到顶；② 机器上限用 `fma` 重新量：单线程 91 GFLOPS、16 线程 753 GFLOPS；③ `MatMul` 在 B 不广播时合并 `(batch, m)`（decoder q/k/v 投影是 `[300,1,256]×[256,256]`，权重曾被打包 300 遍，4.06 → 0.13 ms），rfdetr-small **356 → 270 ms（-24%）**、medium -12%；④ `ProfileAll` 加预热与每算子最小耗时（坑 #41）；⑤ 新增 `fma`、`gemmbench --threads`、逐元素带宽与链式 MLP 微模型、`bench` 的 `alloc`/`gc`/`gc pause` 诊断；⑥ 排除 GC（0.7 ms/iter）与降频（长跑不衰减）两个嫌疑，剩下的计时差指向 host 侧每 forward 重算 2064 个算子的形状并分配 113 MB；新增坑 #40（独立内核吞吐无法预测端到端） |
 

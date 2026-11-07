@@ -146,6 +146,16 @@ min（无干扰下限）：
        所以 rfdetr 剩下的空间只有 `Add`、`Transpose`、`Conv`、`Softmax` 这几个 3~7% 的碎块，**再也没有单点能给出 10%**。
      - 注意 `Add 155 个 / 13.9 ms` 是**融合后剩下的**节点：它们要么每个中间结果有多个消费者（残差、attention 的加回），
        要么链长不足门槛，已经不是「漏融合」而是「结构上不能融合」。
+   - **`GridSample` 修复后（2026-11-07 第六轮）**：3 个 `cross_attn/GridSample` 从 `1.6 ms/个`（合计 4.8 ms、2.3%）
+     降到 `0.92 ms/个`（合计 **2.5 ms、1.2%**，**-48%**），同口径 by-type 表里
+     `MatMul 64.8%`、`Add 6.7%`、`Transpose 6.2%`、`Conv 3.8%`、`Softmax 3.4%`、`Mul 2.4%`、`LayerNorm 2.4%`、
+     `FusedEltwise 1.8%`、`Reshape 1.6%`、`GridSample 1.2%`。
+     端到端交替 A/B **6 轮**（同会话，只取 min —— 本机 median 不可用，yolo 同一份代码都能抖 ±8%）：
+     rfdetr-small **225.4 → 222.2 ms（-1.4%）**、rfdetr-medium **290.9 → 287.8 ms（-1.1%）**，
+     与「省 2.3 ms / 225 ms ≈ 1%」的预期一致。4 个模型 base/fused 输出 `max|diff| = 0`。
+     - 剩下的 0.92 ms 仍偏慢（C=256、spatial=300 → 76800 元素，约 83 M 元素/s），
+       瓶颈已从"写不连续"变成"每元素 4 次随机读 + 4 次边界判断"。再往上要预计算四个邻居的平面内偏移
+       （4×300 个 int，L1 装得下），把内层压成纯 lerp —— 预计还能再省一半，但端到端只有 0.6%，**优先级低于 Transpose**。
    - 也就是说 **Transformer 的 GEMM + 逐元素 + 转置**才是瓶颈，卷积优化（Winograd/面板打包）在 DETR 上只影响 3.4%。
    - 节点构成（rfdetr-small，共 2064 节点）：`Constant 459`、`Add 169`、`MatMul 140`、`Reshape 122`、`Mul 114`、`Transpose 113`、`Slice 62`、`LayerNormalization 49`、`Sqrt 45`、`Cast 36`、`Div 35`。
    - **140 个 MatMul 不全是 batched attention**（此前记错了）。按 `(a[-2:], b[-2:], 前置 batch)` 统计，MLP 与投影都是货真价实的 MatMul 节点：
@@ -233,32 +243,20 @@ min（无干扰下限）：
    注意结论 2 里的带宽核算：融合后已经贴在 42 GB/s 的逐元素带宽上限上，**这条路到头了**，
    不要再往「更聪明的逐元素融合」投入。`Add 169 + Mul 114` 里剩下的多数节点不是链（每个中间结果有多个消费者），
    要动只能动 `Sqrt + Div` 这类成对出现的规范化模式（下一轮可查，量级远小于 GELU）。
-2. **GridSample 是新发现的确定 bug**（融合后的 profile 才暴露出它）：只有 **3 个算子却吃掉 4.8 ms / 2.3%**，
-   单个 1.6 ms。已核对 `AttnOps.cs` 的 `GridSampleLayer.Forward`，是**循环顺序写错**，不是"算法需要求高"：
-
-   ```text
-   for n
-     for oy            <- 输出行
-       for ox          <- 输出列
-         ... 算 gx/gy
-         for c         <- 通道在最内层，写地址每次跨 outH*outW
-           dst[((n*C+c)*outH+oy)*outW+ox] = ...
-   ```
-
-   NCHW 输出下，最内层 `c` 的写地址步长是 `outH*outW`，**每写一个元素就换一个缓存行**，
-   3 个算子的写流量全部退化成"随机 4 字节写"。正确做法是把 `c` 提到最外层、`(oy,ox)` 放内层
-   （同时把 `Unnormalize` 的结果预算到一块 `outH*outW` 的临时数组，避免每个 c 重算），
-   这样目的地址连续、源平面在 L2 里驻留。预期 3~5 倍加速，端到端 **-1.5%~-2%**，是当前投入产出比最高的一项。
-3. **Transpose**：113 个（**6.1%**，12.9 ms），已是 8×8 向量分块 + 同布局 memcpy 快路径，
-   但单个仍要 0.12 ms —— DETR 的 `[4,257,1536]` 这类大转置应能压到 0.05 ms 级。剩余空间中等。
+2. ~~**GridSample 循环顺序 bug**~~ —— **已完成（2026-11-07，见结论 2）**：`c` 外提 + 采样坐标预算，
+   3 个算子 4.8 → 2.5 ms（**-48%**），端到端 rfdetr-small **-1.4%**、medium **-1.1%**（min，6 轮交替 A/B），
+   逐值 `max|diff| = 0`。剩下的 0.92 ms/算子要再快得预计算邻居偏移，端到端只值 0.6%，**不再投入**。
+3. **Transpose**：113 个（**6.2%**，12.7 ms），已是 8×8 向量分块 + 同布局 memcpy 快路径，
+   但单个仍要 0.11 ms —— DETR 的 `[4,257,1536]` 这类大转置应能压到 0.05 ms 级。**现在是 RF-DETR 剩余的最大单块**。
 4. **静态形状图缓存逐算子的形状/类型推断**：`Interpreter.Run` 每 forward 对全部 809 个算子重算
    `GetMemoryShapes` / `GetTypes` / `BindArgTensor` / `FitTemps`，实测**每 forward 分配 113 MB**。
    代价被证明很小（GC 暂停 0.7 ms/iter，同形状连续跑 3000 次 383 vs 386 GFLOPS 不衰减），
    但静态图缓存这些结果是**纯收益**，顺手可做。
 5. **s 档大 GEMM 打包**：对照 SimdYolo `CpuPackedGemm` 与 OpenCV `fastConv` 的权重 block 布局，调 `Panel / RowBlock / SliceDepth`。
    这是 yolov8s/yolo11s 落后 1.5~1.8× 的唯一解释，也是唯一还没被本轮优化覆盖的区域。
-6. 卷积侧：Conv+SiLU 融合、Winograd 覆盖 `5×5` —— 但 DETR 上 Conv 只占 3.6%，收益上限很低。
+6. 卷积侧：Conv+SiLU 融合、Winograd 覆盖 `5×5` —— 但 DETR 上 Conv 只占 3.8%，收益上限很低。
 7. **不要再做的**：任何以「减少逐元素趟数」为目标的改动（已贴 42 GB/s 带宽墙）；
+   任何以「提高 GridSample 单算子速度」为目标的改动（端到端只值 0.6%）；
    以及任何需要用微基准（而非交替 A/B）证明收益的 GEMM 分块调整（见结论 3）。
 
 ## 变更记录
@@ -289,3 +287,12 @@ min（无干扰下限）：
   融合后的 by-type profile 见结论 2：`Div` 35→7 个、`Add+Mul` 14.1%→8.9%、新增 `FusedEltwise 1.8%`，
   而 **`GridSample` 3 个算子占 2.3%** 暴露成一个新的单点异常，已列为下一步第一优先。
   yolov8s 对 SimdYolo 的倍率涨到 1.78× 是因为对方从 58.5 变快到 51.8（我们是 90.2→92.2，属噪声），不是回归。
+- 2026-11-07（第六轮）：**修 `GridSampleLayer.Forward` 的循环顺序 bug**。原实现把通道 `c` 放在最内层，
+  而输出是 NCHW，写地址步长 `outH*outW` → 每写一个元素换一个缓存行。
+  改为 `c` 在外、(oy,ox) 在内（输出连续写、源平面驻留），并把 `Unnormalize` 的采样坐标按 batch 预算到
+  `ArrayPool` 租的数组（原来每个 `c` 都重算）。
+  3 个 `cross_attn/GridSample`：`1.6 → 0.92 ms/个`（合计 4.8 → 2.5 ms，**-48%**，占比 2.3% → 1.2%）。
+  端到端 6 轮交替 A/B（只取 min）：rfdetr-small 225.4 → 222.2（**-1.4%**）、rfdetr-medium 290.9 → 287.8（**-1.1%**）。
+  4 模型 `max|diff| = 0`，测试 29/29。
+  本轮同时确认**本机 median 已不可用于 A/B**：同一份代码重跑 6 次，yolo11n median 49.2~53.5、yolov8s 96.9~106.9，
+  幅度 ±8%，与 GridSample 的真实收益同量级 —— 小改动只能看 min 或逐算子 profile。
