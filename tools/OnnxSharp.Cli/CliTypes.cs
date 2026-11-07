@@ -44,4 +44,7 @@ internal sealed class CliOptions
 
     public float GetFloat(string key, float fallback)
         => _values.TryGetValue(key, out var text) ? float.Parse(text) : fallback;
+
+    public string? GetString(string key)
+        => _values.TryGetValue(key, out var text) ? text : null;
 }

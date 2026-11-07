@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Numerics;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -18,6 +19,10 @@ internal static class DnnOps
     {
         LayerRegistry.Register("Conv", p => new ConvLayer(p));
         LayerRegistry.Register("MaxPool", p => new MaxPoolLayer(p));
+        LayerRegistry.Register("AveragePool", p => new AveragePoolLayer(p));
+        LayerRegistry.Register("GlobalAveragePool", p => new AveragePoolLayer(p));
+        LayerRegistry.Register("GlobalMaxPool", p => new MaxPoolLayer(p));
+        LayerRegistry.Register("ConvTranspose", p => new ConvTransposeLayer(p));
         LayerRegistry.Register("Resize", p => new ResizeLayer(p));
         LayerRegistry.Register("Softmax", p => new SoftmaxLayer(p));
         LayerRegistry.Register("MatMul", p => new MatMulLayer(p));
@@ -205,7 +210,395 @@ internal static class DnnOps
         }
     }
 
+    // ---------------- ConvTranspose ----------------
+
+    /// <summary>
+    /// 转置卷积（NCHW，2D）。权重形状 <c>[Cin, Cout/groups, kH, kW]</c>。
+    /// 用「输入驱动 scatter-accumulate」实现：每个输入点把 v*w 累加到它覆盖的输出窗口，
+    /// 复杂度与正向卷积同阶，且不需要 col 缓冲。yolov8-seg / v11-seg 的 proto 分支要用。
+    /// </summary>
+    private sealed class ConvTransposeLayer : Layer
+    {
+        private readonly int[] _kernelShape;
+        private readonly int[] _strides;
+        private readonly int[] _pads;
+        private readonly int[] _outputPads;
+        private readonly int[] _dilations;
+        private readonly int _groups;
+        private readonly string _autoPad;
+
+        /// <summary>重排后的权重（缓存），顺序 <c>[groups, kH, kW, Cin/groups, Cout/groups]</c>。</summary>
+        private float[]? _packed;
+        private Tensor? _packedSource;
+
+        public ConvTransposeLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _kernelShape = ToInts(parameters.GetInts("kernel_shape"));
+            _strides = ToInts(parameters.GetInts("strides"));
+            _pads = ToInts(parameters.GetInts("pads"));
+            _outputPads = ToInts(parameters.GetInts("output_padding"));
+            _dilations = ToInts(parameters.GetInts("dilations"));
+            _groups = (int)parameters.GetInt("group", 1);
+            _autoPad = parameters.GetString("auto_pad", "NOTSET");
+        }
+
+        private (int[] Pads, int[] Strides, int[] Kernel, int[] Dilations, int[] OutputPads) Resolve(
+            int spatial, TensorShape input, TensorShape weight)
+        {
+            var kernel = new int[spatial];
+            var strides = new int[spatial];
+            var pads = new int[spatial * 2];
+            var dilations = new int[spatial];
+            var outPads = new int[spatial];
+
+            if (_kernelShape.Length > 0)
+            {
+                if (_kernelShape.Length != spatial)
+                    throw new OnnxSharpException($"ConvTranspose '{Name}': kernel_shape must have {spatial} entries");
+
+                for (int i = 0; i < spatial; i++)
+                    kernel[i] = _kernelShape[i];
+            }
+            else
+            {
+                for (int i = 0; i < spatial; i++)
+                    kernel[i] = weight.Dims[2 + i];
+            }
+
+            for (int i = 0; i < spatial; i++)
+            {
+                strides[i] = _strides.Length > i ? _strides[i] : 1;
+                dilations[i] = _dilations.Length > i ? _dilations[i] : 1;
+                outPads[i] = _outputPads.Length > i ? _outputPads[i] : 0;
+
+                if (_autoPad is "SAME_UPPER" or "SAME_LOWER")
+                {
+                    int total = (input.Dims[2 + i] - 1) * strides[i] + dilations[i] * (kernel[i] - 1) + 1
+                                + outPads[i] - input.Dims[2 + i] * strides[i];
+                    if (total < 0)
+                        total = 0;
+
+                    pads[i] = _autoPad == "SAME_UPPER" ? total / 2 : total - total / 2;
+                    pads[spatial + i] = total - pads[i];
+                }
+                else
+                {
+                    pads[i] = _pads.Length > i ? _pads[i] : 0;
+                    pads[spatial + i] = _pads.Length > spatial + i ? _pads[spatial + i] : pads[i];
+                }
+            }
+
+            return (pads, strides, kernel, dilations, outPads);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            var input = inShapes[0];
+            var weight = inShapes[1];
+            int spatial = input.Rank - 2;
+            var (pads, strides, kernel, dilations, outPads) = Resolve(spatial, input, weight);
+
+            var dims = input.ToArray();
+            dims[1] = weight.Dims[1] * _groups;
+
+            for (int i = 0; i < spatial; i++)
+            {
+                long size = (long)(input.Dims[2 + i] - 1) * strides[i]
+                            - pads[i] - pads[spatial + i]
+                            + dilations[i] * (kernel[i] - 1) + outPads[i] + 1;
+
+                dims[2 + i] = (int)size;
+            }
+
+            outShapes.Add(new TensorShape(dims));
+        }
+
+        public override unsafe void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var input = inputs[0];
+            var weight = inputs[1];
+            var output = outputs[0];
+
+            int spatial = input.Shape.Rank - 2;
+            if (spatial != 2)
+                throw new OnnxSharpException($"ConvTranspose '{Name}': only 2D is implemented");
+
+            var (pads, strides, kernel, dilations, _) = Resolve(spatial, input.Shape, weight.Shape);
+
+            int batches = input.Shape.Dims[0];
+            int inChannels = input.Shape.Dims[1];
+            int inH = input.Shape.Dims[2];
+            int inW = input.Shape.Dims[3];
+
+            int outChannels = output.Shape.Dims[1];
+            int outH = output.Shape.Dims[2];
+            int outW = output.Shape.Dims[3];
+
+            int kH = kernel[0], kW = kernel[1];
+            int sH = strides[0], sW = strides[1];
+            int dH = dilations[0], dW = dilations[1];
+            int pT = pads[0], pL = pads[1];
+
+            if (_groups <= 0 || inChannels % _groups != 0 || outChannels % _groups != 0)
+                throw new OnnxSharpException($"ConvTranspose '{Name}': channels are not divisible by group {_groups}");
+
+            int inPerGroup = inChannels / _groups;
+            int outPerGroup = outChannels / _groups;
+
+            var src = input.AsSpan<float>();
+            var dst = output.AsSpan<float>();
+            var packed = GetPacked(weight, inPerGroup, outPerGroup, kH, kW);
+
+            Tensor? bias = Inputs.Count > 2 && Inputs[2].Idx != 0 && inputs.Count > 2 && inputs[2].Count > 0
+                ? inputs[2]
+                : null;
+            float[]? biasArray = bias is null ? null : bias.AsSpan<float>().ToArray();
+
+            long outPlane = (long)outH * outW;
+            long inPlane = (long)inH * inW;
+            long groupKernel = (long)kH * kW * inPerGroup * outPerGroup;
+
+            // 输出侧 gather：每个输出像素只在「合法相位」的 kH/sH × kW/sW 个 tap 上累加，
+            // 内层按 co（连续打包）向量化，写回每个像素只做一次。
+            // 并行维度是「输出行块」——scatter 方案只能按 batch*group 并行，
+            // seg 的 proto 层 batch=group=1 会退化成单线程（1.4 s → 单核跑 838 MMAC）。
+            int threads = ParallelRange.Threads;
+            int blocks = Math.Min(outH, Math.Max(1, threads * 2));
+            int rowsPerBlock = Math.Max(1, (outH + blocks - 1) / blocks);
+            blocks = (outH + rowsPerBlock - 1) / rowsPerBlock;
+            int tasks = batches * _groups * blocks;
+
+            fixed (float* px = src)
+            fixed (float* pp = packed)
+            fixed (float* py = dst)
+            {
+                IntPtr pin = (IntPtr)px;
+                IntPtr ppk = (IntPtr)pp;
+                IntPtr pout = (IntPtr)py;
+
+                ParallelRange.For(tasks, (begin, end) =>
+                {
+                    float* x0 = (float*)pin;
+                    float* w0 = (float*)ppk;
+                    float* y0 = (float*)pout;
+
+                    float[] accBuf = ArrayPool<float>.Shared.Rent(outPerGroup);
+                    Span<int> kyList = stackalloc int[16];
+                    Span<int> iyList = stackalloc int[16];
+                    var accSpan = new Span<float>(accBuf, 0, outPerGroup);
+
+                    try
+                    {
+                        fixed (float* acc = accBuf)
+                        {
+                            for (int task = begin; task < end; task++)
+                            {
+                                int block = task % blocks;
+                                int rest = task / blocks;
+                                int g = rest % _groups;
+                                int b = rest / _groups;
+
+                                int oyBegin = block * rowsPerBlock;
+                                int oyEnd = Math.Min(outH, oyBegin + rowsPerBlock);
+
+                                float* wGroup = w0 + (long)g * groupKernel;
+                                long outGroupBase = (long)b * outChannels * outPlane + (long)g * outPerGroup * outPlane;
+
+                                for (int oy = oyBegin; oy < oyEnd; oy++)
+                                {
+                                    int kyCount = 0;
+                                    for (int ky = 0; ky < kH && kyCount < 16; ky++)
+                                    {
+                                        int t = oy + pT - ky * dH;
+                                        if (t < 0 || t % sH != 0)
+                                            continue;
+
+                                        int iy = t / sH;
+                                        if ((uint)iy >= (uint)inH)
+                                            continue;
+
+                                        kyList[kyCount] = ky;
+                                        iyList[kyCount] = iy;
+                                        kyCount++;
+                                    }
+
+                                    long outRow = outGroupBase + (long)oy * outW;
+
+                                    for (int ox = 0; ox < outW; ox++)
+                                    {
+                                        if (biasArray is null)
+                                        {
+                                            accSpan.Clear();
+                                        }
+                                        else
+                                        {
+                                            biasArray.AsSpan(g * outPerGroup, outPerGroup).CopyTo(accSpan);
+                                        }
+
+                                        for (int k = 0; k < kyCount; k++)
+                                        {
+                                            int ky = kyList[k];
+                                            int iy = iyList[k];
+
+                                            for (int kx = 0; kx < kW; kx++)
+                                            {
+                                                int t = ox + pL - kx * dW;
+                                                if (t < 0 || t % sW != 0)
+                                                    continue;
+
+                                                int ix = t / sW;
+                                                if ((uint)ix >= (uint)inW)
+                                                    continue;
+
+                                                float* wTap = wGroup + ((long)(ky * kW + kx) * inPerGroup) * outPerGroup;
+                                                float* xPlane = x0 + ((long)b * inChannels + g * inPerGroup) * inPlane
+                                                                + (long)iy * inW + ix;
+
+                                                for (int ci = 0; ci < inPerGroup; ci++)
+                                                {
+                                                    float v = xPlane[(long)ci * inPlane];
+                                                    if (v == 0f)
+                                                        continue;
+
+                                                    float* wp = wTap + (long)ci * outPerGroup;
+                                                    int co = 0;
+
+                                                    if (Avx2.IsSupported)
+                                                    {
+                                                        var vv = Vector256.Create(v);
+                                                        for (; co + Vector256<float>.Count <= outPerGroup; co += Vector256<float>.Count)
+                                                        {
+                                                            var a = Avx.LoadVector256(acc + co);
+                                                            var wv = Avx.LoadVector256(wp + co);
+                                                            Avx.Store(acc + co, Avx.Add(a, Avx.Multiply(vv, wv)));
+                                                        }
+                                                    }
+
+                                                    for (; co < outPerGroup; co++)
+                                                        acc[co] += v * wp[co];
+                                                }
+                                            }
+                                        }
+
+                                        for (int co = 0; co < outPerGroup; co++)
+                                            y0[outRow + (long)co * outPlane + ox] = acc[co];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(accBuf);
+                    }
+                });
+            }
+        }
+
+        /// <summary>
+        /// 把 <c>[Cin, Cout/groups, kH, kW]</c> 重排为 <c>[groups, kH, kW, Cin/groups, Cout/groups]</c>，
+        /// 让 gather 内核内层的 co 维连续（可直接 8 路向量累加）。结果按权重张量实例缓存。
+        /// </summary>
+        private float[] GetPacked(Tensor weight, int inPerGroup, int outPerGroup, int kH, int kW)
+        {
+            if (_packed is not null && ReferenceEquals(_packedSource, weight))
+                return _packed;
+
+            var w = weight.AsSpan<float>();
+            var packed = new float[(long)_groups * kH * kW * inPerGroup * outPerGroup];
+            int kernelArea = kH * kW;
+
+            for (int g = 0; g < _groups; g++)
+            {
+                for (int ci = 0; ci < inPerGroup; ci++)
+                {
+                    int ic = g * inPerGroup + ci;
+
+                    for (int co = 0; co < outPerGroup; co++)
+                    {
+                        long srcBase = ((long)ic * outPerGroup + co) * kernelArea;
+                        long dstBase = ((long)g * kernelArea * inPerGroup + ci) * outPerGroup + co;
+
+                        for (int t = 0; t < kernelArea; t++)
+                            packed[dstBase + (long)t * inPerGroup * outPerGroup] = w[(int)(srcBase + t)];
+                    }
+                }
+            }
+
+            _packed = packed;
+            _packedSource = weight;
+            return packed;
+        }
+    }
+
     // ---------------- MaxPool ----------------
+
+    /// <summary>MaxPool / AveragePool 共用的属性归一化（默认值、auto_pad 推导、pads 补齐）。</summary>
+    private static (int[] Pads, int[] Strides, int[] Kernel, int[] Dilations) ResolvePool(
+        string type,
+        string name,
+        int[] kernelShape,
+        int[] stridesAttr,
+        int[] padsAttr,
+        int[] dilationsAttr,
+        string autoPad,
+        int spatial,
+        TensorShape input)
+    {
+        var kernel = new int[spatial];
+        var strides = new int[spatial];
+        var pads = new int[spatial * 2];
+        var dilations = new int[spatial];
+
+        // Global*Pool：核覆盖整个空间，等价于 kernel = 输入尺寸、stride = kernel。
+        if (type is "GlobalAveragePool" or "GlobalMaxPool")
+        {
+            for (int i = 0; i < spatial; i++)
+            {
+                kernel[i] = input.Dims[2 + i];
+                strides[i] = kernel[i];
+                dilations[i] = 1;
+            }
+
+            return (pads, strides, kernel, dilations);
+        }
+
+        if (kernelShape.Length != spatial)
+            throw new OnnxSharpException($"{type} '{name}': kernel_shape must have {spatial} entries");
+
+        for (int i = 0; i < spatial; i++)
+        {
+            kernel[i] = kernelShape[i];
+            strides[i] = stridesAttr.Length > i ? stridesAttr[i] : 1;
+            dilations[i] = dilationsAttr.Length > i ? dilationsAttr[i] : 1;
+        }
+
+        for (int i = 0; i < spatial; i++)
+        {
+            if (autoPad is "SAME_UPPER" or "SAME_LOWER" or "VALID")
+            {
+                var (begin, end) = AutoPad(autoPad, input.Dims[2 + i], kernel[i], strides[i], dilations[i], -1);
+                pads[i] = begin;
+                pads[spatial + i] = end;
+            }
+            else
+            {
+                pads[i] = padsAttr.Length > i ? padsAttr[i] : 0;
+                pads[spatial + i] = padsAttr.Length > spatial + i ? padsAttr[spatial + i] : pads[i];
+            }
+        }
+
+        return (pads, strides, kernel, dilations);
+    }
 
     private sealed class MaxPoolLayer : Layer
     {
@@ -229,39 +622,7 @@ internal static class DnnOps
         }
 
         private (int[] Pads, int[] Strides, int[] Kernel, int[] Dilations) Resolve(int spatial, TensorShape input)
-        {
-            var kernel = new int[spatial];
-            var strides = new int[spatial];
-            var pads = new int[spatial * 2];
-            var dilations = new int[spatial];
-
-            if (_kernelShape.Length != spatial)
-                throw new OnnxSharpException($"MaxPool '{Name}': kernel_shape must have {spatial} entries");
-
-            for (int i = 0; i < spatial; i++)
-            {
-                kernel[i] = _kernelShape[i];
-                strides[i] = _strides.Length > i ? _strides[i] : 1;
-                dilations[i] = _dilations.Length > i ? _dilations[i] : 1;
-            }
-
-            for (int i = 0; i < spatial; i++)
-            {
-                if (_autoPad is "SAME_UPPER" or "SAME_LOWER" or "VALID")
-                {
-                    var (begin, end) = AutoPad(_autoPad, input.Dims[2 + i], kernel[i], strides[i], dilations[i], -1);
-                    pads[i] = begin;
-                    pads[spatial + i] = end;
-                }
-                else
-                {
-                    pads[i] = _pads.Length > i ? _pads[i] : 0;
-                    pads[spatial + i] = _pads.Length > spatial + i ? _pads[spatial + i] : pads[i];
-                }
-            }
-
-            return (pads, strides, kernel, dilations);
-        }
+            => ResolvePool(Type, Name, _kernelShape, _strides, _pads, _dilations, _autoPad, spatial, input);
 
         public override void GetMemoryShapes(
             IReadOnlyList<TensorShape> inShapes,
@@ -354,6 +715,146 @@ internal static class DnnOps
                             }
 
                             d[(int)(outBase + (long)oy * outW + ox)] = best;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // ---------------- AveragePool ----------------
+
+    /// <summary>
+    /// 均值池化。count_include_pad=1（默认）时 pad 出来的 0 也计入分母，但 ceil_mode
+    /// 撑到 pad 边界之外的部分不计；=0 时只统计与真实输入重叠的 tap。
+    /// RT-DETR 的 hybrid encoder、yolov9 的 SPP/SPPF 都用它。
+    /// </summary>
+    private sealed class AveragePoolLayer : Layer
+    {
+        private readonly int[] _kernelShape;
+        private readonly int[] _strides;
+        private readonly int[] _pads;
+        private readonly int[] _dilations;
+        private readonly string _autoPad;
+        private readonly bool _ceilMode;
+        private readonly bool _countIncludePad;
+
+        public AveragePoolLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _kernelShape = ToInts(parameters.GetInts("kernel_shape"));
+            _strides = ToInts(parameters.GetInts("strides"));
+            _pads = ToInts(parameters.GetInts("pads"));
+            _dilations = ToInts(parameters.GetInts("dilations"));
+            _autoPad = parameters.GetString("auto_pad", "NOTSET");
+            _ceilMode = parameters.GetInt("ceil_mode", 0) != 0;
+            _countIncludePad = parameters.GetInt("count_include_pad", 1) != 0;
+        }
+
+        private (int[] Pads, int[] Strides, int[] Kernel, int[] Dilations) Resolve(int spatial, TensorShape input)
+            => ResolvePool(Type, Name, _kernelShape, _strides, _pads, _dilations, _autoPad, spatial, input);
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            var input = inShapes[0];
+            int spatial = input.Rank - 2;
+            var (pads, strides, kernel, dilations) = Resolve(spatial, input);
+
+            var dims = input.ToArray();
+            for (int i = 0; i < spatial; i++)
+                dims[2 + i] = SpatialOut(input.Dims[2 + i], kernel[i], strides[i], dilations[i],
+                    pads[i], pads[spatial + i], _ceilMode);
+
+            outShapes.Add(new TensorShape(dims));
+        }
+
+        /// <summary>窗口里落在 [0, paddedSize) 内的 tap 个数（padded 坐标系）。</summary>
+        private static int PaddedTaps(int start, int kernel, int dilation, int paddedSize)
+        {
+            int k0 = start >= 0 ? 0 : (-start + dilation - 1) / dilation;
+            int k1 = (int)Math.Floor((paddedSize - 1 - start) / (double)dilation) + 1;
+            if (k1 > kernel)
+                k1 = kernel;
+            return k1 > k0 ? k1 - k0 : 0;
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var input = inputs[0];
+            var output = outputs[0];
+            int spatial = input.Shape.Rank - 2;
+            var (pads, strides, kernel, dilations) = Resolve(spatial, input.Shape);
+
+            if (spatial != 2)
+                throw new OnnxSharpException($"AveragePool '{Name}': only 2D pooling is implemented");
+
+            int batches = input.Shape.Dims[0];
+            int channels = input.Shape.Dims[1];
+            int inH = input.Shape.Dims[2];
+            int inW = input.Shape.Dims[3];
+            int outH = output.Shape.Dims[2];
+            int outW = output.Shape.Dims[3];
+
+            int kH = kernel[0], kW = kernel[1];
+            int sH = strides[0], sW = strides[1];
+            int dH = dilations[0], dW = dilations[1];
+            int pT = pads[0], pL = pads[1];
+            int padH = inH + pads[0] + pads[2];
+            int padW = inW + pads[1] + pads[3];
+            bool includePad = _countIncludePad;
+
+            ParallelRange.For(batches * channels, (begin, end) =>
+            {
+                var s = input.AsSpan<float>();
+                var d = output.AsSpan<float>();
+
+                for (int t = begin; t < end; t++)
+                {
+                    long inBase = (long)t * inH * inW;
+                    long outBase = (long)t * outH * outW;
+
+                    for (int oy = 0; oy < outH; oy++)
+                    {
+                        int y0 = oy * sH - pT;
+
+                        int ky0 = y0 >= 0 ? 0 : (-y0 + dH - 1) / dH;
+                        int yLimit = inH - y0;
+                        int ky1 = yLimit <= 0 ? 0 : Math.Min(kH, (yLimit + dH - 1) / dH);
+                        if (ky1 < ky0)
+                            ky1 = ky0;
+
+                        int cntH = includePad ? PaddedTaps(y0 + pT, kH, dH, padH) : ky1 - ky0;
+
+                        for (int ox = 0; ox < outW; ox++)
+                        {
+                            int x0 = ox * sW - pL;
+
+                            int kx0 = x0 >= 0 ? 0 : (-x0 + dW - 1) / dW;
+                            int xLimit = inW - x0;
+                            int kx1 = xLimit <= 0 ? 0 : Math.Min(kW, (xLimit + dW - 1) / dW);
+                            if (kx1 < kx0)
+                                kx1 = kx0;
+
+                            int cntW = includePad ? PaddedTaps(x0 + pL, kW, dW, padW) : kx1 - kx0;
+                            int count = cntH * cntW;
+
+                            float sum = 0;
+                            for (int ky = ky0; ky < ky1; ky++)
+                            {
+                                long rowBase = inBase + (long)(y0 + ky * dH) * inW + x0;
+                                for (int kx = kx0; kx < kx1; kx++)
+                                    sum += s[(int)(rowBase + kx * dW)];
+                            }
+
+                            d[(int)(outBase + (long)oy * outW + ox)] = count > 0 ? sum / count : 0f;
                         }
                     }
                 }

@@ -23,6 +23,8 @@ public sealed class NaryEltwiseLayer : Layer
         LayerRegistry.Register("Div", p => new NaryEltwiseLayer(p, BinaryOpKind.Div));
         LayerRegistry.Register("Max", p => new NaryEltwiseLayer(p, BinaryOpKind.Max));
         LayerRegistry.Register("Min", p => new NaryEltwiseLayer(p, BinaryOpKind.Min));
+        LayerRegistry.Register("Pow", p => new NaryEltwiseLayer(p, BinaryOpKind.Pow));
+        LayerRegistry.Register("Mod", p => new NaryEltwiseLayer(p, BinaryOpKind.Mod));
     }
 
     public override void GetMemoryShapes(

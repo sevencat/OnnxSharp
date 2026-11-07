@@ -229,7 +229,7 @@ static int Run(string[] args)
     var net = Net.ReadModel(path);
     loadWatch.Stop();
 
-    var feeds = BindInputs(net, options.Inputs);
+    var feeds = BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
     int repeat = options.GetInt("--repeat", 1);
 
     Console.WriteLine($"model     : {path}");
@@ -287,7 +287,7 @@ static int Bench(string[] args)
     }
 
     var net = Net.ReadModel(path);
-    BindInputs(net, options.Inputs);
+    BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
 
     int warmup = options.GetInt("--warmup", 1);
     int iters = options.GetInt("--iters", 5);
@@ -334,7 +334,7 @@ static int Profile(string[] args)
     }
 
     var net = Net.ReadModel(path);
-    BindInputs(net, options.Inputs);
+    BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
 
     int iters = Math.Max(1, options.GetInt("--iters", 2));
     int top = options.GetInt("--top", 20);
@@ -394,7 +394,7 @@ static int Detect(string[] args)
     float iou = options.GetFloat("--iou", 0.45f);
 
     var net = Net.ReadModel(path);
-    BindInputs(net, options.Inputs);
+    BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
 
     var output = net.Forward();
     var span = output.AsSpan<float>();
@@ -508,7 +508,20 @@ static CliOptions ParseOptions(string[] args, int start)
 /// 把 <c>--input file.bin</c>（按模型输入顺序）或 <c>--input name=file.bin</c> 绑定到图上。
 /// 只支持静态形状的 F32 输入 —— 这是「引擎外的预处理」边界，letterbox 由调用方完成。
 /// </summary>
-static List<Tensor> BindInputs(Net net, List<string> inputs)
+static int[]? ParseShape(string? text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return null;
+
+    var parts = text.Split(new[] { 'x', 'X', ',' }, StringSplitOptions.RemoveEmptyEntries);
+    var dims = new int[parts.Length];
+    for (int i = 0; i < parts.Length; i++)
+        dims[i] = int.Parse(parts[i]);
+
+    return dims;
+}
+
+static List<Tensor> BindInputs(Net net, List<string> inputs, int[]? shapeOverride = null)
 {
     if (inputs.Count == 0)
         throw new OnnxSharpException("no --input given");
@@ -535,7 +548,7 @@ static List<Tensor> BindInputs(Net net, List<string> inputs)
             file = inputs[i];
         }
 
-        var tensor = LoadTensor(net, name, file);
+        var tensor = LoadTensor(net, name, file, shapeOverride);
         net.SetInput(name, tensor);
         tensors.Add(tensor);
     }
@@ -543,25 +556,42 @@ static List<Tensor> BindInputs(Net net, List<string> inputs)
     return tensors;
 }
 
-static Tensor LoadTensor(Net net, string name, string file)
+static Tensor LoadTensor(Net net, string name, string file, int[]? shapeOverride = null)
 {
     var data = net.Impl.GetArgData(net.Impl.Require(name));
 
     if (data.DType != DType.F32)
         throw new OnnxSharpException($"input '{name}': only F32 is supported for --input (got {data.DType})");
 
-    long count = data.Shape.Total();
-    if (count <= 0)
-        throw new OnnxSharpException($"input '{name}': shape {data.Shape} is not static; cannot bind a raw tensor");
+    TensorShape shape;
 
+    if (shapeOverride is { Length: > 0 })
+    {
+        shape = new TensorShape(shapeOverride);
+    }
+    else
+    {
+        for (int i = 0; i < data.Shape.Rank; i++)
+        {
+            if (data.Shape.Dims[i] > 0)
+                continue;
+
+            throw new OnnxSharpException(
+                $"input '{name}': shape {data.Shape} has dynamic dims; pass --shape 1,3,H,W");
+        }
+
+        shape = data.Shape;
+    }
+
+    long count = shape.Total();
     var bytes = File.ReadAllBytes(file);
     long expected = count * sizeof(float);
 
     if (bytes.Length != expected)
         throw new OnnxSharpException(
-            $"input '{name}': {file} is {bytes.Length} B, expected {expected} B for {data.Shape}");
+            $"input '{name}': {file} is {bytes.Length} B, expected {expected} B for {shape}");
 
-    var tensor = Tensor.Allocate(data.Shape, DType.F32);
+    var tensor = Tensor.Allocate(shape, DType.F32);
     bytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(tensor.AsSpan<float>()));
     return tensor;
 }

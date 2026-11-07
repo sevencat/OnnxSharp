@@ -17,12 +17,17 @@ internal static class MiscOps
         LayerRegistry.Register("ConstantOfShape", p => new ConstantOfShapeLayer(p));
         LayerRegistry.Register("ReduceSum", p => new ReduceLayer(p, ReduceKind.Sum));
         LayerRegistry.Register("ReduceMax", p => new ReduceLayer(p, ReduceKind.Max));
+        LayerRegistry.Register("ReduceMean", p => new ReduceLayer(p, ReduceKind.Mean));
+        LayerRegistry.Register("Range", p => new RangeLayer(p));
     }
 
     internal enum ReduceKind
     {
         Sum,
         Max,
+
+        /// <summary>先按 Sum 归约，最后统一除以窗口大小。</summary>
+        Mean,
     }
 
     // ---------------- Cast ----------------
@@ -197,6 +202,87 @@ internal static class MiscOps
         }
     }
 
+    // ---------------- Range ----------------
+
+    /// <summary>
+    /// <c>Range(start, limit, delta)</c> → 一维等差序列，长度 = max(ceil((limit-start)/delta), 0)。
+    /// 三个输入在生成位置编码时都是常量，所以长度能在形状推断阶段算出来，也能被常量折叠。
+    /// </summary>
+    private sealed class RangeLayer : Layer
+    {
+        public RangeLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+        }
+
+        private static double ReadScalar(Tensor t, string what, string name) => t.DType switch
+        {
+            DType.F32 => t.AsSpan<float>()[0],
+            DType.I64 => t.AsSpan<long>()[0],
+            _ => throw new OnnxSharpException($"Range '{name}': unsupported {what} dtype {t.DType}"),
+        };
+
+        private long Count()
+        {
+            double start = ReadScalar(OpUtil.RequireConstInput(this, 0), "start", Name);
+            double limit = ReadScalar(OpUtil.RequireConstInput(this, 1), "limit", Name);
+            double delta = ReadScalar(OpUtil.RequireConstInput(this, 2), "delta", Name);
+
+            if (delta == 0)
+                throw new OnnxSharpException($"Range '{Name}': delta must not be zero");
+
+            double n = Math.Ceiling((limit - start) / delta);
+            return n <= 0 ? 0 : (long)n;
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+            => outShapes.Add(new TensorShape(new[] { (int)Count() }));
+
+        public override void GetTypes(
+            IReadOnlyList<DType> inTypes,
+            int requiredOutputs,
+            int requiredTemps,
+            List<DType> outTypes,
+            List<DType> tempTypes)
+        {
+            outTypes.Clear();
+            for (int i = 0; i < requiredOutputs; i++)
+                outTypes.Add(inTypes.Count > 0 ? inTypes[0] : DType.F32);
+
+            tempTypes.Clear();
+            for (int i = 0; i < requiredTemps; i++)
+                tempTypes.Add(DType.F32);
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var output = outputs[0];
+
+            double start = ReadScalar(inputs[0], "start", Name);
+            double delta = ReadScalar(inputs[2], "delta", Name);
+
+            if (output.DType == DType.I64)
+            {
+                var d = output.AsSpan<long>();
+                for (int i = 0; i < d.Length; i++)
+                    d[i] = (long)(start + i * delta);
+                return;
+            }
+
+            var f = output.AsSpan<float>();
+            for (int i = 0; i < f.Length; i++)
+                f[i] = (float)(start + i * delta);
+        }
+    }
+
     // ---------------- ReduceSum / ReduceMax ----------------
 
     private sealed class ReduceLayer : Layer
@@ -300,6 +386,9 @@ internal static class MiscOps
 
             if (input.DType == DType.I64)
             {
+                if (_kind == ReduceKind.Mean)
+                    throw new OnnxSharpException($"'ReduceMean' '{Name}': only F32 is supported");
+
                 ReduceInt64(input.AsSpan<long>(), output.AsSpan<long>(), dims, inStrides, map);
                 return;
             }
@@ -315,6 +404,7 @@ internal static class MiscOps
             if (TryContiguousReduction(dims, reduced, out int outer, out int mid, out int inner))
             {
                 ReduceBlocks(src, dst, outer, mid, inner);
+                ScaleIfMean(dst, input.Count);
                 return;
             }
 
@@ -349,6 +439,19 @@ internal static class MiscOps
                     dst[(int)target] += value;
                 }
             }
+
+            ScaleIfMean(dst, input.Count);
+        }
+
+        /// <summary>ReduceMean = 先按 Sum 累加完再整体乘 1/N，避免内层每次都做除法。</summary>
+        private void ScaleIfMean(Span<float> dst, long inputCount)
+        {
+            if (_kind != ReduceKind.Mean || dst.Length == 0 || inputCount == 0)
+                return;
+
+            float inv = (float)dst.Length / inputCount;
+            for (int i = 0; i < dst.Length; i++)
+                dst[i] *= inv;
         }
 
         /// <summary>

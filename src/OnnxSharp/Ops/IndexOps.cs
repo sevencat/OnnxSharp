@@ -14,6 +14,7 @@ internal static class IndexOps
         LayerRegistry.Register("Shape", p => new ShapeLayer(p));
         LayerRegistry.Register("Gather", p => new GatherLayer(p));
         LayerRegistry.Register("GatherElements", p => new GatherElementsLayer(p));
+        LayerRegistry.Register("GatherND", p => new GatherNDLayer(p));
         LayerRegistry.Register("Unsqueeze", p => new UnsqueezeLayer(p));
         LayerRegistry.Register("Squeeze", p => new SqueezeLayer(p));
     }
@@ -241,6 +242,100 @@ internal static class IndexOps
                     source += (long)(d == axis ? k : coords[d]) * dataStrides[d];
 
                 OpUtil.CopyBytes(data, source, output, n, 1);
+            }
+        }
+    }
+
+    // ---------------- GatherND ----------------
+
+    /// <summary>
+    /// <c>GatherND(data, indices)</c>：indices 最后一维是坐标元组长度 r，
+    /// 输出形状 = indices.shape[:-1] + data.shape[r:]。
+    /// </summary>
+    private sealed class GatherNDLayer : Layer
+    {
+        public GatherNDLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+        }
+
+        private int ResolveRank(TensorShape data, TensorShape indices)
+        {
+            int r = indices.Dims[indices.Rank - 1];
+            if (r <= 0 || r > data.Rank)
+                throw new OnnxSharpException(
+                    $"GatherND '{Name}': indices last dim {r} out of range for data rank {data.Rank}");
+            return r;
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            var data = inShapes[0];
+            var indices = inShapes[1];
+            int r = ResolveRank(data, indices);
+
+            int outer = indices.Rank - 1;
+            int tail = data.Rank - r;
+
+            var dims = new int[outer + tail];
+            for (int i = 0; i < outer; i++)
+                dims[i] = indices.Dims[i];
+            for (int i = 0; i < tail; i++)
+                dims[outer + i] = data.Dims[r + i];
+
+            outShapes.Add(new TensorShape(dims));
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var data = inputs[0];
+            var indices = inputs[1];
+            var output = outputs[0];
+
+            int r = ResolveRank(data.Shape, indices.Shape);
+
+            var strides = new long[r];
+            long stride = 1;
+            for (int i = data.Shape.Rank - 1; i >= r; i--)
+                stride *= data.Shape.Dims[i];
+
+            long slice = stride;
+            for (int i = r - 1; i >= 0; i--)
+            {
+                strides[i] = stride;
+                stride *= data.Shape.Dims[i];
+            }
+
+            var idx = indices.DType == DType.I64
+                ? indices.AsSpan<long>()
+                : throw new OnnxSharpException($"GatherND '{Name}': indices must be int64, got {indices.DType}");
+
+            long tuples = idx.Length / r;
+
+            for (long t = 0; t < tuples; t++)
+            {
+                long offset = 0;
+                for (int i = 0; i < r; i++)
+                {
+                    long v = idx[(int)(t * r + i)];
+                    int dim = data.Shape.Dims[i];
+                    if (v < 0)
+                        v += dim;
+                    if ((ulong)v >= (ulong)dim)
+                        throw new OnnxSharpException($"GatherND '{Name}': index {v} out of range for dim {dim}");
+
+                    offset += v * strides[i];
+                }
+
+                OpUtil.CopyBytes(data, offset, output, t * slice, slice);
             }
         }
     }

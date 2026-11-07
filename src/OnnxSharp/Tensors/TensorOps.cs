@@ -14,6 +14,12 @@ public enum BinaryOpKind
     Div,
     Max,
     Min,
+
+    /// <summary>a 的 b 次幂（RT-DETR 的位置编码里用）。</summary>
+    Pow,
+
+    /// <summary>取模，按 ONNX 默认的 fmod=0（floor 语义）。</summary>
+    Mod,
 }
 
 public enum UnaryOpKind
@@ -27,6 +33,13 @@ public enum UnaryOpKind
     Erf,
     Sin,
     Cos,
+    Floor,
+    Ceil,
+    Log,
+    Tanh,
+    Reciprocal,
+    Sign,
+    Round,
 
     /// <summary>
     /// <c>x · sigmoid(x)</c>。ONNX 里 SiLU（Swish）总是导出成 <c>Sigmoid → Mul</c> 两个节点，
@@ -178,6 +191,7 @@ public static class TensorOps
         BinaryOpKind.Div => b == 0 ? 0 : a / b,
         BinaryOpKind.Max => Math.Max(a, b),
         BinaryOpKind.Min => Math.Min(a, b),
+        BinaryOpKind.Mod => b == 0 ? 0 : a - b * (long)Math.Floor((double)a / b),
         _ => throw new OnnxSharpException($"integer element-wise op '{op}' is not supported"),
     };
 
@@ -581,6 +595,8 @@ public static class TensorOps
         BinaryOpKind.Div => a / b,
         BinaryOpKind.Max => MathF.Max(a, b),
         BinaryOpKind.Min => MathF.Min(a, b),
+        BinaryOpKind.Pow => MathF.Pow(a, b),
+        BinaryOpKind.Mod => a - b * MathF.Floor(a / b),
         _ => throw new ArgumentOutOfRangeException(nameof(op), op, null),
     };
 
@@ -595,6 +611,13 @@ public static class TensorOps
         UnaryOpKind.Erf => Erf(a),
         UnaryOpKind.Sin => MathF.Sin(a),
         UnaryOpKind.Cos => MathF.Cos(a),
+        UnaryOpKind.Floor => MathF.Floor(a),
+        UnaryOpKind.Ceil => MathF.Ceiling(a),
+        UnaryOpKind.Log => MathF.Log(a),
+        UnaryOpKind.Tanh => MathF.Tanh(a),
+        UnaryOpKind.Reciprocal => 1f / a,
+        UnaryOpKind.Sign => a > 0f ? 1f : a < 0f ? -1f : 0f,
+        UnaryOpKind.Round => MathF.Round(a),
         UnaryOpKind.Silu => a * (1f / (1f + MathF.Exp(-a))),
         _ => throw new ArgumentOutOfRangeException(nameof(op), op, null),
     };

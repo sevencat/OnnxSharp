@@ -17,6 +17,7 @@ internal static class ShapeOps
     public static void Register()
     {
         LayerRegistry.Register("Reshape", p => new ReshapeLayer(p));
+        LayerRegistry.Register("Flatten", p => new FlattenLayer(p));
         LayerRegistry.Register("Concat", p => new ConcatLayer(p));
         LayerRegistry.Register("Split", p => new SplitLayer(p));
         LayerRegistry.Register("Transpose", p => new TransposeLayer(p));
@@ -113,6 +114,50 @@ internal static class ShapeOps
             if (result.Total() != input.Total())
                 throw new OnnxSharpException($"Reshape '{Name}': element count changed {input} to {result}");
             return result;
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+            => OpUtil.CopyBytes(inputs[0], 0, outputs[0], 0, inputs[0].Count);
+    }
+
+    // ---------------- Flatten ----------------
+
+    /// <summary>
+    /// 把 [0, axis) 折成第 0 维、[axis, rank) 折成第 1 维。纯布局变换，数据不动。
+    /// yolov10 / RT-DETR 的检测头前面都会来一层。
+    /// </summary>
+    private sealed class FlattenLayer : Layer
+    {
+        private readonly long _axis;
+
+        public FlattenLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _axis = parameters.GetInt("axis", 1);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            var input = inShapes[0];
+            int axis = OpUtil.NormalizeAxis(_axis, input.Rank, $"Flatten '{Name}'");
+
+            long outer = 1;
+            for (int i = 0; i < axis; i++)
+                outer *= input.Dims[i];
+
+            long inner = 1;
+            for (int i = axis; i < input.Rank; i++)
+                inner *= input.Dims[i];
+
+            outShapes.Add(new TensorShape(new[] { (int)outer, (int)inner }));
         }
 
         public override void Forward(
