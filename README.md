@@ -14,6 +14,8 @@
 
 实测与本机 OpenCV 5 dnn 相差 1.15~1.30×（见 [性能](#性能)）。
 
+这个引擎能写出来，主要是站在 **SimdYolo** 和 **OpenCV 5 `dnn`** 的肩膀上：算子语义、预处理约定、性能基线和验证方法都大量借鉴了它们。感谢两个项目的作者与贡献者，具体借鉴点见 [致谢](#致谢)。
+
 ### 特性
 
 | 项 | 说明 |
@@ -25,6 +27,7 @@
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
 | 线程 | 默认 `Environment.ProcessorCount`，可用环境变量 `ONNXSHARP_THREADS` 覆盖 |
 | 视觉门面 | `OnnxSharp.Vision`：letterbox / stretch 预处理、YOLO 解码 + NMS、RF-DETR 解码，返回**原图坐标**的框 |
+| 像素输入 | RGB 或 BGR（`bgr` 开关）+ 任意行跨度（`rowStride`，字节）—— OpenCV `Mat`、相机 SDK 的对齐缓冲可直接喂，不必先压成紧凑数组 |
 | 工具 | `OnnxSharp.Cli`：结构 dump、跑一次、计时、逐算子 profile、直接图片检测 |
 | 图像解码 | **不在库里**（避免引入图像库）；CLI 自带最小 PPM/BMP 解码，仅作演示 |
 
@@ -34,7 +37,7 @@
 
 ```powershell
 dotnet build OnnxSharp.slnx -c Release
-dotnet run --project tests/OnnxSharp.Tests -c Release    # 49 个用例，全通过退出码 0
+dotnet run --project tests/OnnxSharp.Tests -c Release    # 51 个用例，全通过退出码 0
 ```
 
 准备一个 ONNX 模型（例如 `yolo11n.onnx`）和一张图，用 CLI 直接检测：
@@ -87,7 +90,6 @@ Tensor dets = net.Forward("dets");
 ```csharp
 using OnnxSharp.Vision;
 
-// pixels：紧凑 RGB24（长度 = width * height * 3）；OpenCV 的 Mat 传 bgr: true
 // LoadRgb24 是调用方自己的解码代码 —— 库不内置 JPEG/PNG 解码
 byte[] pixels = LoadRgb24("photo.jpg", out int width, out int height);
 
@@ -98,9 +100,17 @@ var detector = new YoloDetector("yolo11n.onnx", new DetectorOptions
     MaxDetections = 300,     // 默认 300
 });
 
+// ① 紧凑 RGB24（行跨度 = width * 3）
 foreach (var d in detector.Detect(pixels, width, height))
     Console.WriteLine($"{d.ClassId} {d.Score:F3} [{d.X:F1},{d.Y:F1},{d.Width:F1}x{d.Height:F1}]");
+
+// ② BGR + 行尾填充：OpenCV 的 Mat、相机 SDK 的缓冲都长这样
+//    matData = mat.data 的 byte 视图（Marshal.Copy / unsafe 指针），stride = (int)mat.Step()
+foreach (var d in detector.Detect(matData, width, height, bgr: true, rowStride: stride))
+    Console.WriteLine(d);
 ```
+
+**像素输入约定**：`bgr` 决定 R/B 顺序（OpenCV、多数相机/采集卡是 BGR）；`rowStride` 是**每行字节数**（含行尾对齐填充），0 表示 `width * 3`。两个参数在 `Detect` 和只做预处理的 `Preprocess` 上都可传，内部只按跨度取像素，不会复制或压紧整幅图。
 
 内部完成：letterbox（等比缩放 + 填 114 + 双线性）→ 推理 → 逐锚点 argmax → 阈值 → 同类 NMS → 反 letterbox → 裁剪到图内。框坐标原点在原图左上角，单位像素。
 
@@ -134,12 +144,15 @@ foreach (var d in detector.Detect(pixels, width, height))
 
 > RF-DETR 用的是逐类 sigmoid 而不是 softmax，一个查询可以同时在多个类别上过阈值 —— 门面已按官方 `decode_detections` 的语义实现，不需要自己做 NMS。
 
+RF-DETR 门面的 `Detect` / `Preprocess` 与 YOLO 一样接受 `bgr` 与 `rowStride`。
+
 ### 库用法 4：分步预处理 / 后处理
 
 需要在两个阶段之间自己插计时或缓存时，可以只调一半：
 
 ```csharp
 // yolo / rfdetr 即上面两个检测器实例
+// 预处理同样接受像素约定：Preprocess(pixels, w, h, bgr: true, rowStride: stride)
 // YOLO：letterbox 参数自己拿着，解码时还要用
 var (tensor, transform) = yolo.Preprocess(pixels, width, height);
 yolo.Net.SetInput(yolo.InputName, tensor);
@@ -270,7 +283,7 @@ src/OnnxSharp/
   Vision/    可选门面：ImagePreprocessor / YoloDetector / YoloDecoder
              / RfDetrDetector / RfDetrDecoder / Detection（可整体删除，不影响推理）
 tools/OnnxSharp.Cli/   info / run / bench / profile / detect / 微基准 + 最小 PPM/BMP 解码
-tests/OnnxSharp.Tests/ 零依赖测试运行器（49 用例），直接 dotnet run
+tests/OnnxSharp.Tests/ 零依赖测试运行器（51 用例），直接 dotnet run
 bench/                四引擎 × 6 模型的对照脚本与产物
 ```
 
@@ -283,6 +296,25 @@ bench/                四引擎 × 6 模型的对照脚本与产物
 | [bench.md](bench.md) | 性能唯一事实源：口径、复现命令、每轮结果 |
 | [upstream.lock](upstream.lock) | 上游 OpenCV 5 dnn 跟踪基线（机器可读） |
 
+### 致谢
+
+这个引擎不是凭空发明的，更多是把两个优秀项目的经验重新实现了一遍。**感谢 SimdYolo 与 [OpenCV](https://opencv.org/) 5 `dnn` 的作者与贡献者**，本项目的很多「正确答案」都来自它们：
+
+**SimdYolo —— 纯 C# 路线的可行性证明**
+
+- 「纯托管 + SIMD 也能跑好 YOLO」这个前提，本身就是它验证过的结论，本项目只是把范围扩展到通用 ONNX 图。
+- letterbox 的**半像素中心**采样公式 `(dst + 0.5) * src / dst - 0.5`、填边值 114、以及「用实际取整后的 scale 而不是理论比例还原坐标」的取舍，全部沿用它的约定 —— 否则同一张图在不同引擎里会有 1~2 像素的系统偏移。
+- 解码与 NMS 的组织方式（逐锚点取 max、同类别抑制、按分数排序后截断）也参考了它的实现。
+- 验证方法同样来自它：先把检测框与官方实现对齐到亚像素，再谈优化。本项目的 YOLO 结果与它逐框一致（最大偏差 0.005 px）。
+
+**OpenCV 5 `dnn` —— 语义与性能的对照基准**
+
+- 算子边界行为的**事实标准**：`Resize` / `GridSample` / `Pad` / `Slice` 的插值方式与越界处理、`INTER_LINEAR` 的半像素对齐、`Conv` 的 auto_pad 语义，都按它的行为对齐；有疑问时以它的输出为准。
+- ONNX Importer 的组织方式（算子注册、常量折叠时机、形状推断的位置）提供了可参照的骨架。
+- **性能基线**：每一轮优化都以「不劣于本机 OpenCV 5 dnn」为目标，`upstream.lock` 里锁定的就是这条对照线；`bench/` 下的对照脚本与 [bench.md](bench.md) 的结论都以它为参照。
+
+> 说明：OnnxSharp 是独立实现，**不包含**上述项目的任何源码；文中所有对齐数据与性能数字都来自对它们公开接口的实测。
+
 ---
 
 ## English
@@ -294,6 +326,8 @@ bench/                四引擎 × 6 模型的对照脚本与产物
 `OnnxSharp` is a from-scratch ONNX inference engine in pure C# — **CPU only, FP32, zero third-party dependencies**. It runs ONNX exports of YOLO11 / YOLOv8 / RF-DETR, and ships an optional vision facade that turns an image into detections in source-image coordinates.
 
 Semantics follow OpenCV 5 `dnn` and SimdYolo; the engine is within **1.15–1.30×** of OpenCV on the reference machine (see [Performance](#performance)).
+
+This engine stands on the shoulders of **SimdYolo** and **OpenCV 5 `dnn`**: operator semantics, preprocessing conventions, performance baselines and the validation methodology are heavily borrowed from both. Thanks to their authors and contributors — details in [Acknowledgements](#acknowledgements).
 
 ### Features
 
@@ -314,7 +348,7 @@ Requires .NET 8 or .NET 10 SDK.
 
 ```powershell
 dotnet build OnnxSharp.slnx -c Release
-dotnet run --project tests/OnnxSharp.Tests -c Release     # 49 cases, exit code 0 on success
+dotnet run --project tests/OnnxSharp.Tests -c Release     # 51 cases, exit code 0 on success
 ```
 
 Detect objects in one command:
@@ -350,7 +384,6 @@ List<Tensor> all = net.ForwardAll();             // multi-output models (RF-DETR
 ```csharp
 using OnnxSharp.Vision;
 
-// pixels: packed RGB24 (length = width * height * 3); pass bgr: true for OpenCV Mats
 // LoadRgb24 is your own decoder — the library does not decode JPEG/PNG
 byte[] pixels = LoadRgb24("photo.jpg", out int width, out int height);
 
@@ -361,9 +394,17 @@ var detector = new YoloDetector("yolo11n.onnx", new DetectorOptions
     MaxDetections = 300,
 });
 
+// (1) packed RGB24, row stride == width * 3
 foreach (var d in detector.Detect(pixels, width, height))
     Console.WriteLine($"{d.ClassId} {d.Score:F3} [{d.X:F1},{d.Y:F1},{d.Width:F1}x{d.Height:F1}]");
+
+// (2) BGR with row padding: OpenCV Mat, camera SDK buffers
+//     matData = byte view of mat.data (Marshal.Copy / unsafe pointer), stride = (int)mat.Step()
+foreach (var d in detector.Detect(matData, width, height, bgr: true, rowStride: stride))
+    Console.WriteLine(d);
 ```
+
+**Pixel input contract**: `bgr` swaps R/B (OpenCV and most camera/capture SDKs are BGR); `rowStride` is the **byte count per row** (including alignment padding), `0` means `width * 3`. Both flags exist on `Detect` and on the preprocess-only `Preprocess`, and pixels are read in place — the image is never copied or repacked.
 
 The facade does letterbox (keep aspect ratio, pad 114, bilinear) → forward → per-anchor argmax → threshold → per-class NMS → un-letterbox → clip. Boxes are in source pixels.
 
@@ -391,10 +432,13 @@ Differences from YOLO (all handled internally):
 | Decode | argmax → threshold → NMS | per-class **sigmoid** → drop background → `Q×C` top-k → threshold |
 | Box mapping | invert letterbox | multiply by source width/height |
 
+Both detectors accept the same pixel contract (`bgr` / `rowStride`) on `Detect` and `Preprocess`.
+
 **Stage-by-stage**
 
 ```csharp
 // yolo / rfdetr are the detector instances from above
+// preprocessing takes the same pixel contract: Preprocess(pixels, w, h, bgr: true, rowStride: stride)
 // YOLO: keep the letterbox transform for decoding
 var (tensor, transform) = yolo.Preprocess(pixels, width, height);
 yolo.Net.SetInput(yolo.InputName, tensor);
@@ -463,7 +507,7 @@ Forward pass only, batch=1, FP32, 16 threads, median of 40 frames (Ryzen 7 8845H
 src/OnnxSharp/   Core (graph/runtime) · Onnx (protobuf reader) · Tensors · Ops · Kernels
                  Threading · Vision (optional facade: image in, boxes out)
 tools/OnnxSharp.Cli/   info / run / bench / profile / detect / micro-benchmarks
-tests/OnnxSharp.Tests/ zero-dependency test runner (49 cases)
+tests/OnnxSharp.Tests/ zero-dependency test runner (51 cases)
 bench/                 four-engine × six-model comparison scripts
 ```
 
@@ -475,3 +519,22 @@ bench/                 four-engine × six-model comparison scripts
 | [misc.md](misc.md) | Decision log and pitfalls |
 | [bench.md](bench.md) | Performance source of truth: methodology, commands, results |
 | [upstream.lock](upstream.lock) | Pinned OpenCV 5 dnn baseline |
+
+### Acknowledgements
+
+This engine was not invented from scratch — it re-implements, in a different scope, what two excellent projects had already worked out. **Thanks to the authors and contributors of SimdYolo and [OpenCV](https://opencv.org/) 5 `dnn`**; many of the "right answers" here came from them:
+
+**SimdYolo — proof that the pure-C# path works**
+
+- That managed code plus SIMD is fast enough for YOLO was its conclusion first; this project only widens the scope to general ONNX graphs.
+- The letterbox **half-pixel-centre** sampling formula `(dst + 0.5) * src / dst - 0.5`, the pad value 114, and the decision to un-map boxes with the *actually rounded* scale rather than the theoretical ratio all follow its conventions — without them the same image would shift by 1–2 px between engines.
+- The shape of decode + NMS (per-anchor max, same-class suppression, sort and truncate) was modelled on its implementation.
+- So was the validation method: align boxes with the reference to sub-pixel precision first, optimise later. YOLO detections here match it box-for-box (max 0.005 px).
+
+**OpenCV 5 `dnn` — the reference for semantics and speed**
+
+- The **de-facto standard** for operator edge cases: bilinear behaviour and out-of-range handling in `Resize` / `GridSample` / `Pad` / `Slice`, the `INTER_LINEAR` half-pixel convention, `Conv` auto_pad semantics. When in doubt, its output wins.
+- Its ONNX importer layout (operator registration, constant-folding timing, where shape inference sits) provided a skeleton to follow.
+- **The performance baseline**: every optimisation round targeted "no slower than OpenCV 5 dnn on this machine", which is exactly what `upstream.lock` pins down. The scripts under `bench/` and the results in [bench.md](bench.md) are measured against it.
+
+> OnnxSharp is an independent implementation and contains **no** source code from those projects; every alignment figure and timing above comes from exercising their public interfaces.

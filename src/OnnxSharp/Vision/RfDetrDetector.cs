@@ -86,20 +86,36 @@ public sealed class RfDetrDetector
     /// <summary>
     /// 只做预处理：拉伸到模型尺寸 + 归一化，返回 <c>[1, 3, H, W]</c> 的输入张量（需要自己推理时用）。
     /// </summary>
-    public Tensor Preprocess(ReadOnlySpan<byte> pixels, int width, int height, bool bgr = false)
+    /// <param name="pixels">8 位三通道像素，每行 <paramref name="rowStride"/> 字节。</param>
+    /// <param name="width">图像宽，像素。</param>
+    /// <param name="height">图像高，像素。</param>
+    /// <param name="bgr">true 表示像素是 BGR 顺序（OpenCV 默认），false 为 RGB。</param>
+    /// <param name="rowStride">源图每行字节数（含行尾填充）；0 表示 <c>width * 3</c>。</param>
+    public Tensor Preprocess(
+        ReadOnlySpan<byte> pixels,
+        int width,
+        int height,
+        bool bgr = false,
+        int rowStride = 0)
         => ImagePreprocessor.Stretch(
-            pixels, width, height, TargetWidth, TargetHeight, bgr, 0, Options.Normalization);
+            pixels, width, height, TargetWidth, TargetHeight, bgr, rowStride, Options.Normalization);
 
     /// <summary>
     /// 对一张已解码的图像做检测，返回<b>原图坐标系</b>下的检测框（按分数降序，已裁剪到图内）。
     /// </summary>
-    /// <param name="pixels">紧凑排布的 8 位三通道像素。</param>
+    /// <param name="pixels">8 位三通道像素，每行 <paramref name="rowStride"/> 字节。</param>
     /// <param name="width">图像宽，像素。</param>
     /// <param name="height">图像高，像素。</param>
     /// <param name="bgr">true 表示像素是 BGR 顺序（OpenCV 默认），false 为 RGB。</param>
-    public IReadOnlyList<Detection> Detect(ReadOnlySpan<byte> pixels, int width, int height, bool bgr = false)
+    /// <param name="rowStride">源图每行字节数（含行尾填充）；0 表示 <c>width * 3</c>。</param>
+    public IReadOnlyList<Detection> Detect(
+        ReadOnlySpan<byte> pixels,
+        int width,
+        int height,
+        bool bgr = false,
+        int rowStride = 0)
     {
-        var input = Preprocess(pixels, width, height, bgr);
+        var input = Preprocess(pixels, width, height, bgr, rowStride);
         return Detect(input, width, height);
     }
 

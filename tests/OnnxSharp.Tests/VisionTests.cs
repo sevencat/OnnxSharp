@@ -15,6 +15,7 @@ internal static class VisionTests
         yield return new("vision: letterbox fills padding with 114", LetterboxPadValue);
         yield return new("vision: letterbox downsample averages the block", LetterboxAveragesBlock);
         yield return new("vision: letterbox honours bgr order", LetterboxBgr);
+        yield return new("vision: letterbox honours row stride", LetterboxHonoursRowStride);
         yield return new("vision: iou of identical and disjoint boxes", IouBasics);
         yield return new("vision: nms keeps the best of overlapping same class", NmsSuppressesSameClass);
         yield return new("vision: nms keeps overlapping different classes", NmsKeepsDifferentClasses);
@@ -25,6 +26,7 @@ internal static class VisionTests
         yield return new("vision: decode clips boxes to image bounds", DecodeClips);
         yield return new("vision: decode rejects ambiguous layout", DecodeRejectsAmbiguous);
         yield return new("vision: rfdetr stretch fills the canvas without padding", StretchFillsCanvas);
+        yield return new("vision: rfdetr stretch honours row stride", StretchHonoursRowStride);
         yield return new("vision: rfdetr decode maps normalized cxcywh to pixels", RfDetrMapsToPixels);
         yield return new("vision: rfdetr decode drops the background slot", RfDetrDropsBackground);
         yield return new("vision: rfdetr decode keeps several classes of one query", RfDetrKeepsSeveralClasses);
@@ -107,6 +109,41 @@ internal static class VisionTests
         Near(source[2 * plane], 30 / 255f, "rgb.b");
         Near(swapped[0], 30 / 255f, "bgr.r");
         Near(swapped[2 * plane], 10 / 255f, "bgr.b");
+    }
+
+    /// <summary>
+    /// 带行尾填充的 BGR 缓冲区（OpenCV <c>Mat</c> 的常见形态）必须与紧凑 RGB 缓冲区得到逐元素相同的张量。
+    /// 填充字节故意填成 0xAA：一旦 stride 被忽略，多读出来的值会立刻暴露。
+    /// </summary>
+    private static void LetterboxHonoursRowStride()
+    {
+        const int width = 4;
+        const int height = 2;
+        const int padding = 5;
+
+        var (packed, padded, stride) = BuildPaddedBgr(width, height, padding);
+        var (expected, _) = ImagePreprocessor.Letterbox(packed, width, height, width, height);
+        var (actual, _) = ImagePreprocessor.Letterbox(
+            padded, width, height, width, height, bgr: true, rowStride: stride);
+
+        RequireSameValues(expected, actual, "letterbox with row stride");
+    }
+
+    /// <summary>拉伸路径同样要按行跨度取像素。</summary>
+    private static void StretchHonoursRowStride()
+    {
+        const int width = 4;
+        const int height = 2;
+        const int padding = 7;
+
+        var (packed, padded, stride) = BuildPaddedBgr(width, height, padding);
+        var expected = ImagePreprocessor.Stretch(
+            packed, width, height, 8, 4, normalization: ChannelNormalization.ImageNet);
+        var actual = ImagePreprocessor.Stretch(
+            padded, width, height, 8, 4, bgr: true, rowStride: stride,
+            normalization: ChannelNormalization.ImageNet);
+
+        RequireSameValues(expected, actual, "stretch with row stride");
     }
 
     // ---------------- iou / nms ----------------
@@ -429,6 +466,51 @@ internal static class VisionTests
         data[start + 1] = cy;
         data[start + 2] = w;
         data[start + 3] = h;
+    }
+
+    /// <summary>造一对等价缓冲区：紧凑 RGB，以及每行带 <paramref name="padding"/> 字节填充的 BGR。</summary>
+    private static (byte[] Packed, byte[] Padded, int Stride) BuildPaddedBgr(
+        int width, int height, int padding)
+    {
+        var packed = new byte[width * height * 3];
+        for (int i = 0; i < width * height; i++)
+        {
+            packed[i * 3] = (byte)(10 + i);       // R
+            packed[i * 3 + 1] = (byte)(100 + i);  // G
+            packed[i * 3 + 2] = (byte)(200 - i);  // B
+        }
+
+        int stride = width * 3 + padding;
+        var padded = new byte[stride * height];
+        Array.Fill(padded, (byte)0xAA);           // 行尾填充成垃圾值
+
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int source = (y * width + x) * 3;
+                int target = y * stride + x * 3;
+                padded[target] = packed[source + 2];      // BGR：B 在前
+                padded[target + 1] = packed[source + 1];
+                padded[target + 2] = packed[source];
+            }
+        }
+
+        return (packed, padded, stride);
+    }
+
+    private static void RequireSameValues(Tensor expected, Tensor actual, string what)
+    {
+        var left = expected.AsSpan<float>();
+        var right = actual.AsSpan<float>();
+        Require(left.Length == right.Length, $"{what}: length {left.Length} vs {right.Length}");
+
+        for (int i = 0; i < left.Length; i++)
+        {
+            if (MathF.Abs(left[i] - right[i]) > 1e-6f)
+                throw new InvalidOperationException(
+                    $"{what}: element {i} expected {left[i]}, got {right[i]}");
+        }
     }
 
     private static byte[] White(int width, int height)

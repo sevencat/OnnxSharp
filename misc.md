@@ -645,6 +645,12 @@ Tile TopK Transpose Unsqueeze Where
     双方各 **41 框**，类别完全一致，分数差 < 1e-4，坐标最大偏差 **0.00 px**。
     另一条旁证：同图 yolo11n 给出的 person 框（1347.3, 671.9）与 rfdetr（1349.7, 672.1）几乎重合，
     说明两条完全不同的前/后处理链路没有引入共同偏移。
+58. **像素输入的 `bgr` / `rowStride` 必须一路透传到门面**。`ImagePreprocessor` 早就支持这两个参数，但
+    `YoloDetector`/`RfDetrDetector` 的 `Preprocess`/`Detect` 一开始只暴露了 `bgr`，`Stretch` 的 stride
+    还被写死成 0 —— 结果「OpenCV `Mat` 直接喂」在门面层是断的。现在两个门面都按
+    `(pixels, width, height, bgr = false, rowStride = 0)` 透传，`rowStride` 以**字节**计、0 表示 `width * 3`。
+    验证：persons.jpg 1568×1068，紧凑 RGB 与「BGR + 每行 64 字节填充」两条路径的 yolo11n 结果
+    24/24 框、坐标差 **0.000000 px**；rfdetr 41/41 框、top1 分数一致。
 
 ---
 

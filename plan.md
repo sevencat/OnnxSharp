@@ -71,7 +71,7 @@ OpenCV 5.2 的 `modules/dnn` 内含两套引擎：
 | **WASM** | **不做**。不写 `browser-wasm` 目标，不为 4GB 线性内存做特殊设计。 |
 | **IL2CPP / Unity** | **不支持，且不在路线图**。不提供 `netstandard2.1` 目标，不为 IL2CPP 做裁剪/反射限制改造。宿主必须是 **.NET 8/10 运行时**（桌面 / 服务端）。 |
 | 图像编解码 | 交给调用方。`tools/OnnxSharp.Cli` 内置最小 PPM(P6)/BMP 解码，仅用于 CLI 演示与跨引擎对照，不进产品库。 |
-| 图像预处理 / 检测后处理 | **`src/OnnxSharp/Vision/` 提供可选门面**：`ImagePreprocessor`（`Letterbox` 等比填边 / `Stretch` 直接拉伸）+ `YoloDetector`/`YoloDecoder` + `RfDetrDetector`/`RfDetrDecoder`。一张图进去、原图坐标的 `Detection` 出来。它只依赖引擎的 `Net`，不参与图的执行，删掉不影响推理核心。 |
+| 图像预处理 / 检测后处理 | **`src/OnnxSharp/Vision/` 提供可选门面**：`ImagePreprocessor`（`Letterbox` 等比填边 / `Stretch` 直接拉伸）+ `YoloDetector`/`YoloDecoder` + `RfDetrDetector`/`RfDetrDecoder`。一张图进去、原图坐标的 `Detection` 出来。像素输入统一按 `(pixels, width, height, bgr, rowStride)` 约定：RGB/BGR 可切换，行跨度以字节计（`0` = `width * 3`），OpenCV `Mat`/相机缓冲可直接喂。它只依赖引擎的 `Net`，不参与图的执行，删掉不影响推理核心。 |
 
 ### 1.4 非目标（首版明确不做）
 
