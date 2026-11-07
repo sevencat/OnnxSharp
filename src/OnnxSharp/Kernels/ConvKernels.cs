@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 using OnnxSharp.Threading;
@@ -17,6 +19,9 @@ internal static class ConvKernels
 {
     /// <summary>GEMM 微内核的列向量宽度（AVX2 下 8 个 float）。列块宽度低于它只能走标量内核。</summary>
     private const int ColumnVectorWidth = 8;
+
+    /// <summary>取 8 个 float 里的偶数道（stride 2 的 im2col 抽头）。</summary>
+    private static readonly Vector256<int> EvenLanes = Vector256.Create(0, 2, 4, 6, 0, 0, 0, 0);
 
     /// <summary>
     /// im2col + GEMM：把卷积化成
@@ -331,10 +336,48 @@ internal static class ConvKernels
                             }
                             else
                             {
-                                for (int i = 0; i < colCount; i++)
+                                // 逐元素算边界太贵（一次比较 + 一次分支预测失败就是好几拍），
+                                // 先把「整段都在界内」的 [lo, hi] 求出来，循环里只剩 load + store，
+                                // 两端各清一次零。
+                                int lo = x0 >= 0 ? 0 : Math.Min(colCount, (-x0 + strideW - 1) / strideW);
+                                int hi = colCount - 1;
+
+                                if (x0 + hi * strideW > inW - 1)
+                                    hi = Math.Min(hi, (inW - 1 - x0) / strideW);
+
+                                if (hi < lo)
                                 {
-                                    int x = x0 + i * strideW;
-                                    row[i] = (uint)x < (uint)inW ? source[x] : 0f;
+                                    new Span<float>(row, colCount).Clear();
+                                    continue;
+                                }
+
+                                if (lo > 0)
+                                    new Span<float>(row, lo).Clear();
+                                if (hi + 1 < colCount)
+                                    new Span<float>(row + hi + 1, colCount - hi - 1).Clear();
+
+                                if (strideW == 2 && Avx2.IsSupported && hi > lo)
+                                {
+                                    // stride 2：读 16 个连续 float，取偶数道就是 8 个输出像素。
+                                    // 最后一条向量会多读 1 个 float，所以起点上限卡到不会越出本行。
+                                    int vecHi = Math.Min(hi, (inW - 2 * ColumnVectorWidth - x0) / 2);
+                                    int i = lo;
+
+                                    for (; i + ColumnVectorWidth <= hi + 1 && i <= vecHi; i += ColumnVectorWidth)
+                                    {
+                                        float* p = source + x0 + i * 2;
+                                        var e0 = Avx2.PermuteVar8x32(Avx.LoadVector256(p), EvenLanes);
+                                        var e1 = Avx2.PermuteVar8x32(Avx.LoadVector256(p + 8), EvenLanes);
+                                        Avx.Store(row + i, Avx2.Permute2x128(e0, e1, 0x20));
+                                    }
+
+                                    for (; i <= hi; i++)
+                                        row[i] = source[x0 + i * 2];
+                                }
+                                else
+                                {
+                                    for (int i = lo; i <= hi; i++)
+                                        row[i] = source[x0 + i * strideW];
                                 }
                             }
                         }
