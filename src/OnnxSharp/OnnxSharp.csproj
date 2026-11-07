@@ -10,6 +10,10 @@
     <AssemblyName>OnnxSharp</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageId>Sevencat.OnnxSharp</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>Sevencat</Authors>
   </PropertyGroup>
 
   <ItemGroup>
