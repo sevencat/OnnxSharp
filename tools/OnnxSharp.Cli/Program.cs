@@ -1,8 +1,12 @@
-﻿using System.Runtime.Intrinsics;
+﻿using System.Diagnostics;
+using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using System.Text;
+using System.Text.Json;
 using OnnxSharp.Core;
 using OnnxSharp.Onnx;
 using OnnxSharp.Tensors;
+using OnnxSharp.Vision;
 
 // 子命令：
 //   (无参数) / smoke         M0 冒烟：手工建图 Add + Relu，验证引擎链路
@@ -45,8 +49,12 @@ static int Usage()
     Console.WriteLine("                                      # 计时迭代");
     Console.WriteLine("  OnnxSharp.Cli profile <model.onnx> --input <file.bin> [--iters N] [--top N]");
     Console.WriteLine("                                      # 逐算子耗时排行（找热点）");
-    Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> --input <file.bin> [--conf 0.25] [--iou 0.45]");
-    Console.WriteLine("                                      # 调用示例：YOLO decode + NMS（不写进产品库）");
+    Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> <image.ppm|bmp> [--conf 0.25] [--iou 0.45]");
+    Console.WriteLine("                     [--labels names.txt] [--json out.json] [--max-det 300]");
+    Console.WriteLine("                     [--classes N] [--layout auto|cf|cl|e2e] [--iters N]");
+    Console.WriteLine("                                      # 内建 letterbox + decode + NMS，直接返回原图坐标的框");
+    Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> --input <file.bin> [--shape 1,3,640,640] [...同上]");
+    Console.WriteLine("                                      # 输入已预处理好的 F32，跳过 letterbox");
     Console.WriteLine("  OnnxSharp.Cli gemmbench [--iters N] [--shape m,k,n]");
     Console.WriteLine("                                      # GEMM 微内核吞吐（GFLOPS），调优用");
     return 2;
@@ -736,110 +744,194 @@ static int Profile(string[] args)
     return 0;
 }
 
-// ---------------- YOLO decode + NMS（调用示例，不属于引擎） ----------------
+// ---------------- YOLO 检测：图进、框出（letterbox / decode / NMS 都在 OnnxSharp.Vision） ----------------
 
 static int Detect(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.Error.WriteLine("usage: detect <yolo.onnx> --input <file.bin> [--conf 0.25] [--iou 0.45]");
+        Console.Error.WriteLine("usage: detect <yolo.onnx> <image.ppm|bmp> [--conf 0.25] [--iou 0.45] [--labels names.txt] [--json out.json]");
+        Console.Error.WriteLine("       detect <yolo.onnx> --input <file.bin> [--shape 1,3,640,640]");
         return 2;
     }
 
-    string path = args[1];
+    string modelPath = args[1];
     var options = ParseOptions(args, 2);
-    float conf = options.GetFloat("--conf", 0.25f);
-    float iou = options.GetFloat("--iou", 0.45f);
 
-    var net = Net.ReadModel(path);
-    BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
-
-    var output = net.Forward();
-    var span = output.AsSpan<float>();
-
-    // YOLOv8/v11: output0 = [1, 4 + numClasses, numAnchors]（无 objectness，类别分数已 sigmoid）
-    if (output.Shape.Rank != 3 || output.Shape[1] < 5)
-        throw new OnnxSharpException($"detect: unexpected output shape {output.Shape}");
-
-    int attributes = output.Shape[1];
-    int anchors = output.Shape[2];
-    int classes = attributes - 4;
-
-    var candidates = new List<Detection>();
-
-    for (int a = 0; a < anchors; a++)
+    int squareSize = options.GetInt("--size", 0);
+    var detectorOptions = new DetectorOptions
     {
-        int best = -1;
-        float bestScore = conf;
+        Confidence = options.GetFloat("--conf", 0.25f),
+        IouThreshold = options.GetFloat("--iou", 0.45f),
+        MaxDetections = options.GetInt("--max-det", 300),
+        ClassCount = options.GetInt("--classes", 0),
+        ClassAgnosticNms = options.Has("--class-agnostic"),
+        Layout = ParseOutputLayout(options.GetString("--layout")),
+        // 只对动态形状的模型生效；静态形状由模型自己决定。
+        TargetWidth = squareSize,
+        TargetHeight = squareSize,
+    };
 
-        for (int c = 0; c < classes; c++)
+    var detector = new YoloDetector(modelPath, detectorOptions);
+
+    // 默认只跑一次：这是「第一帧」的真实延迟（含 JIT 与首次分配）。
+    // 要稳态吞吐就加 --iters 40 —— 分层编译约 30 次调用后才升到 tier-1，少于此数会偏高 1.5~2 倍。
+    int iterations = Math.Max(1, options.GetInt("--iters", 1));
+
+    string? imagePath = args.Length > 2 && !args[2].StartsWith("--", StringComparison.Ordinal) ? args[2] : null;
+
+    ImageData? image = null;
+    Letterbox transform = default;
+    Tensor input = null!;
+    double preprocessMilliseconds = double.MaxValue;
+
+    if (imagePath is not null)
+    {
+        image = ImageFile.Load(imagePath);
+
+        // 预处理同样取多次的最小值：第一次含 JIT 与数组首次分配，能差 3~5 倍。
+        for (int iteration = 0; iteration < iterations; iteration++)
         {
-            float score = span[(c + 4) * anchors + a];
-            if (score > bestScore)
-            {
-                bestScore = score;
-                best = c;
-            }
+            var preprocessing = Stopwatch.StartNew();
+            (input, transform) = detector.Preprocess(image.Value.Pixels, image.Value.Width, image.Value.Height);
+            preprocessMilliseconds = Math.Min(preprocessMilliseconds, preprocessing.Elapsed.TotalMilliseconds);
+        }
+    }
+    else
+    {
+        if (options.Inputs.Count == 0)
+        {
+            Console.Error.WriteLine("detect: need either an image path or --input <file.bin>");
+            return 2;
         }
 
-        if (best < 0)
-            continue;
+        var inputs = BindInputs(detector.Net, options.Inputs, ParseShape(options.GetString("--shape")));
+        input = inputs[0];
 
-        float cx = span[a];
-        float cy = span[anchors + a];
-        float w = span[2 * anchors + a];
-        float h = span[3 * anchors + a];
-
-        candidates.Add(new Detection
-        {
-            ClassId = best,
-            Score = bestScore,
-            X = cx - w * 0.5f,
-            Y = cy - h * 0.5f,
-            W = w,
-            H = h,
-        });
+        // 已经是 letterbox 之后的张量，框就落在模型坐标系里 —— 恒等变换即可。
+        var inputShape = input.Shape;
+        transform = new Letterbox(inputShape[3], inputShape[2], inputShape[3], inputShape[2], 1, 1, 0, 0);
     }
 
-    var kept = Nms(candidates, iou);
+    // 多次迭代只用于取更稳的耗时（第一次含 JIT 与首次分配）。
+    // 前向与后处理分开计时：两者差一个数量级时，能立刻看出是模型慢还是后处理慢。
+    IReadOnlyList<Detection> detections = Array.Empty<Detection>();
+    double forwardMilliseconds = double.MaxValue;
+    double decodeMilliseconds = double.MaxValue;
+    detector.Net.SetInput(detector.InputName, input);
 
-    Console.WriteLine($"model     : {path}");
-    Console.WriteLine($"anchors   : {anchors}    classes: {classes}    candidates: {candidates.Count}    kept: {kept.Count}");
-
-    foreach (var detection in kept.Take(20))
+    for (int iteration = 0; iteration < iterations; iteration++)
     {
-        Console.WriteLine($"  class {detection.ClassId,3}  score {detection.Score:F4}  " +
-                          $"box [{detection.X:F1}, {detection.Y:F1}, {detection.W:F1}, {detection.H:F1}]");
+        var forward = Stopwatch.StartNew();
+        var output = detector.Net.Forward();
+        forwardMilliseconds = Math.Min(forwardMilliseconds, forward.Elapsed.TotalMilliseconds);
+
+        var decode = Stopwatch.StartNew();
+        detections = detector.Decode(output, transform);
+        decodeMilliseconds = Math.Min(decodeMilliseconds, decode.Elapsed.TotalMilliseconds);
+    }
+
+    var labels = LoadLabels(options.GetString("--labels"));
+
+    Console.WriteLine($"model      : {modelPath}");
+    if (image is { } source)
+        Console.WriteLine($"image      : {imagePath} {source.Width}x{source.Height}");
+    Console.WriteLine($"input      : [1, 3, {detector.TargetHeight}, {detector.TargetWidth}]  ({transform})");
+    if (image is not null)
+        Console.WriteLine($"preprocess : {preprocessMilliseconds:F2} ms");
+    string iterationHint = iterations < 10 ? "; 稳态吞吐加 --iters 40" : string.Empty;
+    Console.WriteLine($"forward    : {forwardMilliseconds:F2} ms  (min of {iterations}{iterationHint})");
+    Console.WriteLine($"decode     : {decodeMilliseconds:F2} ms  (min of {iterations})");
+    Console.WriteLine($"detections : {detections.Count}");
+
+    int index = 0;
+    foreach (var detection in detections.Take(30))
+    {
+        string name = LabelOf(labels, detection.ClassId);
+        Console.WriteLine($"  #{index++,-3} {name,-16} {detection.Score:F4}  " +
+                          $"[{detection.X:F1}, {detection.Y:F1}, {detection.Width:F1} x {detection.Height:F1}]");
+    }
+
+    if (options.GetString("--json") is { } jsonPath)
+    {
+        WriteDetectJson(jsonPath, modelPath, imagePath, image, transform, detector,
+            preprocessMilliseconds, forwardMilliseconds, detections, labels);
+        Console.WriteLine($"json       : {jsonPath}");
     }
 
     return 0;
 }
 
-static List<Detection> Nms(List<Detection> candidates, float iouThreshold)
+static OutputLayout ParseOutputLayout(string? text) => text?.ToLowerInvariant() switch
 {
-    var sorted = new List<Detection>(candidates);
-    sorted.Sort((x, y) => y.Score.CompareTo(x.Score));
+    "cf" or "channelsfirst" => OutputLayout.ChannelsFirst,
+    "cl" or "channelslast" => OutputLayout.ChannelsLast,
+    "e2e" or "endtoend" => OutputLayout.EndToEnd,
+    _ => OutputLayout.Auto,
+};
 
-    var kept = new List<Detection>();
-    var suppressed = new bool[sorted.Count];
+static string[]? LoadLabels(string? path)
+    => path is null ? null : File.ReadAllLines(path).Select(line => line.Trim()).ToArray();
 
-    for (int i = 0; i < sorted.Count; i++)
+static string LabelOf(string[]? labels, int classId)
+    => labels is not null && classId >= 0 && classId < labels.Length ? labels[classId] : $"class{classId}";
+
+static void WriteDetectJson(
+    string path,
+    string modelPath,
+    string? imagePath,
+    ImageData? image,
+    in Letterbox transform,
+    YoloDetector detector,
+    double preprocessMilliseconds,
+    double forwardMilliseconds,
+    IReadOnlyList<Detection> detections,
+    string[]? labels)
+{
+    using var stream = File.Create(path);
+    using var json = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+
+    json.WriteStartObject();
+    json.WriteString("model", Path.GetFileName(modelPath));
+    if (imagePath is not null && image is { } source)
     {
-        if (suppressed[i])
-            continue;
-
-        kept.Add(sorted[i]);
-
-        for (int j = i + 1; j < sorted.Count; j++)
-        {
-            if (suppressed[j] || sorted[j].ClassId != sorted[i].ClassId)
-                continue;
-            if (Detection.IoU(sorted[i], sorted[j]) > iouThreshold)
-                suppressed[j] = true;
-        }
+        json.WriteString("image", Path.GetFileName(imagePath));
+        json.WriteNumber("width", source.Width);
+        json.WriteNumber("height", source.Height);
     }
 
-    return kept;
+    json.WriteStartArray("inputShape");
+    json.WriteNumberValue(1);
+    json.WriteNumberValue(3);
+    json.WriteNumberValue(detector.TargetHeight);
+    json.WriteNumberValue(detector.TargetWidth);
+    json.WriteEndArray();
+
+    json.WriteNumber("confidence", detector.Options.Confidence);
+    json.WriteNumber("iou", detector.Options.IouThreshold);
+    json.WriteNumber("preprocessMs", Math.Round(preprocessMilliseconds, 3));
+    json.WriteNumber("inferenceMs", Math.Round(forwardMilliseconds, 3));
+    json.WriteNumber("sourceWidth", transform.SourceWidth);
+    json.WriteNumber("sourceHeight", transform.SourceHeight);
+
+    json.WriteStartArray("detections");
+    foreach (var detection in detections)
+    {
+        json.WriteStartObject();
+        json.WriteNumber("classId", detection.ClassId);
+        if (labels is not null && detection.ClassId >= 0 && detection.ClassId < labels.Length)
+            json.WriteString("name", labels[detection.ClassId]);
+        json.WriteNumber("score", Math.Round(detection.Score, 5));
+        json.WriteNumber("x", Math.Round(detection.X, 2));
+        json.WriteNumber("y", Math.Round(detection.Y, 2));
+        json.WriteNumber("width", Math.Round(detection.Width, 2));
+        json.WriteNumber("height", Math.Round(detection.Height, 2));
+        json.WriteEndObject();
+    }
+
+    json.WriteEndArray();
+    json.WriteEndObject();
+    json.Flush();
 }
 
 // ---------------- 参数与输入绑定 ----------------
@@ -855,8 +947,14 @@ static CliOptions ParseOptions(string[] args, int start)
             options.Inputs.Add(args[++i]);
         else if (arg == "--compare" && i + 1 < args.Length)
             options.Compare = args[++i];
-        else if (arg.StartsWith("--", StringComparison.Ordinal) && i + 1 < args.Length)
-            options.Add(arg, args[++i]);
+        else if (arg.StartsWith("--", StringComparison.Ordinal))
+        {
+            // --class-agnostic 这类纯开关后面不跟值：下一个 token 又是 --xxx 时就记成空值。
+            if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                options.Add(arg, args[++i]);
+            else
+                options.Add(arg, string.Empty);
+        }
     }
 
     return options;

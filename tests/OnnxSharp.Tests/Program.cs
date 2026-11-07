@@ -10,6 +10,7 @@ cases.AddRange(EngineTests.Cases());
 cases.AddRange(OnnxReaderTests.Cases());
 cases.AddRange(OnnxShapeTests.Cases());
 cases.AddRange(TransposeKernelTests.Cases());
+cases.AddRange(VisionTests.Cases());
 cases.AddRange(YoloGoldenTests.Cases());
 
 return Harness.RunAll(cases);
