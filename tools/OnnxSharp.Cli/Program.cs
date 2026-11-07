@@ -303,6 +303,12 @@ static int Bench(string[] args)
     for (int i = 0; i < warmup; i++)
         net.ForwardAll();
 
+    // 分配量与 GC 次数是解释「单算子计时之和 ≠ 端到端」的关键：
+    // 分配多就会频繁触发 gen0/gen1 GC，而 GC 暂停会被算进当时正在跑的那个算子头上。
+    long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
+    int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+    TimeSpan pauseBefore = GC.GetTotalPauseDuration();
+
     var samples = new double[iters];
     for (int i = 0; i < iters; i++)
     {
@@ -312,6 +318,9 @@ static int Bench(string[] args)
         samples[i] = watch.Elapsed.TotalMilliseconds;
     }
 
+    long allocPerIter = (GC.GetTotalAllocatedBytes(precise: true) - allocBefore) / Math.Max(1, iters);
+    double gcMsPerIter = (GC.GetTotalPauseDuration() - pauseBefore).TotalMilliseconds / Math.Max(1, iters);
+
     Array.Sort(samples);
     Console.WriteLine($"model     : {path}");
     Console.WriteLine($"iters     : {iters}  (warmup {warmup})");
@@ -319,6 +328,9 @@ static int Bench(string[] args)
     Console.WriteLine($"median    : {samples[iters / 2]:F1} ms");
     Console.WriteLine($"mean      : {samples.Average():F1} ms");
     Console.WriteLine($"max       : {samples[^1]:F1} ms");
+    Console.WriteLine($"alloc     : {allocPerIter / 1024.0:F0} KB/iter");
+    Console.WriteLine($"gc        : gen0 {GC.CollectionCount(0) - g0}  gen1 {GC.CollectionCount(1) - g1}  gen2 {GC.CollectionCount(2) - g2}  (共 {iters} 次推理)");
+    Console.WriteLine($"gc pause  : {gcMsPerIter:F1} ms/iter ({gcMsPerIter / Math.Max(1e-9, samples[iters / 2]) * 100:F0}% of median)");
     return 0;
 }
 

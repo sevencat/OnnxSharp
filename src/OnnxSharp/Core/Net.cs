@@ -55,8 +55,10 @@ public sealed class Net
     /// 「MatMul 占 66%」，预热后是 60%，而定点微模型显示内核本身已接近峰值。
     /// </para>
     /// <para>
-    /// 同时**不要用均值看绝对值**：测量机有后台负载，均值比中位数高 20% 以上。
-    /// 各算子的 <see cref="OpTiming.MinMilliseconds"/> 之和才和 <c>bench</c> 的中位数对得上。
+    /// 怎么和 <c>bench</c> 对账：**各算子 <see cref="OpTiming.Milliseconds"/> 之和（均值口径）**
+    /// 才等于端到端中位数（rfdetr-small：251 vs 250~275 ms）。
+    /// 各算子 <see cref="OpTiming.MinMilliseconds"/> 之和只是**下界**（215 ms），不能拿去和中位数比 ——
+    /// 每个算子的最小值基本不会同时出现。
     /// </para>
     /// </summary>
     public IReadOnlyList<OpTiming> ProfileAll(int iters = 2, int warmup = 0)

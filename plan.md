@@ -31,7 +31,7 @@
 | 11 | `ConstFolder` 折叠集合补 `Transpose`（可消灭 1 处数据相关 `Where`） | 依赖追踪实测 |
 | 12 | 新增 **§13 上游同步机制**：后续更新/优化/bugfix 一律先跟 OpenCV 5 dnn 的 git | `misc.md §11`（基线 `5.x @ 43f8b1f5`） |
 | 13 | **性能结果全部搬进 `bench.md`**（唯一事实源），`plan.md` §9 只保留目标与口径；四引擎 × 6 模型可一条命令复现 | 原 §9 是 i7-8700K 的手抄数字，机器/口径都变了 |
-| 14 | M4 重排：**微内核已完成**，GEMM 只跑到机器峰值的 40%~46%；但**任何内核级优化必须用端到端交替 A/B 判定** | `bench.md` 结论 3（`fma` 16 线程 753 GFLOPS vs GEMM 300~350；三次内核加速均无端到端收益） |
+| 14 | M4 重排：**GEMM 已不是瓶颈**（真实模型 407 GFLOPS，机器峰值 753）；重点转向逐元素融合与 host 侧开销。**任何内核级优化必须用端到端交替 A/B 判定** | `bench.md` 结论 2/3（`profile` + `fma`；三次内核加速均无端到端收益） |
 | 15 | **`profile` 必须带 `--warmup` 且只看每算子最小耗时**，否则 tier-0 代码与后台负载重尾会把均值抬高 20%~4 倍 | `bench.md`「测量方法上的坑」 |
 
 ---
@@ -340,13 +340,13 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 - [x] Depthwise 专用 kernel、MaxPool 滑窗 AVX2
 - [x] 逐元素/Softmax/LayerNorm 的 `Span<float>` + 无广播快速路径（`ApplyContiguous` / `ApplyScalar` / `ApplyBroadcast` 三条快路径 + `ParallelRange`）
 - [x] 多线程：`ParallelRange` 按输出面板切分；**小任务（< 4M 乘加）直接串行**，避开 `Parallel.For` 的 ~7 µs 固定开销
-- [x] 性能记录体系：`bench/`（四引擎 × 6 模型）+ `bench.md`（唯一事实源）+ `gemmbench` / `convbench`（按时间预热）+ `fma`（机器算力上限）+ `profile`（带预热、每算子最小耗时）
+- [x] 性能记录体系：`bench/`（四引擎 × 6 模型）+ `bench.md`（唯一事实源）+ `gemmbench` / `convbench`（按时间预热）+ `fma`（机器算力上限）+ `profile`（带预热、每算子最小耗时）+ `bench` 的 `alloc`/`gc`/`gc pause` 诊断行
 
 **未完成 / 重新排序**
 
 1. [x] **MatMul 合并 batch 维**：B 不广播时把 `(batch, m)` 拼成一次 GEMM。修掉 decoder q/k/v 投影「300 个 batch × m=1、权重被打包 300 遍」的浪费，单算子 4.06 → 0.13 ms，rfdetr-small -24%、medium -12%
 2. [ ] **逐元素融合（第二收益点）**：`Add 169 + Mul 114 + Div 35 + Sqrt 45` 占 DETR 约 20%，每次都是一遍全量读写。实测 56 GB/s ≈ 单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量，只能靠融合减少遍数**
-3. [ ] **查清「独立内核快 ≠ 端到端快」**：MatMul 仍占 61.9%（≈125 GFLOPS），同形状独立跑是 313~343 GFLOPS。把链式 MLP 微模型（24 个 MatMul，280 GFLOPS 与独立一致）逐步加回真实模型的其他算子，找出谁把缓存挤掉了
+3. [ ] **静态形状图缓存逐算子的形状/类型推断**：`Interpreter.Run` 每 forward 对 **2064 个算子**重算 `GetMemoryShapes`/`GetTypes`/`BindArgTensor`/`FitTemps`，实测每 forward 分配 **113 MB**。代价目前很小（GC 暂停 0.7 ms/iter、无降频），所以排在逐元素融合之后，但属于纯收益
 4. [ ] **GEMM 多线程扩展性**：16 线程跑出机器峰值（753 GFLOPS）的 40%~46%：
    - [ ] 二维 cache blocking（m 块 × n 块都分块），让每个线程的 B 面板只读一遍
    - [ ] batched attention 在**一个** `ParallelRange` 区域里按 `(batch, 行块)` 展平调度（`257×64×257 ×24` 只有 156 GFLOPS，是最差一组）
@@ -676,11 +676,13 @@ onnx.save(m, sys.argv[2])
 |---|---|
 | 机器上限：纯 FMA 单线程 **91 GFLOPS**、16 线程 **753 GFLOPS**（SMT）；GEMM 最好约 500 GFLOPS | `fma --threads 1,16` + `gemmbench` |
 | 16 线程 GEMM 只有峰值的 **40%~46%**：① 26~33 个行块分 16 线程要跑两波；② 每行块重读整个 B，DRAM 带宽受限 | `gemmbench --threads 1,2,4,8,16` + 手工估算 |
-| RF-DETR 的 140 个 MatMul **不全是 batched attention**：MLP 的 `[257,384]×[384,1536]` 就是 MatMul 节点，全部合计 16.6 GFLOP（约 92% 计算量）。卷积只影响 3.4% | 形状统计 + `profile` |
+| RF-DETR 的 140 个 MatMul **不全是 batched attention**：MLP 的 `[257,384]×[384,1536]` 就是 MatMul 节点，全部合计 **54.1 GFLOP**（主干 MLP/投影带前置 batch 4）。卷积只影响 3.4% | 形状统计 + `profile` |
+| MatMul **已经跑满**：133 ms / 54.1 GFLOP = **407 GFLOPS**，不低于同形状独立基准（386）。GEMM 不再是可挖的点 | `profile` + `gemmbench` |
 | decoder q/k/v 投影运行时是 `[300,1,256]×[256,256]`（300 个 batch × m=1），按 batch 逐个调内核会把权重重打包 300 遍，**已修为合并 batch 维**（4.06 → 0.13 ms/算子） | `profile` 逐算子 + 端到端 A/B（-24%） |
 | 逐元素算子已向量化+并行，实测 **56 GB/s**，是单线程 memcpy 上限（73 GB/s）的 77%，**没有带宽余量**，只能靠**融合减少遍数** | 微模型 `add-1024x1024` + numpy memcpy 对照 |
 | YOLO 侧差距集中在 `s` 档（层宽 128~256），是**大 GEMM 分块/打包**，不是单个卷积 | `bench.md` 相对倍率表 |
-| **独立内核吞吐无法预测端到端**：三次独立验证（B 预打包、`mb` 扫参、列切分 +45%）都出现「微基准变快/变慢、端到端无变化」，只能用同会话交替 A/B 判定 | `bench.md` 结论 3 |
+| **独立内核吞吐无法预测端到端**：B 预打包、`mb` 扫参、列切分（+45%）三次都出现「微基准变快、端到端无变化」；且统计 FLOPs 时漏掉前置 batch 会凭空造出「慢 3 倍」的假象。只能用同会话交替 A/B 判定 | `bench.md` 结论 3 |
+| GC 与降频都已排除：GC 暂停 0.7 ms/iter；同一形状连续跑 3000 次不衰减（383 vs 386 GFLOPS）。**profile 与 bench 的唯一差别只是口径**：各算子均值之和 251 ms ≈ 端到端中位数，min 之和 215 ms 是下界 | `bench` 新增的 `alloc`/`gc`/`gc pause` 三行输出 |
 
 ---
 

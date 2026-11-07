@@ -364,16 +364,21 @@ Tile TopK Transpose Unsqueeze Where
 > **上一版这里写的「140 个 MatMul 全是 batched attention、MLP 已导出成 Conv」是错的。**
 > 按 `(a[-2:], b[-2:])` 重新统计后，MLP 与投影都是货真价实的 `MatMul` 节点。
 
-`rfdetr-small` 的 140 个 `MatMul`，合计约 **16.6 GFLOP**（占模型 ~92%）：
+`rfdetr-small` 的 140 个 `MatMul`，合计 **54.1 GFLOP**：
 
-| 形状 | 组数 | 出现位置 |
-|---|---|---|
-| `[257,384]×[384,1536]` / `[257,1536]×[1536,384]` | 各 12 | ViT-S 主干 MLP（fc1 单算子 1.26 GFLOP，是最大的一类） |
-| `[1028,384]×[384,384]` 等 | 各 6 | 主干 qkv / 投影 |
-| `(6, 1028, 64, 1028)` / `(6, 1028, 1028, 64)` | 若干 | 主干 attention 的 `QKᵀ` 与 `AV` |
-| `(24, 257, 64, 257)` / `(24, 257, 257, 64)` | 若干 | 主干 windowed attention |
-| `[300,1,256]×[256,256]` | 9 | decoder q/k/v 投影（**m=1 的假 batch，见下**） |
-| `(8, 300, 32, 300)` / `(8, 300, 300, 32)` | 3 组 | decoder cross-attention |
+| 形状（前置 batch） | 组数 | 合计 FLOPs | 出现位置 |
+|---|---|---:|---|
+| `(257,384)×(384,1536)`，batch **4** / `(257,1536)×(1536,384)`，batch **4** | 各 12 | 各 14.55 G | ViT-S 主干 MLP |
+| `(257,384)×(384,384)`，batch **4** | 12 | 10.00 G | 主干 qkv |
+| `(1028,384)×(384,384)` | 若干 | 3.64 G | 全局 block 的 qkv |
+| `(6, 1028, 64, 1028)` / `(6, 1028, 1028, 64)` | 各 6 | 各 2.43 G | 主干 attention 的 `QKᵀ` 与 `AV` |
+| `(24, 257, 64, 257)` / `(24, 257, 257, 64)` | 各 24 | 各 1.83 G | 主干 windowed attention |
+| `[300,1,256]×[256,256]` | 9 | 可忽略 | decoder q/k/v 投影（**m=1 的假 batch，见下**） |
+| `(8, 300, 32, 300)` / `(8, 300, 300, 32)` | 3 组 | 可忽略 | decoder cross-attention |
+
+> ⚠️ **算 FLOPs 必须乘上前置 batch**。主干 MLP/投影都是 batch 4（windowed attention 的 4 个窗口并行），
+> 漏掉就得到 16.6 GFLOP，进而算出「in-situ 只有 125 GFLOPS、比裸内核慢 3 倍」的假象。
+> 按 54.1 GFLOP 算，in-situ 是 **407 GFLOPS**，已经不低于同形状的独立基准（386 GFLOPS）。
 
 **含义**：
 - 卷积优化（Winograd / 面板打包）对 RF-DETR 只影响 **3.4%**，别再往那儿投；
@@ -381,8 +386,9 @@ Tile TopK Transpose Unsqueeze Where
 - `[300,1,256]×[256,256]` 是最典型的坑：ONNX 里 batch 维是动态的（静态推导为 0，运行时为 1），
   正确切法是 `(batch=300, m=1)`，按 batch 逐个调内核会让 256 KB 权重被打包 300 遍，单算子 4.06 ms。
   **`(batch, m)` 合并成一次 GEMM 后 0.13 ms**，已修复，端到端 -24%；
-- 逐元素 `Add 169 + Mul 114 + Div 35 + Sqrt 45` 合计约 20%，每次都是一遍全量读写（实测 56 GB/s，已接近单线程 memcpy 上限 73 GB/s）。
-- 实测吞吐：`1028×64×1028` 约 276~345 GFLOPS，`257×1536×384` 313 GFLOPS；机器 16 线程 FMA 峰值 753 GFLOPS。详见 `bench.md` 结论 3。
+- 逐元素 `Add 169 + Mul 114 + Div 35 + Sqrt 45` 合计约 20%，每次都是一遍全量读写（实测 56 GB/s，已接近单线程 memcpy 上限 73 GB/s）。**这是当前第一优先级的可优化项**。
+- 实测吞吐：独立基准 `257×384×1536` 386 GFLOPS、`1028×64×1028` 276~345 GFLOPS；机器 16 线程 FMA 峰值 753 GFLOPS。
+  真实模型里 MatMul 合计 133 ms / 54.1 GFLOP = **407 GFLOPS**，已经没有「in-situ 落后于裸内核」这回事。详见 `bench.md` 结论 3。
 >
 > 两者都属于 §3.8 的 shape/mask 链（可被常量折叠吃掉），但**必须实现**。因此 `plan.md` §7 的分批数应为 A9 + B3 + C17 + D5 + **E8** = 42。
 
@@ -552,7 +558,10 @@ Tile TopK Transpose Unsqueeze Where
 
 41. **`profile` 的两个陷阱**（`Net.ProfileAll` 已按这两条改造）：
     - **必须预热**：前几轮迭代跑 tier-0 代码，而 tier-0 的 MatMul 比 tier-1 慢约 4 倍（逐元素只慢 2 倍），于是计算密集算子的份额被系统性高估 —— 不加预热得到「MatMul 占 66%」，预热后是 60%。
-    - **必须看最小耗时**：测量机后台负载的重尾会把均值抬高 20% 以上，上百个算子合起来的均值之和（rfdetr-small 约 250 ms）比 `bench` 中位数还高。改造后 `ProfileAll` 同时记录每算子最小耗时，**sum-of-min（215 ms）才和端到端中位数对得上**。
+    - **对账要用均值口径**：各算子均值之和（rfdetr-small 251 ms）等于端到端中位数（250~275 ms）。
+      每算子最小耗时也有用（看单个算子的稳态性能），但**最小值之和只是下界（215 ms），不能拿去和中位数比** ——
+      每个算子的最小值基本不会同时出现，差的 15% 不是「隐藏开销」。
+    - **后台负载**会把均值抬高 20% 以上，所以同一份代码不同时段能测出不同绝对值，跨会话不要比绝对值。
     - 计时开销本身可以忽略（每算子约 100 ns），别去怀疑 `Stopwatch`。
 
 39. **`Parallel.For` 的固定开销约 7 µs**，小算子开线程反而更慢。当前阈值：`GemmKernel.ParallelThreshold = 1<<22` 乘加、`TensorOps.ParallelElementThreshold = 1<<16` 元素。副作用是 `300×32×300`（2.9M 乘加）这类形状被判定串行，只能跑 60 GFLOPS —— 更好的做法是「按 batch 并行」而不是整算子串行。
@@ -845,7 +854,7 @@ SMOKE TEST: PASS
 | 2026-11-07 | **M0.5 落地完成**：`Engine/BufferAllocator.cs`（生命周期着色）、`LayerInfo.Net` + `In()/IsConstInput()`、`Graph.Version/Reset/RemoveAll`、`NetImpl` 槽池 + `FitTemps` + `Declare/Require/TryGetArg`、`Interpreter` 动态形状分支 + 类型签名、`Tensors/Layout.cs` 预留、`tests/OnnxSharp.Tests`（零依赖 16 用例）。`dotnet build` 0 警告 0 错误，16/16 PASS |
 | 2026-11-07 | **建立 `bench.md`（性能唯一事实源）+ `bench/` 脚本体系**：`run_all.py` 一条命令跑 4 引擎 × 6 模型（OnnxSharp / ORT CPU / OpenCV 5 dnn / SimdYolo，YOLO×4 + RF-DETR×2），输出 median/min 双指标；实测 yolo11n 43.4 ms、rfdetr-small 317.5 ms。新增坑 #36（分层编译按次数预热会低估 4 倍） |
 | 2026-11-07 | **上一轮：RF-DETR 瓶颈定位到 batched attention GEMM**（结论后被修正）。新增 §6.5 坑 #36~#39（分层编译预热、A/B 必须交替、两个已否决的内核方向、`Parallel.For` 7 µs 阈值）；`gemmbench` 加 `--batch` 并改为按时间预热；新增 `bench/make_micro_models.py` |
-| 2026-11-07 | **本轮：修正上一轮两个错误结论 + 修掉最大单点浪费**。① §3.10 重写：140 个 MatMul 里 MLP（`[257,384]×[384,1536]`）与投影都是真 MatMul，合计 16.6 GFLOP；② 机器上限用 `fma` 重新量：单线程 91 GFLOPS、16 线程 753 GFLOPS，GEMM 300~500 GFLOPS；③ `MatMul` 在 B 不广播时合并 `(batch, m)`（decoder q/k/v 投影是 `[300,1,256]×[256,256]`，权重曾被打包 300 遍，4.06 → 0.13 ms），rfdetr-small **356 → 270 ms（-24%）**、medium -12%；④ `ProfileAll` 加预热与每算子最小耗时（坑 #41）；⑤ 新增 `fma`、`gemmbench --threads`、逐元素带宽与链式 MLP 微模型；新增坑 #40（独立内核吞吐无法预测端到端，三次验证） |
+| 2026-11-07 | **本轮：修正上一轮两个错误结论 + 修掉最大单点浪费**。① §3.10 重写：140 个 MatMul 里 MLP（`[257,384]×[384,1536]`）与投影都是真 MatMul，合计 **54.1 GFLOP**（前置 batch 4），in-situ 407 GFLOPS，GEMM 已到顶；② 机器上限用 `fma` 重新量：单线程 91 GFLOPS、16 线程 753 GFLOPS；③ `MatMul` 在 B 不广播时合并 `(batch, m)`（decoder q/k/v 投影是 `[300,1,256]×[256,256]`，权重曾被打包 300 遍，4.06 → 0.13 ms），rfdetr-small **356 → 270 ms（-24%）**、medium -12%；④ `ProfileAll` 加预热与每算子最小耗时（坑 #41）；⑤ 新增 `fma`、`gemmbench --threads`、逐元素带宽与链式 MLP 微模型、`bench` 的 `alloc`/`gc`/`gc pause` 诊断；⑥ 排除 GC（0.7 ms/iter）与降频（长跑不衰减）两个嫌疑，剩下的计时差指向 host 侧每 forward 重算 2064 个算子的形状并分配 113 MB；新增坑 #40（独立内核吞吐无法预测端到端） |
 
 ---
 
