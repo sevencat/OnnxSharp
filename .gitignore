@@ -8,3 +8,5 @@ TestResults/
 *.golden
 artifacts/
 bench/inputs/
+bench/models/
+bench/bin/

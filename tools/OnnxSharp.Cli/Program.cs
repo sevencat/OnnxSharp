@@ -330,6 +330,7 @@ static int GemmBench(string[] args)
 {
     var options = ParseOptions(args, 1);
     int iters = options.GetInt("--iters", 50);
+    int batches = options.GetInt("--batch", 1);
 
     var shapes = new List<(int M, int K, int N)>();
     string? single = options.GetString("--shape");
@@ -354,38 +355,60 @@ static int GemmBench(string[] args)
         shapes.Add((256, 256, 6400));   // 1x1 256->256  80x80
     }
 
+    batches = Math.Max(1, batches);
+
     Console.WriteLine($"threads : {OnnxSharp.Threading.ParallelRange.Threads}");
     Console.WriteLine($"iters   : {iters}");
+    Console.WriteLine($"batch   : {batches}");
     Console.WriteLine();
-    Console.WriteLine("     m       k       n       min ms    GFLOPS");
+    Console.WriteLine("     m       k       n    batch    per-batch ms    GFLOPS");
 
     foreach (var (m, k, n) in shapes)
     {
-        var a = new float[m * k];
-        var b = new float[k * n];
-        var c = new float[m * n];
+        var a = new float[batches * m * k];
+        var b = new float[batches * k * n];
+        var c = new float[batches * m * n];
         var rng = new Random(12345);
         for (int i = 0; i < a.Length; i++) a[i] = (float)rng.NextDouble();
         for (int i = 0; i < b.Length; i++) b[i] = (float)rng.NextDouble();
 
-        for (int i = 0; i < 3; i++)
-            GemmKernel.Multiply(a, b, c, m, k, n);
+        void Run() => RunBatched(a, b, c, batches, m, k, n);
+
+        // 按时间预热：分层编译下「调用次数」比「迭代次数」更重要，固定 3 次预热会把
+        // tier-0 的慢样本算进来（实测同形状能差 4 倍以上）。
+        var warm = System.Diagnostics.Stopwatch.StartNew();
+        do
+        {
+            Run();
+        }
+        while (warm.Elapsed.TotalMilliseconds < 400);
 
         double best = double.MaxValue;
         for (int i = 0; i < iters; i++)
         {
             var watch = System.Diagnostics.Stopwatch.StartNew();
-            GemmKernel.Multiply(a, b, c, m, k, n);
+            Run();
             watch.Stop();
             if (watch.Elapsed.TotalMilliseconds < best)
                 best = watch.Elapsed.TotalMilliseconds;
         }
 
-        double gflops = 2.0 * m * k * n / (best * 1e6);
-        Console.WriteLine($"{m,6}  {k,6}  {n,6}   {best,8:F3}  {gflops,8:F1}");
+        double perBatch = best / batches;
+        double gflops = 2.0 * m * k * n / (perBatch * 1e6);
+        Console.WriteLine($"{m,6}  {k,6}  {n,6}  {batches,6}   {perBatch,12:F3}  {gflops,8:F1}");
     }
 
     return 0;
+
+    static void RunBatched(float[] a, float[] b, float[] c, int batches, int m, int k, int n)
+    {
+        var aSpan = a.AsSpan();
+        var bSpan = b.AsSpan();
+        var cSpan = c.AsSpan();
+        for (int bi = 0; bi < batches; bi++)
+            GemmKernel.Multiply(aSpan.Slice(bi * m * k, m * k), bSpan.Slice(bi * k * n, k * n),
+                                cSpan.Slice(bi * m * n, m * n), m, k, n);
+    }
 }
 
 /// <summary>
