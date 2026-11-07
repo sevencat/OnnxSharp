@@ -630,6 +630,22 @@ Tile TopK Transpose Unsqueeze Where
     框坐标最大偏差 **0.005 px**（仅 JSON 两位小数舍入）—— 预处理/解码的语义可以认为已经对齐。
     PPM 与 BMP 两条解码路径输出完全相同，可作为「图像读取没引入色序错误」的回归手段。
 
+### 6.9 RF-DETR 的前后处理（2026-11-07）
+
+54. **RF-DETR 不是 letterbox，是直接拉伸**（`torchvision.resize` 到 512×512，`antialias=False`，半像素中心双线性）。
+    所以还原框只需乘原图宽高，没有 pad 要减；**照抄 YOLO 的 letterbox 会让框系统性偏移**（竖图最明显）。
+    归一化也不同：ImageNet `mean=[0.485,0.456,0.406] std=[0.229,0.224,0.225]`，不是 `/255`。
+55. **逐类 sigmoid，不是 softmax**。一个查询可以同时在多个类别上超过阈值，所以必须把 `(Q, C)` 摊平成
+    `Q×C` 个「查询×类别」对再取 top-k；**每查询 argmax 会静默丢掉额外类别**（COCO 上常出现的
+    「person + 自行车」同框就会消失）。也正因如此 top-k 必须在阈值**之前**做（官方 `_select_topk` 的顺序）——
+    数值上「先阈值再取前 N」等价（阈值单调），实现里用的是后者，省一次全量排序。
+56. **背景槽位默认是最后一列（-1）**。COCO 91 类导出里最后一列是背景，不排除会出一堆 class90 的高分框；
+    自定义类别数导出、或稀疏 COCO checkpoint（末列是 class 90）时必须改 `BackgroundClassId`（CLI `--background`）。
+57. 与官方 `rfdetr.export._runtime.decode.decode_detections` 逐框对照：persons.jpg 1568×1068 + rfdetr-small，
+    双方各 **41 框**，类别完全一致，分数差 < 1e-4，坐标最大偏差 **0.00 px**。
+    另一条旁证：同图 yolo11n 给出的 person 框（1347.3, 671.9）与 rfdetr（1349.7, 672.1）几乎重合，
+    说明两条完全不同的前/后处理链路没有引入共同偏移。
+
 ---
 
 ## 7. 工具脚本

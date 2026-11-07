@@ -744,99 +744,189 @@ static int Profile(string[] args)
     return 0;
 }
 
-// ---------------- YOLO 检测：图进、框出（letterbox / decode / NMS 都在 OnnxSharp.Vision） ----------------
+// ---------------- 检测：图进、框出（预处理 / 解码 / NMS 都在 OnnxSharp.Vision） ----------------
+// 两种检测头：YOLO（letterbox + 逐锚点 argmax + NMS）与 RF-DETR（拉伸 + 逐类 sigmoid + top-k）。
+// 默认按输出个数判族（RF-DETR 是 dets + labels 双输出），也可以用 --family 强制指定。
 
 static int Detect(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.Error.WriteLine("usage: detect <yolo.onnx> <image.ppm|bmp> [--conf 0.25] [--iou 0.45] [--labels names.txt] [--json out.json]");
-        Console.Error.WriteLine("       detect <yolo.onnx> --input <file.bin> [--shape 1,3,640,640]");
+        Console.Error.WriteLine("usage: detect <model.onnx> <image.ppm|bmp> [--family auto|yolo|rfdetr] [--conf X]");
+        Console.Error.WriteLine("                     [--labels names.txt] [--json out.json] [--iters N] [--size N]");
+        Console.Error.WriteLine("       yolo  : [--iou 0.45] [--max-det 300] [--classes N] [--layout auto|cf|cl|e2e] [--class-agnostic]");
+        Console.Error.WriteLine("       rfdetr: [--max-det 300] [--background -1|none] [--norm imagenet|255]");
+        Console.Error.WriteLine("       detect <model.onnx> --input <file.bin> [--shape 1,3,640,640]");
         return 2;
     }
 
     string modelPath = args[1];
     var options = ParseOptions(args, 2);
 
-    int squareSize = options.GetInt("--size", 0);
-    var detectorOptions = new DetectorOptions
+    string? family = options.GetString("--family")?.ToLowerInvariant();
+    if (family is not (null or "auto" or "yolo" or "rfdetr"))
     {
-        Confidence = options.GetFloat("--conf", 0.25f),
-        IouThreshold = options.GetFloat("--iou", 0.45f),
-        MaxDetections = options.GetInt("--max-det", 300),
-        ClassCount = options.GetInt("--classes", 0),
-        ClassAgnosticNms = options.Has("--class-agnostic"),
-        Layout = ParseOutputLayout(options.GetString("--layout")),
-        // 只对动态形状的模型生效；静态形状由模型自己决定。
-        TargetWidth = squareSize,
-        TargetHeight = squareSize,
-    };
-
-    var detector = new YoloDetector(modelPath, detectorOptions);
+        Console.Error.WriteLine($"detect: unknown --family '{family}' (auto|yolo|rfdetr)");
+        return 2;
+    }
 
     // 默认只跑一次：这是「第一帧」的真实延迟（含 JIT 与首次分配）。
     // 要稳态吞吐就加 --iters 40 —— 分层编译约 30 次调用后才升到 tier-1，少于此数会偏高 1.5~2 倍。
     int iterations = Math.Max(1, options.GetInt("--iters", 1));
+    int squareSize = options.GetInt("--size", 0);
 
     string? imagePath = args.Length > 2 && !args[2].StartsWith("--", StringComparison.Ordinal) ? args[2] : null;
-
-    ImageData? image = null;
-    Letterbox transform = default;
-    Tensor input = null!;
-    double preprocessMilliseconds = double.MaxValue;
-
-    if (imagePath is not null)
+    if (imagePath is null && options.Inputs.Count == 0)
     {
-        image = ImageFile.Load(imagePath);
-
-        // 预处理同样取多次的最小值：第一次含 JIT 与数组首次分配，能差 3~5 倍。
-        for (int iteration = 0; iteration < iterations; iteration++)
-        {
-            var preprocessing = Stopwatch.StartNew();
-            (input, transform) = detector.Preprocess(image.Value.Pixels, image.Value.Width, image.Value.Height);
-            preprocessMilliseconds = Math.Min(preprocessMilliseconds, preprocessing.Elapsed.TotalMilliseconds);
-        }
+        Console.Error.WriteLine("detect: need either an image path or --input <file.bin>");
+        return 2;
     }
-    else
+
+    ImageData? image = imagePath is null ? null : ImageFile.Load(imagePath);
+
+    // 模型只读一次：两个检测器都有接收 Net 的构造函数，避免重复解析 100+ MB 的权重。
+    var net = Net.ReadModel(modelPath);
+    bool rfdetr = family switch
     {
-        if (options.Inputs.Count == 0)
-        {
-            Console.Error.WriteLine("detect: need either an image path or --input <file.bin>");
-            return 2;
-        }
-
-        var inputs = BindInputs(detector.Net, options.Inputs, ParseShape(options.GetString("--shape")));
-        input = inputs[0];
-
-        // 已经是 letterbox 之后的张量，框就落在模型坐标系里 —— 恒等变换即可。
-        var inputShape = input.Shape;
-        transform = new Letterbox(inputShape[3], inputShape[2], inputShape[3], inputShape[2], 1, 1, 0, 0);
-    }
+        "yolo" => false,
+        "rfdetr" => true,
+        _ => net.OutputNames.Count >= 2,
+    };
 
     // 多次迭代只用于取更稳的耗时（第一次含 JIT 与首次分配）。
     // 前向与后处理分开计时：两者差一个数量级时，能立刻看出是模型慢还是后处理慢。
     IReadOnlyList<Detection> detections = Array.Empty<Detection>();
+    double preprocessMilliseconds = double.MaxValue;
     double forwardMilliseconds = double.MaxValue;
     double decodeMilliseconds = double.MaxValue;
-    detector.Net.SetInput(detector.InputName, input);
+    float confidence;
+    float? iou;
+    string inputDescription;
 
-    for (int iteration = 0; iteration < iterations; iteration++)
+    if (image is not null)
+        Console.WriteLine($"image      : {imagePath} {image.Value.Width}x{image.Value.Height}");
+
+    if (!rfdetr)
     {
-        var forward = Stopwatch.StartNew();
-        var output = detector.Net.Forward();
-        forwardMilliseconds = Math.Min(forwardMilliseconds, forward.Elapsed.TotalMilliseconds);
+        var detectorOptions = new DetectorOptions
+        {
+            Confidence = options.GetFloat("--conf", 0.25f),
+            IouThreshold = options.GetFloat("--iou", 0.45f),
+            MaxDetections = options.GetInt("--max-det", 300),
+            ClassCount = options.GetInt("--classes", 0),
+            ClassAgnosticNms = options.Has("--class-agnostic"),
+            Layout = ParseOutputLayout(options.GetString("--layout")),
+            // 只对动态形状的模型生效；静态形状由模型自己决定。
+            TargetWidth = squareSize,
+            TargetHeight = squareSize,
+        };
 
-        var decode = Stopwatch.StartNew();
-        detections = detector.Decode(output, transform);
-        decodeMilliseconds = Math.Min(decodeMilliseconds, decode.Elapsed.TotalMilliseconds);
+        var detector = new YoloDetector(net, detectorOptions);
+        Letterbox transform = default;
+        Tensor input = null!;
+
+        if (image is { } source)
+        {
+            // 预处理同样取多次的最小值：第一次含 JIT 与数组首次分配，能差 3~5 倍。
+            for (int iteration = 0; iteration < iterations; iteration++)
+            {
+                var preprocessing = Stopwatch.StartNew();
+                (input, transform) = detector.Preprocess(source.Pixels, source.Width, source.Height);
+                preprocessMilliseconds = Math.Min(preprocessMilliseconds, preprocessing.Elapsed.TotalMilliseconds);
+            }
+        }
+        else
+        {
+            input = BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")))[0];
+
+            // 已经是 letterbox 之后的张量，框就落在模型坐标系里 —— 恒等变换即可。
+            var inputShape = input.Shape;
+            transform = new Letterbox(inputShape[3], inputShape[2], inputShape[3], inputShape[2], 1, 1, 0, 0);
+        }
+
+        net.SetInput(detector.InputName, input);
+
+        for (int iteration = 0; iteration < iterations; iteration++)
+        {
+            var forward = Stopwatch.StartNew();
+            var output = net.Forward();
+            forwardMilliseconds = Math.Min(forwardMilliseconds, forward.Elapsed.TotalMilliseconds);
+
+            var decode = Stopwatch.StartNew();
+            detections = detector.Decode(output, transform);
+            decodeMilliseconds = Math.Min(decodeMilliseconds, decode.Elapsed.TotalMilliseconds);
+        }
+
+        confidence = detectorOptions.Confidence;
+        iou = detectorOptions.IouThreshold;
+        inputDescription = $"[1, 3, {detector.TargetHeight}, {detector.TargetWidth}]  ({transform})";
+    }
+    else
+    {
+        int? background = -1;
+        if (options.GetString("--background") is { } backgroundText)
+            background = backgroundText.Equals("none", StringComparison.OrdinalIgnoreCase)
+                ? null
+                : int.Parse(backgroundText);
+
+        var detectorOptions = new RfDetrOptions
+        {
+            Confidence = options.GetFloat("--conf", 0.3f),
+            MaxDetections = options.GetInt("--max-det", 300),
+            BackgroundClassId = background,
+            Normalization = ParseNormalization(options.GetString("--norm")),
+            TargetWidth = squareSize,
+            TargetHeight = squareSize,
+        };
+
+        var detector = new RfDetrDetector(net, detectorOptions);
+        Tensor input = null!;
+        int sourceWidth;
+        int sourceHeight;
+
+        if (image is { } source)
+        {
+            sourceWidth = source.Width;
+            sourceHeight = source.Height;
+
+            for (int iteration = 0; iteration < iterations; iteration++)
+            {
+                var preprocessing = Stopwatch.StartNew();
+                input = detector.Preprocess(source.Pixels, source.Width, source.Height);
+                preprocessMilliseconds = Math.Min(preprocessMilliseconds, preprocessing.Elapsed.TotalMilliseconds);
+            }
+        }
+        else
+        {
+            input = BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")))[0];
+            sourceWidth = input.Shape[3];
+            sourceHeight = input.Shape[2];
+        }
+
+        net.SetInput(detector.InputName, input);
+
+        for (int iteration = 0; iteration < iterations; iteration++)
+        {
+            var forward = Stopwatch.StartNew();
+            var outputs = net.ForwardAll();
+            forwardMilliseconds = Math.Min(forwardMilliseconds, forward.Elapsed.TotalMilliseconds);
+
+            var decode = Stopwatch.StartNew();
+            detections = detector.Decode(outputs, sourceWidth, sourceHeight);
+            decodeMilliseconds = Math.Min(decodeMilliseconds, decode.Elapsed.TotalMilliseconds);
+        }
+
+        confidence = detectorOptions.Confidence;
+        iou = null;
+        inputDescription = $"[1, 3, {detector.TargetHeight}, {detector.TargetWidth}]  " +
+                           $"({sourceWidth}x{sourceHeight} -> stretch, {detector.BoxesOutputName}/{detector.LogitsOutputName})";
     }
 
     var labels = LoadLabels(options.GetString("--labels"));
 
     Console.WriteLine($"model      : {modelPath}");
-    if (image is { } source)
-        Console.WriteLine($"image      : {imagePath} {source.Width}x{source.Height}");
-    Console.WriteLine($"input      : [1, 3, {detector.TargetHeight}, {detector.TargetWidth}]  ({transform})");
+    Console.WriteLine($"family     : {(rfdetr ? "rfdetr" : "yolo")}");
+    Console.WriteLine($"input      : {inputDescription}");
     if (image is not null)
         Console.WriteLine($"preprocess : {preprocessMilliseconds:F2} ms");
     string iterationHint = iterations < 10 ? "; 稳态吞吐加 --iters 40" : string.Empty;
@@ -854,13 +944,20 @@ static int Detect(string[] args)
 
     if (options.GetString("--json") is { } jsonPath)
     {
-        WriteDetectJson(jsonPath, modelPath, imagePath, image, transform, detector,
-            preprocessMilliseconds, forwardMilliseconds, detections, labels);
+        WriteDetectJson(jsonPath, modelPath, imagePath, image, rfdetr ? "rfdetr" : "yolo",
+            inputDescription, confidence, iou, preprocessMilliseconds, forwardMilliseconds,
+            decodeMilliseconds, detections, labels);
         Console.WriteLine($"json       : {jsonPath}");
     }
 
     return 0;
 }
+
+static ChannelNormalization ParseNormalization(string? text) => text?.ToLowerInvariant() switch
+{
+    "255" or "unit" or "div255" => ChannelNormalization.Divide255,
+    _ => ChannelNormalization.ImageNet,
+};
 
 static OutputLayout ParseOutputLayout(string? text) => text?.ToLowerInvariant() switch
 {
@@ -881,10 +978,13 @@ static void WriteDetectJson(
     string modelPath,
     string? imagePath,
     ImageData? image,
-    in Letterbox transform,
-    YoloDetector detector,
+    string family,
+    string inputDescription,
+    float confidence,
+    float? iou,
     double preprocessMilliseconds,
     double forwardMilliseconds,
+    double decodeMilliseconds,
     IReadOnlyList<Detection> detections,
     string[]? labels)
 {
@@ -893,6 +993,7 @@ static void WriteDetectJson(
 
     json.WriteStartObject();
     json.WriteString("model", Path.GetFileName(modelPath));
+    json.WriteString("family", family);
     if (imagePath is not null && image is { } source)
     {
         json.WriteString("image", Path.GetFileName(imagePath));
@@ -900,19 +1001,13 @@ static void WriteDetectJson(
         json.WriteNumber("height", source.Height);
     }
 
-    json.WriteStartArray("inputShape");
-    json.WriteNumberValue(1);
-    json.WriteNumberValue(3);
-    json.WriteNumberValue(detector.TargetHeight);
-    json.WriteNumberValue(detector.TargetWidth);
-    json.WriteEndArray();
-
-    json.WriteNumber("confidence", detector.Options.Confidence);
-    json.WriteNumber("iou", detector.Options.IouThreshold);
+    json.WriteString("input", inputDescription);
+    json.WriteNumber("confidence", confidence);
+    if (iou is { } iouThreshold)
+        json.WriteNumber("iou", iouThreshold);
     json.WriteNumber("preprocessMs", Math.Round(preprocessMilliseconds, 3));
     json.WriteNumber("inferenceMs", Math.Round(forwardMilliseconds, 3));
-    json.WriteNumber("sourceWidth", transform.SourceWidth);
-    json.WriteNumber("sourceHeight", transform.SourceHeight);
+    json.WriteNumber("decodeMs", Math.Round(decodeMilliseconds, 3));
 
     json.WriteStartArray("detections");
     foreach (var detection in detections)

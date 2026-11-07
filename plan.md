@@ -27,7 +27,7 @@
 | 7 | golden 生成改为 **python 图改写追加 graph.output**（ORT 无「加中间输出」API） | §8.2 |
 | 8 | 平台目标收窄：**不支持 WASM / IL2CPP（不在路线图），首版不验 NativeAOT**，仅保持 AOT 友好编码 | 本轮结论 |
 | 9 | 性能目标重设（原「优化后 <60ms」过松，「首版 <150ms」过紧） | SimdYolo 22.19ms、ORT 26.4ms |
-| 10 | YOLO decode+NMS 移出**引擎核心**，作为可选门面放 `src/OnnxSharp/Vision/`（`YoloDetector`：letterbox + decode + NMS，返回原图坐标的框）；引擎本身仍只出 `[1,84,8400]` 原始张量 | 与 §1.3 一致；2026-11-07 落地 |
+| 10 | 检测头的前后处理（YOLO 的 letterbox+NMS、RF-DETR 的拉伸+top-k）移出**引擎核心**，作为可选门面放 `src/OnnxSharp/Vision/`（`YoloDetector` / `RfDetrDetector`：一张图进、原图坐标的框出）；引擎本身仍只出原始张量（`[1,84,8400]` / `dets`+`labels`） | 与 §1.3 一致；2026-11-07 落地 |
 | 11 | `ConstFolder` 折叠集合补 `Transpose`（可消灭 1 处数据相关 `Where`） | 依赖追踪实测 |
 | 12 | 新增 **§13 上游同步机制**：后续更新/优化/bugfix 一律先跟 OpenCV 5 dnn 的 git | `misc.md §11`（基线 `5.x @ 43f8b1f5`） |
 | 13 | **性能结果全部搬进 `bench.md`**（唯一事实源），`plan.md` §9 只保留目标与口径；四引擎 × 6 模型可一条命令复现 | 原 §9 是 i7-8700K 的手抄数字，机器/口径都变了 |
@@ -71,7 +71,7 @@ OpenCV 5.2 的 `modules/dnn` 内含两套引擎：
 | **WASM** | **不做**。不写 `browser-wasm` 目标，不为 4GB 线性内存做特殊设计。 |
 | **IL2CPP / Unity** | **不支持，且不在路线图**。不提供 `netstandard2.1` 目标，不为 IL2CPP 做裁剪/反射限制改造。宿主必须是 **.NET 8/10 运行时**（桌面 / 服务端）。 |
 | 图像编解码 | 交给调用方。`tools/OnnxSharp.Cli` 内置最小 PPM(P6)/BMP 解码，仅用于 CLI 演示与跨引擎对照，不进产品库。 |
-| 图像预处理 / YOLO 后处理 | **`src/OnnxSharp/Vision/` 提供可选门面**（`ImagePreprocessor.Letterbox` + `YoloDetector` + `YoloDecoder`）：一张图进去、原图坐标的 `Detection` 出来。它只依赖引擎的 `Net`，不参与图的执行，删掉不影响推理核心。 |
+| 图像预处理 / 检测后处理 | **`src/OnnxSharp/Vision/` 提供可选门面**：`ImagePreprocessor`（`Letterbox` 等比填边 / `Stretch` 直接拉伸）+ `YoloDetector`/`YoloDecoder` + `RfDetrDetector`/`RfDetrDecoder`。一张图进去、原图坐标的 `Detection` 出来。它只依赖引擎的 `Net`，不参与图的执行，删掉不影响推理核心。 |
 
 ### 1.4 非目标（首版明确不做）
 
@@ -200,9 +200,11 @@ F:\code\OnnxSharp\
 │     │  ├─ PackedConv.cs      面板打包卷积                               [M4]
 │     │  └─ Winograd.cs        Winograd F(2×2,3×3)                        [M4]
 │     └─ Vision\               可选门面：图进、框出（不参与图执行，可整体删除）
-│        ├─ ImagePreprocessor.cs  letterbox：等比缩放 + 居中填 114 + 双线性 + 归一化
-│        ├─ YoloDetector.cs       Net + 预处理 + 解码的一站式封装
+│        ├─ ImagePreprocessor.cs  Letterbox（等比 + 填 114）与 Stretch（直接拉伸）+ 双线性 + 归一化
+│        ├─ YoloDetector.cs       YOLO 一站式封装：Net + letterbox + 解码 + NMS
 │        ├─ YoloDecoder.cs        检测头解码（ChannelsFirst/ChannelsLast/EndToEnd）+ 反 letterbox
+│        ├─ RfDetrDetector.cs     RF-DETR 一站式封装：Net + 拉伸 + 解码（dets/labels 双输出）
+│        ├─ RfDetrDecoder.cs      逐类 sigmoid + 背景剔除 + Q×C top-k + 归一化框还原
 │        └─ Detection.cs          Detection / IoU / 贪心 NMS
 ├─ tools\
 │  ├─ OnnxSharp.Cli\           info / run / detect / bench / profile / dump-graph / gemmbench / convbench
@@ -303,6 +305,7 @@ F:\code\OnnxSharp\
 - [x] 与 ORT 端到端比对（`gen_golden.py` + `YoloGoldenTests`）
 - [ ] 与 ORT **逐层**比对（定位误差来源用，M2 收尾再补）
 - [x] （非引擎）decode+NMS：**`src/OnnxSharp/Vision/` 门面**（`YoloDetector` / `YoloDecoder` / `ImagePreprocessor` / `Detection`），CLI `detect` 支持「图片进、框出」；与 SimdYolo 输出逐框一致（最大偏差 0.005 px）
+- [x] （非引擎）RF-DETR 同款门面：`RfDetrDetector` / `RfDetrDecoder`（拉伸预处理 + 逐类 sigmoid + 背景剔除 + Q×C top-k），CLI `detect` 按输出个数自动判族；与官方 `decode_detections` 逐框一致（41/41 框，坐标偏差 0.00 px）
 
 **实测（2026-11-07）**
 
@@ -748,7 +751,7 @@ onnx.save(m, sys.argv[2])
 | Q2 | protobuf：手写 vs `Google.Protobuf` | **手写**（直接移植 SimdYolo `Proto`，加 DType 维度） |
 | Q3 | 是否需要 OpenCV 作 oracle | 不需要。**ORT（算子/端到端）+ onnx.shape_inference（形状）** 双 oracle |
 | Q4 | 是否纳入 `yolov11s-seg/pose/obb` | 不纳入（M6 再议） |
-| Q5 | 图像预处理辅助 | **已定（2026-11-07）**：`src/OnnxSharp/Vision/` 提供可选门面（letterbox + decode + NMS + `Detection`），不依赖任何第三方包、不参与图执行、可整体删除；图像**编解码**仍只在 `tools/` |
+| Q5 | 图像预处理辅助 | **已定（2026-11-07）**：`src/OnnxSharp/Vision/` 提供可选门面（letterbox / stretch + decode + NMS / top-k + `Detection`，覆盖 YOLO 与 RF-DETR 两种检测头），不依赖任何第三方包、不参与图执行、可整体删除；图像**编解码**仍只在 `tools/` |
 | Q6 | NativeAOT / WASM / IL2CPP | **AOT**：首版不验证，仅保持 AOT 友好编码约定。**WASM / IL2CPP / Unity：不支持，不在路线图** |
 | Q7 | 是否允许 channel 对齐 | **分两层**：①**kernel 内部**打包 / padding / 缓存行对齐任务切分 → **允许，M4 必做**（对图透明、回退成本低）；②**图级** blocked layout（NC8HW8 + `TransformLayout`）→ **不实现**，仅在 `Tensor.Layout`、`ArgData.Layout`、`LayerInfo.GetLayouts()`（恒返回 NCHW）预留接口，成本 < 1 天。将来真要做需 +3~5 周，收益 5~15% 且需实测 |
 

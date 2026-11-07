@@ -24,6 +24,13 @@ internal static class VisionTests
         yield return new("vision: decode end-to-end treats coords as corners", DecodeEndToEnd);
         yield return new("vision: decode clips boxes to image bounds", DecodeClips);
         yield return new("vision: decode rejects ambiguous layout", DecodeRejectsAmbiguous);
+        yield return new("vision: rfdetr stretch fills the canvas without padding", StretchFillsCanvas);
+        yield return new("vision: rfdetr decode maps normalized cxcywh to pixels", RfDetrMapsToPixels);
+        yield return new("vision: rfdetr decode drops the background slot", RfDetrDropsBackground);
+        yield return new("vision: rfdetr decode keeps several classes of one query", RfDetrKeepsSeveralClasses);
+        yield return new("vision: rfdetr decode applies num_select before threshold", RfDetrCapsBeforeThreshold);
+        yield return new("vision: rfdetr decode clips and drops boxes outside", RfDetrClipsAndDrops);
+        yield return new("vision: rfdetr decode rejects mismatched query counts", RfDetrRejectsMismatch);
     }
 
     // ---------------- letterbox ----------------
@@ -259,7 +266,170 @@ internal static class VisionTests
         Require(threw, "6x6 output must be rejected as ambiguous");
     }
 
+    // ---------------- rfdetr ----------------
+
+    /// <summary>logit = ln(9) 对应 sigmoid 0.9，ln(4) 对应 0.8，0 对应 0.5。</summary>
+    private static readonly float Logit90 = MathF.Log(9f);
+    private static readonly float Logit80 = MathF.Log(4f);
+
+    private static void StretchFillsCanvas()
+    {
+        // 4x1 图：左两像素红、右两像素黑，拉到 2x1 后每一列正好落在原图的一个像素边界上。
+        var pixels = new byte[] { 255, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+        var input = ImagePreprocessor.Stretch(
+            pixels, 4, 1, 2, 1, normalization: ChannelNormalization.ImageNet);
+
+        Require(input.Shape.Rank == 4 && input.Shape[1] == 3 && input.Shape[2] == 1 && input.Shape[3] == 2,
+            $"unexpected input shape {input.Shape}");
+
+        var data = input.AsSpan<float>();
+        int plane = 2;
+
+        // ImageNet：(v - 0.485) / 0.229 之类，没有填边值。
+        Near(data[0], (1f - 0.485f) / 0.229f, "red.r");
+        Near(data[plane], -0.456f / 0.224f, "red.g");
+        Near(data[2 * plane], -0.406f / 0.225f, "red.b");
+        Near(data[1], -0.485f / 0.229f, "black.r");
+        Near(data[2 * plane + 1], -0.406f / 0.225f, "black.b");
+    }
+
+    private static void RfDetrMapsToPixels()
+    {
+        var boxes = Tensor.Allocate(new TensorShape(1, 1, 4), DType.F32);
+        WriteBox(boxes.AsSpan<float>(), 0, 0.5f, 0.5f, 0.2f, 0.4f);
+
+        var logits = Tensor.Allocate(new TensorShape(1, 1, 3), DType.F32);
+        var logitData = logits.AsSpan<float>();
+        logitData[0] = -10f;
+        logitData[1] = Logit90;
+        logitData[2] = -10f;   // 背景列
+
+        var detections = RfDetrDecoder.Decode(boxes, logits, 200, 100, new RfDetrOptions { Confidence = 0.3f });
+
+        Require(detections.Count == 1, $"expected 1 detection, got {detections.Count}");
+        var detection = detections[0];
+        Require(detection.ClassId == 1, $"class {detection.ClassId}");
+        Near(detection.Score, 0.9f, "score");
+        Near(detection.X, 80f, "x");          // (0.5 - 0.1) * 200
+        Near(detection.Y, 30f, "y");          // (0.5 - 0.2) * 100
+        Near(detection.Width, 40f, "width");  // 0.2 * 200
+        Near(detection.Height, 40f, "height"); // 0.4 * 100
+    }
+
+    private static void RfDetrDropsBackground()
+    {
+        var boxes = Tensor.Allocate(new TensorShape(1, 1, 4), DType.F32);
+        WriteBox(boxes.AsSpan<float>(), 0, 0.5f, 0.5f, 0.2f, 0.2f);
+
+        // 背景列分数最高，但它必须被排除 → 前景都低于阈值 → 一个框都没有。
+        var logits = Tensor.Allocate(new TensorShape(1, 1, 3), DType.F32);
+        var logitData = logits.AsSpan<float>();
+        logitData[0] = -10f;
+        logitData[1] = -10f;
+        logitData[2] = Logit90;
+
+        var detections = RfDetrDecoder.Decode(boxes, logits, 100, 100, new RfDetrOptions { Confidence = 0.6f });
+        Require(detections.Count == 0, $"background must not be reported, got {detections.Count}");
+    }
+
+    private static void RfDetrKeepsSeveralClasses()
+    {
+        var boxes = Tensor.Allocate(new TensorShape(1, 1, 4), DType.F32);
+        WriteBox(boxes.AsSpan<float>(), 0, 0.5f, 0.5f, 0.5f, 0.5f);
+
+        // 一个查询同时在两个类别上超过阈值（逐类 sigmoid，不是 softmax）。
+        var logits = Tensor.Allocate(new TensorShape(1, 1, 3), DType.F32);
+        var logitData = logits.AsSpan<float>();
+        logitData[0] = Logit90;
+        logitData[1] = Logit80;
+        logitData[2] = -10f;
+
+        var detections = RfDetrDecoder.Decode(boxes, logits, 100, 100, new RfDetrOptions { Confidence = 0.3f });
+
+        Require(detections.Count == 2, $"expected 2 detections, got {detections.Count}");
+        Require(detections[0].ClassId == 0, $"first class {detections[0].ClassId}");
+        Near(detections[0].Score, 0.9f, "first score");
+        Require(detections[1].ClassId == 1, $"second class {detections[1].ClassId}");
+        Near(detections[1].Score, 0.8f, "second score");
+    }
+
+    private static void RfDetrCapsBeforeThreshold()
+    {
+        var boxes = Tensor.Allocate(new TensorShape(1, 2, 4), DType.F32);
+        var boxData = boxes.AsSpan<float>();
+        WriteBox(boxData, 0, 0.25f, 0.25f, 0.1f, 0.1f);
+        WriteBox(boxData, 1, 0.75f, 0.75f, 0.1f, 0.1f);
+
+        var logits = Tensor.Allocate(new TensorShape(1, 2, 2), DType.F32);
+        var logitData = logits.AsSpan<float>();
+        logitData[0] = Logit90;   // 查询 0，类别 0 → 0.9
+        logitData[1] = -10f;
+        logitData[2] = Logit80;   // 查询 1，类别 0 → 0.8
+        logitData[3] = -10f;
+
+        var all = RfDetrDecoder.Decode(boxes, logits, 100, 100, new RfDetrOptions { Confidence = 0.3f });
+        Require(all.Count == 2, $"expected 2 detections, got {all.Count}");
+
+        var capped = RfDetrDecoder.Decode(
+            boxes, logits, 100, 100, new RfDetrOptions { Confidence = 0.3f, MaxDetections = 1 });
+
+        Require(capped.Count == 1, $"num_select must cap before threshold, got {capped.Count}");
+        Near(capped[0].Score, 0.9f, "the single kept detection is the highest score");
+    }
+
+    private static void RfDetrClipsAndDrops()
+    {
+        var boxes = Tensor.Allocate(new TensorShape(1, 2, 4), DType.F32);
+        var boxData = boxes.AsSpan<float>();
+        WriteBox(boxData, 0, 0.02f, 0.5f, 0.5f, 0.2f);   // 左边越界 → 裁到 0
+        WriteBox(boxData, 1, -0.5f, 0.5f, 0.2f, 0.2f);   // 完全在图外 → 丢弃
+
+        var logits = Tensor.Allocate(new TensorShape(1, 2, 2), DType.F32);
+        var logitData = logits.AsSpan<float>();
+        logitData[0] = Logit90;
+        logitData[1] = -10f;
+        logitData[2] = Logit80;
+        logitData[3] = -10f;
+
+        var detections = RfDetrDecoder.Decode(boxes, logits, 200, 100, new RfDetrOptions { Confidence = 0.3f });
+
+        Require(detections.Count == 1, $"out-of-image box must be dropped, got {detections.Count}");
+        var box = detections[0];
+        Near(box.X, 0f, "clipped x");
+        Near(box.Width, 54f, "clipped width");   // (0.02 + 0.25) * 200
+        Near(box.Y, 40f, "y");                   // (0.5 - 0.1) * 100
+    }
+
+    private static void RfDetrRejectsMismatch()
+    {
+        var boxes = Tensor.Allocate(new TensorShape(1, 2, 4), DType.F32);
+        var logits = Tensor.Allocate(new TensorShape(1, 3, 2), DType.F32);
+
+        bool threw = false;
+        try
+        {
+            RfDetrDecoder.Decode(boxes, logits, 10, 10);
+        }
+        catch (ArgumentException)
+        {
+            threw = true;
+        }
+
+        Require(threw, "query count mismatch must be rejected");
+    }
+
     // ---------------- helpers ----------------
+
+    /// <summary>写一条 RF-DETR 的归一化 cxcywh 框。</summary>
+    private static void WriteBox(Span<float> data, int query, float cx, float cy, float w, float h)
+    {
+        int start = query * 4;
+        data[start] = cx;
+        data[start + 1] = cy;
+        data[start + 2] = w;
+        data[start + 3] = h;
+    }
 
     private static byte[] White(int width, int height)
     {
