@@ -1,0 +1,8 @@
+[
+  { "name": "yolo11n", "path": "F:/ai/models/yolo/yolo11n.onnx", "family": "yolo" },
+  { "name": "yolov8n", "path": "F:/code/SimdYolo/models/onnx/yolov8n.onnx", "family": "yolo" },
+  { "name": "yolov8s", "path": "F:/ai/models/yolo/yolov8s.onnx", "family": "yolo" },
+  { "name": "yolo11s", "path": "F:/ai/models/yolo/yolov11s.onnx", "family": "yolo" },
+  { "name": "rfdetr-small", "path": "F:/ai/rfdetr/onnx_model/rfdetr-small.onnx", "family": "detr" },
+  { "name": "rfdetr-medium", "path": "F:/ai/rfdetr/onnx_model/rfdetr-medium.onnx", "family": "detr" }
+]

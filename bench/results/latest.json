@@ -1,0 +1,150 @@
+{
+  "iters": 30,
+  "warmup": 10,
+  "threads": 16,
+  "rounds": 2,
+  "results": [
+    {
+      "model": "yolo11n",
+      "runtime": "onnxsharp",
+      "median_ms": 43.4,
+      "min_ms": 37.6
+    },
+    {
+      "model": "yolo11n",
+      "runtime": "onnxruntime-cpu",
+      "median_ms": 49.45,
+      "min_ms": 34.64
+    },
+    {
+      "model": "yolo11n",
+      "runtime": "opencv-dnn",
+      "median_ms": 34.04,
+      "min_ms": 28.32
+    },
+    {
+      "model": "yolo11n",
+      "runtime": "simdyolo",
+      "median_ms": 35.55,
+      "min_ms": 31.09
+    },
+    {
+      "model": "yolov8n",
+      "runtime": "onnxsharp",
+      "median_ms": 35.1,
+      "min_ms": 33.1
+    },
+    {
+      "model": "yolov8n",
+      "runtime": "onnxruntime-cpu",
+      "median_ms": 53.46,
+      "min_ms": 34.17
+    },
+    {
+      "model": "yolov8n",
+      "runtime": "opencv-dnn",
+      "median_ms": 29.49,
+      "min_ms": 27.77
+    },
+    {
+      "model": "yolov8n",
+      "runtime": "simdyolo",
+      "median_ms": 32.0,
+      "min_ms": 28.59
+    },
+    {
+      "model": "yolov8s",
+      "runtime": "onnxsharp",
+      "median_ms": 88.0,
+      "min_ms": 86.0
+    },
+    {
+      "model": "yolov8s",
+      "runtime": "onnxruntime-cpu",
+      "median_ms": 151.09,
+      "min_ms": 93.06
+    },
+    {
+      "model": "yolov8s",
+      "runtime": "opencv-dnn",
+      "median_ms": 77.28,
+      "min_ms": 75.43
+    },
+    {
+      "model": "yolov8s",
+      "runtime": "simdyolo",
+      "median_ms": 52.05,
+      "min_ms": 49.72
+    },
+    {
+      "model": "yolo11s",
+      "runtime": "onnxsharp",
+      "median_ms": 81.3,
+      "min_ms": 78.9
+    },
+    {
+      "model": "yolo11s",
+      "runtime": "onnxruntime-cpu",
+      "median_ms": 114.89,
+      "min_ms": 63.44
+    },
+    {
+      "model": "yolo11s",
+      "runtime": "opencv-dnn",
+      "median_ms": 73.18,
+      "min_ms": 71.62
+    },
+    {
+      "model": "yolo11s",
+      "runtime": "simdyolo",
+      "median_ms": 58.75,
+      "min_ms": 56.26
+    },
+    {
+      "model": "rfdetr-small",
+      "runtime": "onnxsharp",
+      "median_ms": 317.5,
+      "min_ms": 312.5
+    },
+    {
+      "model": "rfdetr-small",
+      "runtime": "onnxruntime-cpu",
+      "median_ms": 366.13,
+      "min_ms": 294.16
+    },
+    {
+      "model": "rfdetr-small",
+      "runtime": "opencv-dnn",
+      "median_ms": 188.81,
+      "min_ms": 183.04
+    },
+    {
+      "model": "rfdetr-small",
+      "runtime": "simdyolo",
+      "error": "RuntimeError:    at Program.<Main>$(String[] args) in F:\\code\\SimdYolo\\src\\SimdYolo.Cli\\Program.cs:line 39"
+    },
+    {
+      "model": "rfdetr-medium",
+      "runtime": "onnxsharp",
+      "median_ms": 411.8,
+      "min_ms": 405.5
+    },
+    {
+      "model": "rfdetr-medium",
+      "runtime": "onnxruntime-cpu",
+      "median_ms": 514.64,
+      "min_ms": 320.14
+    },
+    {
+      "model": "rfdetr-medium",
+      "runtime": "opencv-dnn",
+      "median_ms": 241.85,
+      "min_ms": 237.66
+    },
+    {
+      "model": "rfdetr-medium",
+      "runtime": "simdyolo",
+      "error": "RuntimeError:    at Program.<Main>$(String[] args) in F:\\code\\SimdYolo\\src\\SimdYolo.Cli\\Program.cs:line 39"
+    }
+  ]
+}
