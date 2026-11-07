@@ -1,35 +1,35 @@
-yolo11n       onnxsharp         {'median_ms': 33.7, 'min_ms': 32.0}
-yolo11n       onnxruntime-cpu   {'median_ms': 46.52, 'min_ms': 25.65}
-yolo11n       opencv-dnn        {'median_ms': 28.87, 'min_ms': 27.91}
-yolo11n       simdyolo          {'median_ms': 29.99, 'min_ms': 26.17}
-yolov8n       onnxsharp         {'median_ms': 36.9, 'min_ms': 33.6}
-yolov8n       onnxruntime-cpu   {'median_ms': 59.32, 'min_ms': 29.95}
-yolov8n       opencv-dnn        {'median_ms': 30.45, 'min_ms': 28.84}
-yolov8n       simdyolo          {'median_ms': 30.37, 'min_ms': 27.49}
-yolov8s       onnxsharp         {'median_ms': 92.2, 'min_ms': 86.7}
-yolov8s       onnxruntime-cpu   {'median_ms': 149.42, 'min_ms': 89.55}
-yolov8s       opencv-dnn        {'median_ms': 77.22, 'min_ms': 72.71}
-yolov8s       simdyolo          {'median_ms': 51.83, 'min_ms': 49.18}
-yolo11s       onnxsharp         {'median_ms': 83.1, 'min_ms': 79.4}
-yolo11s       onnxruntime-cpu   {'median_ms': 140.62, 'min_ms': 102.34}
-yolo11s       opencv-dnn        {'median_ms': 73.95, 'min_ms': 70.2}
-yolo11s       simdyolo          {'median_ms': 53.85, 'min_ms': 49.73}
-rfdetr-small  onnxsharp         {'median_ms': 230.4, 'min_ms': 220.0}
-rfdetr-small  onnxruntime-cpu   {'median_ms': 432.58, 'min_ms': 317.64}
-rfdetr-small  opencv-dnn        {'median_ms': 204.93, 'min_ms': 193.97}
+yolo11n       onnxsharp         {'median_ms': 35.7, 'min_ms': 32.6}
+yolo11n       onnxruntime-cpu   {'median_ms': 39.39, 'min_ms': 25.15}
+yolo11n       opencv-dnn        {'median_ms': 29.45, 'min_ms': 27.68}
+yolo11n       simdyolo          {'median_ms': 34.85, 'min_ms': 31.41}
+yolov8n       onnxsharp         {'median_ms': 35.5, 'min_ms': 33.6}
+yolov8n       onnxruntime-cpu   {'median_ms': 67.99, 'min_ms': 31.84}
+yolov8n       opencv-dnn        {'median_ms': 31.95, 'min_ms': 28.17}
+yolov8n       simdyolo          {'median_ms': 29.33, 'min_ms': 25.76}
+yolov8s       onnxsharp         {'median_ms': 101.6, 'min_ms': 97.0}
+yolov8s       onnxruntime-cpu   {'median_ms': 243.19, 'min_ms': 131.45}
+yolov8s       opencv-dnn        {'median_ms': 85.38, 'min_ms': 79.22}
+yolov8s       simdyolo          {'median_ms': 61.99, 'min_ms': 54.91}
+yolo11s       onnxsharp         {'median_ms': 97.5, 'min_ms': 85.9}
+yolo11s       onnxruntime-cpu   {'median_ms': 195.07, 'min_ms': 100.63}
+yolo11s       opencv-dnn        {'median_ms': 83.28, 'min_ms': 75.2}
+yolo11s       simdyolo          {'median_ms': 67.37, 'min_ms': 59.0}
+rfdetr-small  onnxsharp         {'median_ms': 264.1, 'min_ms': 240.1}
+rfdetr-small  onnxruntime-cpu   {'median_ms': 607.81, 'min_ms': 465.3}
+rfdetr-small  opencv-dnn        {'median_ms': 222.15, 'min_ms': 205.66}
 rfdetr-small  simdyolo          {'error': 'RuntimeError:    at Program.<Main>$(String[] args) in F:\\code\\SimdYolo\\src\\SimdYolo.Cli\\Program.cs:line 39'}
-rfdetr-medium onnxsharp         {'median_ms': 321.5, 'min_ms': 304.0}
-rfdetr-medium onnxruntime-cpu   {'median_ms': 638.41, 'min_ms': 458.62}
-rfdetr-medium opencv-dnn        {'median_ms': 304.45, 'min_ms': 263.5}
+rfdetr-medium onnxsharp         {'median_ms': 382.2, 'min_ms': 319.6}
+rfdetr-medium onnxruntime-cpu   {'median_ms': 613.88, 'min_ms': 472.37}
+rfdetr-medium opencv-dnn        {'median_ms': 250.73, 'min_ms': 238.62}
 rfdetr-medium simdyolo          {'error': 'RuntimeError:    at Program.<Main>$(String[] args) in F:\\code\\SimdYolo\\src\\SimdYolo.Cli\\Program.cs:line 39'}
 
 | ģ�� | onnxsharp | onnxruntime-cpu | opencv-dnn | simdyolo |
 | --- | ---: | ---: | ---: | ---: |
-| yolo11n | 33.7 | 46.5 | 28.9 | 30.0 |
-| yolov8n | 36.9 | 59.3 | 30.4 | 30.4 |
-| yolov8s | 92.2 | 149.4 | 77.2 | 51.8 |
-| yolo11s | 83.1 | 140.6 | 74.0 | 53.9 |
-| rfdetr-small | 230.4 | 432.6 | 204.9 | N/A |
-| rfdetr-medium | 321.5 | 638.4 | 304.4 | N/A |
+| yolo11n | 35.7 | 39.4 | 29.4 | 34.9 |
+| yolov8n | 35.5 | 68.0 | 31.9 | 29.3 |
+| yolov8s | 101.6 | 243.2 | 85.4 | 62.0 |
+| yolo11s | 97.5 | 195.1 | 83.3 | 67.4 |
+| rfdetr-small | 264.1 | 607.8 | 222.2 | N/A |
+| rfdetr-medium | 382.2 | 613.9 | 250.7 | N/A |
 
 written: F:\code\OnnxSharp\bench\results\latest.json

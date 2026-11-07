@@ -7,116 +7,116 @@
     {
       "model": "yolo11n",
       "runtime": "onnxsharp",
-      "median_ms": 33.7,
-      "min_ms": 32.0
+      "median_ms": 36.7,
+      "min_ms": 33.3
     },
     {
       "model": "yolo11n",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 46.52,
-      "min_ms": 25.65
+      "median_ms": 41.18,
+      "min_ms": 27.79
     },
     {
       "model": "yolo11n",
       "runtime": "opencv-dnn",
-      "median_ms": 28.87,
-      "min_ms": 27.91
+      "median_ms": 28.57,
+      "min_ms": 27.31
     },
     {
       "model": "yolo11n",
       "runtime": "simdyolo",
-      "median_ms": 29.99,
-      "min_ms": 26.17
+      "median_ms": 34.65,
+      "min_ms": 31.21
     },
     {
       "model": "yolov8n",
       "runtime": "onnxsharp",
-      "median_ms": 36.9,
-      "min_ms": 33.6
+      "median_ms": 35.8,
+      "min_ms": 33.4
     },
     {
       "model": "yolov8n",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 59.32,
-      "min_ms": 29.95
+      "median_ms": 57.5,
+      "min_ms": 35.81
     },
     {
       "model": "yolov8n",
       "runtime": "opencv-dnn",
-      "median_ms": 30.45,
-      "min_ms": 28.84
+      "median_ms": 30.85,
+      "min_ms": 29.0
     },
     {
       "model": "yolov8n",
       "runtime": "simdyolo",
-      "median_ms": 30.37,
-      "min_ms": 27.49
+      "median_ms": 27.6,
+      "min_ms": 24.37
     },
     {
       "model": "yolov8s",
       "runtime": "onnxsharp",
-      "median_ms": 92.2,
-      "min_ms": 86.7
+      "median_ms": 92.4,
+      "min_ms": 88.0
     },
     {
       "model": "yolov8s",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 149.42,
-      "min_ms": 89.55
+      "median_ms": 158.5,
+      "min_ms": 92.94
     },
     {
       "model": "yolov8s",
       "runtime": "opencv-dnn",
-      "median_ms": 77.22,
-      "min_ms": 72.71
+      "median_ms": 77.35,
+      "min_ms": 74.91
     },
     {
       "model": "yolov8s",
       "runtime": "simdyolo",
-      "median_ms": 51.83,
-      "min_ms": 49.18
+      "median_ms": 56.67,
+      "min_ms": 53.22
     },
     {
       "model": "yolo11s",
       "runtime": "onnxsharp",
-      "median_ms": 83.1,
-      "min_ms": 79.4
+      "median_ms": 85.1,
+      "min_ms": 81.6
     },
     {
       "model": "yolo11s",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 140.62,
-      "min_ms": 102.34
+      "median_ms": 111.22,
+      "min_ms": 64.41
     },
     {
       "model": "yolo11s",
       "runtime": "opencv-dnn",
-      "median_ms": 73.95,
-      "min_ms": 70.2
+      "median_ms": 73.13,
+      "min_ms": 71.18
     },
     {
       "model": "yolo11s",
       "runtime": "simdyolo",
-      "median_ms": 53.85,
-      "min_ms": 49.73
+      "median_ms": 58.65,
+      "min_ms": 55.32
     },
     {
       "model": "rfdetr-small",
       "runtime": "onnxsharp",
-      "median_ms": 230.4,
-      "min_ms": 220.0
+      "median_ms": 231.5,
+      "min_ms": 219.8
     },
     {
       "model": "rfdetr-small",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 432.58,
-      "min_ms": 317.64
+      "median_ms": 382.7,
+      "min_ms": 300.42
     },
     {
       "model": "rfdetr-small",
       "runtime": "opencv-dnn",
-      "median_ms": 204.93,
-      "min_ms": 193.97
+      "median_ms": 191.7,
+      "min_ms": 187.27
     },
     {
       "model": "rfdetr-small",
@@ -126,20 +126,20 @@
     {
       "model": "rfdetr-medium",
       "runtime": "onnxsharp",
-      "median_ms": 321.5,
-      "min_ms": 304.0
+      "median_ms": 299.4,
+      "min_ms": 287.0
     },
     {
       "model": "rfdetr-medium",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 638.41,
-      "min_ms": 458.62
+      "median_ms": 454.96,
+      "min_ms": 297.52
     },
     {
       "model": "rfdetr-medium",
       "runtime": "opencv-dnn",
-      "median_ms": 304.45,
-      "min_ms": 263.5
+      "median_ms": 243.08,
+      "min_ms": 237.02
     },
     {
       "model": "rfdetr-medium",

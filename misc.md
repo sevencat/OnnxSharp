@@ -599,6 +599,23 @@ Tile TopK Transpose Unsqueeze Where
     - 排查手段只有 `profile` 的 by-type 表：**「算子个数少但耗时占比高」就是它**。
       GridSample 只有 3 个却占 2.3%，而同耗时的 MatMul 有 139 个 —— 单算子效率差两个数量级，一眼可疑。
 
+### 6.7 全表测量的两条铁律（2026-11-07 第七轮踩到）
+
+48. **跑全表前先确认没有满载进程**。第七轮开跑时 `SC2_x64` 在前台跑游戏，5 秒吃掉 5.03 秒 CPU（一个核满载），
+    结果前两轮全表整轮作废：同一份代码，ORT 的 yolov8s median 跑出 243 / 194，OpenCV 的 rfdetr-small 跑出 222 / 275，
+    而我们自己 264.1 / 243.0 —— 全部落在 ±20% 的噪声里，什么也读不出来。
+    确认成本只有 5 秒：
+    ```powershell
+    $a=(Get-Process SC2_x64).CPU; Start-Sleep 4; (Get-Process SC2_x64).CPU - $a   # 接近 4 说明它占满一个核
+    ```
+    一般结论：**`bench.md` 里的绝对值只在「同一会话、安静机器」下有效**，跨会话只能比同表内部的**倍率**。
+49. **「追平对手」的结论至少要看对手两轮的读数**。第五轮我们记下「rfdetr 对 OpenCV 1.12 / 1.06，已追平」，
+    第七轮同一份 OpenCV 代码跑出 191.7 / 243.1（medium 快了 **20%**）—— 说明第五轮是**对方发挥失常**，
+    真实差距一直是 1.2× 左右。我们自己的数字两轮几乎没变（231.5 vs 230.4、299.4 vs 321.5），
+    所以问题完全出在「拿对方的一次异常读数当基准」。
+    - 判定规则：**双方绝对值都落在各自历史区间内**，比值才写进结论；否则只写「本轮 N 倍，待复核」。
+    - 反向也成立：**不要因为对手某一轮变快就认为我们回归了**（第五轮 yolov8s 的 1.54→1.78 就是这么来的）。
+
 ---
 
 ## 7. 工具脚本
@@ -889,6 +906,7 @@ SMOKE TEST: PASS
 | 2026-11-07 | **建立 `bench.md`（性能唯一事实源）+ `bench/` 脚本体系**：`run_all.py` 一条命令跑 4 引擎 × 6 模型（OnnxSharp / ORT CPU / OpenCV 5 dnn / SimdYolo，YOLO×4 + RF-DETR×2），输出 median/min 双指标；实测 yolo11n 43.4 ms、rfdetr-small 317.5 ms。新增坑 #36（分层编译按次数预热会低估 4 倍） |
 | 2026-11-07 | **逐元素图级融合落地**（`GraphFusion.FuseElementWiseChains` + `Ops/FusedEltwiseLayer.cs`）：GELU `Div→Erf→Add→Mul→Mul` 编译成单层，rfdetr-small 12 条链、节点 857→801，端到端 **-7.4% / medium -9.1%**，输出 max\|diff\|=0。新增 §6.6 坑 #42~#46（运行期下标的 `Vector256[]` 会被 JIT 打回内存、短链必须设门槛、GELU 实际算子顺序、golden 覆盖不足要用 `run --dump` 逐值 A/B、沿消费者而非生产者遍历）；§9 目录树补 `FusedEltwiseLayer.cs`；CLI `run` 新增 `--dump <dir>` |
 | 2026-11-07 | **修 `GridSampleLayer` 的循环顺序 bug**：通道 `c` 原本在最内层而输出是 NCHW（写步长 `outH*outW`，每元素换缓存行），改为 `c` 外提 + 采样坐标预算到 `ArrayPool`。3 个算子 1.6 → 0.92 ms/个（-48%），端到端 rfdetr-small -1.4% / medium -1.1%（min），逐值 diff=0。新增坑 #47（「写得顺不顺」类 bug 不报错只是慢，"算子个数少但占比高"是唯一线索）；记录本机 median 抖动 ±8%，小改动只能用 min 或 profile 判定 |
+| 2026-11-07 | **第七轮全表复测 + 修正「已追平 OpenCV」的错误结论**：rfdetr 231.5 / 299.4 ms，对 OpenCV（191.7 / 243.1）为 **1.21× / 1.23×**，对 ORT 0.60× / 0.66×；yolo 侧 vs ORT 0.58~0.89、vs OpenCV 1.16~1.28、vs SimdYolo 1.06~1.63。上一轮记的 1.12 / 1.06 是 **OpenCV 自身发挥失常**（medium 从 304.4 变到 243.1，-20%）造成的假象。新增坑 #48（比值只在双方都落在各自历史区间时可信；跑全表前先用 `(Get-Process).CPU` 增量确认没有满载进程——本轮 `SC2_x64` 占核导致前两轮作废） |
 | 2026-11-07 | **上一轮：RF-DETR 瓶颈定位到 batched attention GEMM**（结论后被修正）。新增 §6.5 坑 #36~#39（分层编译预热、A/B 必须交替、两个已否决的内核方向、`Parallel.For` 7 µs 阈值）；`gemmbench` 加 `--batch` 并改为按时间预热；新增 `bench/make_micro_models.py` |
 | 2026-11-07 | **本轮：修正上一轮两个错误结论 + 修掉最大单点浪费**。① §3.10 重写：140 个 MatMul 里 MLP（`[257,384]×[384,1536]`）与投影都是真 MatMul，合计 **54.1 GFLOP**（前置 batch 4），in-situ 407 GFLOPS，GEMM 已到顶；② 机器上限用 `fma` 重新量：单线程 91 GFLOPS、16 线程 753 GFLOPS；③ `MatMul` 在 B 不广播时合并 `(batch, m)`（decoder q/k/v 投影是 `[300,1,256]×[256,256]`，权重曾被打包 300 遍，4.06 → 0.13 ms），rfdetr-small **356 → 270 ms（-24%）**、medium -12%；④ `ProfileAll` 加预热与每算子最小耗时（坑 #41）；⑤ 新增 `fma`、`gemmbench --threads`、逐元素带宽与链式 MLP 微模型、`bench` 的 `alloc`/`gc`/`gc pause` 诊断；⑥ 排除 GC（0.7 ms/iter）与降频（长跑不衰减）两个嫌疑，剩下的计时差指向 host 侧每 forward 重算 2064 个算子的形状并分配 113 MB；新增坑 #40（独立内核吞吐无法预测端到端） |
 

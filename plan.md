@@ -657,17 +657,19 @@ onnx.save(m, sys.argv[2])
 
 目标（本机 Ryzen 7 8845HS，8C/16T，FP32 batch=1，16 线程）：
 
-| 模型 | 当前实测（median，2026-11-07 第五轮） | 同期 OpenCV dnn | 优化后目标 |
+| 模型 | 当前实测（median，2026-11-07 第七轮） | 同期 OpenCV dnn | 优化后目标 |
 |---|---|---|---|
-| yolo11n 640² | 33.7 ms | 28.9 | **< 30 ms** |
-| yolo11s 640² | 83.1 ms | 74.0 | < 75 ms |
-| yolov8n 640² | 36.9 ms | 30.4 | < 30 ms |
-| yolov8s 640² | 92.2 ms | 77.2 | < 77 ms |
-| rfdetr-small 512² | 230.4 ms | 204.9 | **< 205 ms**（追平 OpenCV dnn） |
-| rfdetr-medium 576² | 321.5 ms | 304.4 | < 305 ms |
+| yolo11n 640² | 36.7 ms | 28.6 | **< 30 ms** |
+| yolo11s 640² | 85.1 ms | 73.1 | < 75 ms |
+| yolov8n 640² | 35.8 ms | 30.9 | < 30 ms |
+| yolov8s 640² | 92.4 ms | 77.4 | < 77 ms |
+| rfdetr-small 512² | 231.5 ms | 191.7 | **< 192 ms**（追平 OpenCV dnn） |
+| rfdetr-medium 576² | 299.4 ms | 243.1 | < 244 ms |
 
-> 目标已按「同期同会话的 OpenCV dnn 实测」重设（原目标写于 rfdetr 还慢 1.4× 的时候）。
-> `yolov8s < 55 ms` 那档不再作为近期目标：它要求追平 SimdYolo（51.8），属于 `s` 档大 GEMM 打包的独立课题。
+> 目标按「同期同会话的 OpenCV dnn 实测」设定（每轮随对方实测平移）。
+> 第五轮曾把 rfdetr 目标设在 205 / 305，那一轮的 OpenCV 数字（204.9 / 304.4）本身失常，
+> 第七轮对方跑出 191.7 / 243.1 —— 目标已随之收紧。**改目标前先确认对方读数在历史区间内。**
+> `yolov8s < 55 ms` 那档不再作为近期目标：它要求追平 SimdYolo（56.7），属于 `s` 档大 GEMM 打包的独立课题。
 
 > 口径说明：
 > - 原「首版 < 150 ms」对标标量 kernel 偏乐观，已放弃该阶段口径；现直接对标 OpenCV 5 dnn / SimdYolo 实测值。
@@ -692,6 +694,8 @@ onnx.save(m, sys.argv[2])
 | **融合后的瓶颈分布**（rfdetr-small，by-type，sum-of-min 211 ms）：`MatMul 64.3%`、`Add 6.6%`、`Transpose 6.1%`、`Conv 3.6%`、`Softmax 3.4%`、`Mul 2.3%`、`LayerNorm 2.3%`、**`GridSample 2.3%`**、`FusedEltwise 1.8%`。MatMul 占比**升**了，因为别的部分变快了，而它本身已 407 GFLOPS —— 只剩 3~7% 的碎块可挖 | `profile --top 1` 的 by-type 段 |
 | ~~`GridSample` 循环顺序 bug~~ **已修复**：原实现把通道 `c` 放最内层而输出是 NCHW（写步长 `outH*outW`，每元素换缓存行）。`c` 外提 + 采样坐标预算后 1.6 → 0.92 ms/个（**-48%**），端到端 rfdetr-small -1.4% / medium -1.1%（min），逐值 diff=0 | `profile` by-type 前后对比 + 6 轮交替 A/B |
 | 小改动（<2%）在本机**只能用 min 或逐算子 profile 判定**：同代码重跑 6 次，yolo11n median 抖 49.2~53.5、yolov8s 96.9~106.9（±8%），后台负载会把信号整个淹没 | `ab_fuse.ps1` 6 轮交替实测 |
+| **「追平对手」不能只看一轮比值**：第五轮记的 rfdetr vs OpenCV = 1.12/1.06（"已追平"），第七轮对方同代码跑出 191.7/243.1（medium 快 20%），说明那是对方发挥失常；真实差距一直是 **1.21~1.23×**。我们自己两轮几乎没变（231.5/299.4 vs 230.4/321.5） | `bench.md` 4.1 + 第七轮复测 |
+| **跑全表前先查满载进程**：第七轮 `SC2_x64` 占满一个核，导致两轮全表作废（ORT 的 yolov8s 跑出 243/194 两次）。`(Get-Process X).CPU` 隔 4 秒的增量 ≈ 4 就说明它占满一核 | 第七轮实测 |
 | **独立内核吞吐无法预测端到端**：B 预打包、`mb` 扫参、列切分（+45%）三次都出现「微基准变快、端到端无变化」；且统计 FLOPs 时漏掉前置 batch 会凭空造出「慢 3 倍」的假象。只能用同会话交替 A/B 判定 | `bench.md` 结论 3 |
 | GC 与降频都已排除：GC 暂停 0.7 ms/iter；同一形状连续跑 3000 次不衰减（383 vs 386 GFLOPS）。**profile 与 bench 的唯一差别只是口径**：各算子均值之和 251 ms ≈ 端到端中位数，min 之和 215 ms 是下界 | `bench` 新增的 `alloc`/`gc`/`gc pause` 三行输出 |
 
