@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using OnnxSharp.Core;
+using OnnxSharp.Threading;
 
 namespace OnnxSharp.Tensors;
 
@@ -26,6 +27,12 @@ public enum UnaryOpKind
     Erf,
     Sin,
     Cos,
+
+    /// <summary>
+    /// <c>x · sigmoid(x)</c>。ONNX 里 SiLU（Swish）总是导出成 <c>Sigmoid → Mul</c> 两个节点，
+    /// 图级融合后走这一个内核，省掉一整遍读+写。
+    /// </summary>
+    Silu,
 }
 
 /// <summary>
@@ -196,7 +203,10 @@ public static class TensorOps
         return sign * (1f - poly * MathF.Exp(-ax * ax));
     }
 
-    public static void ElementWiseUnary(UnaryOpKind op, Tensor a, Tensor c)
+    /// <summary>低于该元素数时逐元素算子不开线程（调度开销盖过收益）。</summary>
+    private const int ParallelElementThreshold = 1 << 16;
+
+    public static unsafe void ElementWiseUnary(UnaryOpKind op, Tensor a, Tensor c)
     {
         if (a.DType != DType.F32 || c.DType != DType.F32)
             throw new NotSupportedException("unary kernel supports F32 only");
@@ -207,58 +217,105 @@ public static class TensorOps
             throw new OnnxSharpException($"unary op size mismatch: {sa.Length} vs {sc.Length}");
 
         int n = sc.Length;
-        int width = Vector<float>.Count;
-        int i = 0;
+        if (n <= 0)
+            return;
 
-        // switch 提到循环外：Erf/Sigmoid 之类每元素都要一次分派，热路径上代价很高
+        // 一次 pin + 按区间并行：Sigmoid/Erf 这类纯算术算子单核已经吃满，
+        // 想再快只能横向摊开（yolo 里 78 个 Sigmoid 原本串行占 15%）。
+        // 指针本身不能进 lambda（CS1764），转成 IntPtr 再在回调里还原。
+        fixed (float* ps = sa)
+        fixed (float* pd = sc)
+        {
+            if (n >= ParallelElementThreshold && ParallelRange.Threads > 1)
+            {
+                IntPtr pin = (IntPtr)ps;
+                IntPtr pout = (IntPtr)pd;
+                ParallelRange.For(n, (begin, end) => UnaryRange(op, (float*)pin, (float*)pout, begin, end));
+            }
+            else
+            {
+                UnaryRange(op, ps, pd, 0, n);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 一元算子的区间内核。<c>switch</c> 在区间外层，内层只有矢量化循环。
+    /// </summary>
+    private static unsafe void UnaryRange(UnaryOpKind op, float* sa, float* sc, int begin, int end)
+    {
+        int i = begin;
+
         switch (op)
         {
             case UnaryOpKind.Relu:
-                for (; i <= n - width; i += width)
-                    Vector.Max(new Vector<float>(sa.Slice(i)), Vector<float>.Zero).CopyTo(sc.Slice(i));
-                for (; i < n; i++) sc[i] = sa[i] > 0f ? sa[i] : 0f;
+                if (Avx.IsSupported)
+                {
+                    for (; i <= end - 8; i += 8)
+                        Avx.Store(sc + i, Avx.Max(Avx.LoadVector256(sa + i), Vector256<float>.Zero));
+                }
+
+                for (; i < end; i++) sc[i] = sa[i] > 0f ? sa[i] : 0f;
                 break;
 
             case UnaryOpKind.Neg:
-                for (; i <= n - width; i += width)
-                    (-new Vector<float>(sa.Slice(i))).CopyTo(sc.Slice(i));
-                for (; i < n; i++) sc[i] = -sa[i];
+                if (Avx.IsSupported)
+                {
+                    var sign = Vector256.Create(-0.0f);
+                    for (; i <= end - 8; i += 8)
+                        Avx.Store(sc + i, Avx.Xor(Avx.LoadVector256(sa + i), sign));
+                }
+
+                for (; i < end; i++) sc[i] = -sa[i];
                 break;
 
             case UnaryOpKind.Abs:
-                for (; i <= n - width; i += width)
-                    Vector.Abs(new Vector<float>(sa.Slice(i))).CopyTo(sc.Slice(i));
-                for (; i < n; i++) sc[i] = MathF.Abs(sa[i]);
+                if (Avx.IsSupported)
+                {
+                    var sign = Vector256.Create(-0.0f);
+                    for (; i <= end - 8; i += 8)
+                        Avx.Store(sc + i, Avx.AndNot(sign, Avx.LoadVector256(sa + i)));
+                }
+
+                for (; i < end; i++) sc[i] = MathF.Abs(sa[i]);
                 break;
 
             case UnaryOpKind.Sqrt:
-                for (; i <= n - width; i += width)
-                    Vector.SquareRoot(new Vector<float>(sa.Slice(i))).CopyTo(sc.Slice(i));
-                for (; i < n; i++) sc[i] = MathF.Sqrt(sa[i]);
+                if (Avx.IsSupported)
+                {
+                    for (; i <= end - 8; i += 8)
+                        Avx.Store(sc + i, Avx.Sqrt(Avx.LoadVector256(sa + i)));
+                }
+
+                for (; i < end; i++) sc[i] = MathF.Sqrt(sa[i]);
                 break;
 
             case UnaryOpKind.Exp:
-                VectorMath.Exp(sa, sc);
-                return;
+                VectorMath.Exp(sa + begin, sc + begin, end - begin);
+                break;
 
             case UnaryOpKind.Sigmoid:
-                VectorMath.Sigmoid(sa, sc);
-                return;
+                VectorMath.Sigmoid(sa + begin, sc + begin, end - begin);
+                break;
 
             case UnaryOpKind.Erf:
-                VectorMath.Erf(sa, sc);
-                return;
+                VectorMath.Erf(sa + begin, sc + begin, end - begin);
+                break;
+
+            case UnaryOpKind.Silu:
+                VectorMath.Silu(sa + begin, sc + begin, end - begin);
+                break;
 
             case UnaryOpKind.Sin:
-                for (; i < n; i++) sc[i] = MathF.Sin(sa[i]);
+                for (; i < end; i++) sc[i] = MathF.Sin(sa[i]);
                 break;
 
             case UnaryOpKind.Cos:
-                for (; i < n; i++) sc[i] = MathF.Cos(sa[i]);
+                for (; i < end; i++) sc[i] = MathF.Cos(sa[i]);
                 break;
 
             default:
-                for (; i < n; i++) sc[i] = Apply(op, sa[i]);
+                for (; i < end; i++) sc[i] = Apply(op, sa[i]);
                 break;
         }
     }
@@ -340,17 +397,33 @@ public static class TensorOps
         fixed (float* py = y)
         fixed (float* pc = c)
         {
-            int i = 0;
-
-            if (Avx.IsSupported)
+            if (n >= ParallelElementThreshold && ParallelRange.Threads > 1)
             {
-                for (; i <= n - 8; i += 8)
-                    Avx.Store(pc + i, T.Apply(Avx.LoadVector256(px + i), Avx.LoadVector256(py + i)));
+                IntPtr p1 = (IntPtr)px;
+                IntPtr p2 = (IntPtr)py;
+                IntPtr p3 = (IntPtr)pc;
+                ParallelRange.For(n, (begin, end) => ContiguousRange<T>((float*)p1, (float*)p2, (float*)p3, begin, end));
             }
-
-            for (; i < n; i++)
-                pc[i] = T.Apply(px[i], py[i]);
+            else
+            {
+                ContiguousRange<T>(px, py, pc, 0, n);
+            }
         }
+    }
+
+    private static unsafe void ContiguousRange<T>(float* px, float* py, float* pc, int begin, int end)
+        where T : struct, IBinaryKernel
+    {
+        int i = begin;
+
+        if (Avx.IsSupported)
+        {
+            for (; i <= end - 8; i += 8)
+                Avx.Store(pc + i, T.Apply(Avx.LoadVector256(px + i), Avx.LoadVector256(py + i)));
+        }
+
+        for (; i < end; i++)
+            pc[i] = T.Apply(px[i], py[i]);
     }
 
     private static void ApplyContiguous(
@@ -522,6 +595,7 @@ public static class TensorOps
         UnaryOpKind.Erf => Erf(a),
         UnaryOpKind.Sin => MathF.Sin(a),
         UnaryOpKind.Cos => MathF.Cos(a),
+        UnaryOpKind.Silu => a * (1f / (1f + MathF.Exp(-a))),
         _ => throw new ArgumentOutOfRangeException(nameof(op), op, null),
     };
 }

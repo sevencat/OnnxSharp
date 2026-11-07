@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
+using OnnxSharp.Threading;
 
 namespace OnnxSharp.Ops;
 
@@ -10,6 +11,9 @@ namespace OnnxSharp.Ops;
 /// </summary>
 internal static class ShapeOps
 {
+    /// <summary>Concat 低于该元素数时不开线程（拷贝太小，调度开销盖过收益）。</summary>
+    private const int ParallelConcatThreshold = 1 << 16;
+
     public static void Register()
     {
         LayerRegistry.Register("Reshape", p => new ReshapeLayer(p));
@@ -176,6 +180,26 @@ internal static class ShapeOps
                 ? OpUtil.Product(outDims.AsSpan(axis + 1))
                 : 1;
             long outBlock = (long)outDims[axis] * inner;
+
+            // yolo 里的 Concat 都是 axis=1、outer=1、3~4 个输入，串行版就是一条
+            // 单线程 memcpy 搬 1~2 MB。各输入的落点互不重叠，直接按输入摊开。
+            if (outer == 1
+                && inputs.Count > 1
+                && output.Count >= ParallelConcatThreshold
+                && ParallelRange.Threads > 1)
+            {
+                var blocks = new long[inputs.Count + 1];
+                for (int i = 0; i < inputs.Count; i++)
+                    blocks[i + 1] = blocks[i] + (long)inputs[i].Shape.Dims[axis] * inner;
+
+                ParallelRange.For(inputs.Count, (begin, end) =>
+                {
+                    for (int i = begin; i < end; i++)
+                        OpUtil.CopyBytes(inputs[i], 0, output, blocks[i], blocks[i + 1] - blocks[i]);
+                });
+
+                return;
+            }
 
             long offset = 0;
             foreach (var input in inputs)

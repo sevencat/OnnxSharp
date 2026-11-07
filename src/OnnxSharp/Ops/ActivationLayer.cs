@@ -26,6 +26,9 @@ public sealed class ActivationLayer : Layer
         LayerRegistry.Register("Erf", p => new ActivationLayer(p, UnaryOpKind.Erf));
         LayerRegistry.Register("Sin", p => new ActivationLayer(p, UnaryOpKind.Sin));
         LayerRegistry.Register("Cos", p => new ActivationLayer(p, UnaryOpKind.Cos));
+
+        // 不是 ONNX 算子：图级融合（Sigmoid → Mul）的产物，见 GraphFusion。
+        LayerRegistry.Register("Silu", p => new ActivationLayer(p, UnaryOpKind.Silu));
     }
 
     public override void GetMemoryShapes(

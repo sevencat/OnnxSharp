@@ -119,6 +119,20 @@ public class LayerInfo
 }
 
 /// <summary>
+/// 允许把紧随其后的逐元素激活算子（SiLU/Relu）吸收进自己的输出端。
+/// <para>
+/// 由 <see cref="GraphFusion"/> 设置：激活层的输出 Arg 会挂到本层头上，
+/// 本层写完输出后<b>就地</b>做一次激活。省掉一次独立的算子调用与一轮
+/// 「读整张输出、再写整张输出」的流量，代价只是本层多一趟缓存内的读改写。
+/// </para>
+/// </summary>
+internal interface IActivationFusable
+{
+    /// <summary>None 表示不融合；否则在 Forward 末尾对输出张量原地做该激活。</summary>
+    UnaryOpKind? FusedActivation { get; set; }
+}
+
+/// <summary>
 /// 可执行算子。CPU 路径下与 <see cref="LayerInfo"/> 为同一对象
 /// （对齐 OpenCV 中 <c>Layer : LayerInfo</c> 的设计）。
 /// </summary>

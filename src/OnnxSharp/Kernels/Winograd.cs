@@ -30,6 +30,12 @@ internal static unsafe class Winograd
     /// <summary>权重变换结果的上限（float 个数），超过就交回 im2col，免得白占几十 MB。</summary>
     private const long MaxTransformedWeights = 1L << 24;
 
+    /// <summary>
+    /// 允许走 Winograd 的最大输出空间像素数（默认 64×64）。超过就交回 im2col。
+    /// 抬到 <see cref="long.MaxValue"/> 可以强制所有 3×3 层都走 Winograd（调参/基准用）。
+    /// </summary>
+    internal static long MaxSpatialPixels = 4096;
+
     private static readonly ConditionalWeakTable<Tensor, float[]> WeightCache = new();
 
     /// <summary>判断这层能不能走 Winograd，能就执行并返回 true。</summary>
@@ -81,7 +87,7 @@ internal static unsafe class Winograd
         // 相当于 30 个输出通道的成本。空间大时 im2col 的复用更好：
         // 160×160 的 32→32 上 Winograd 4.3 ms、im2col 1.7 ms；80×80 的 64→64 是 2.2 vs 1.3。
         // 到 40×40 以下 im2col 的并行度和复用一起塌掉，Winograd 反超 2~4 倍。
-        if ((long)inH * inW > 4096)
+        if ((long)inH * inW > MaxSpatialPixels)
             return false;
 
         if ((long)outChannels * channels * Components > MaxTransformedWeights)
@@ -151,7 +157,7 @@ internal static unsafe class Winograd
         int tilesY = (inH + TileOut - 1) / TileOut;
         int tilesX = (inW + TileOut - 1) / TileOut;
 
-        int threads = Environment.ProcessorCount;
+        int threads = ParallelRange.Threads;
 
         // V 与 M 各占 16×max(ic, oc)×tiles 个 float，单块控制在一两 MB
         int budgetTiles = Math.Max(threads * 16, (1 << 21) / (4 * Components * Math.Max(inChannels, outChannels)));

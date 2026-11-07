@@ -3,6 +3,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using OnnxSharp.Threading;
 
 namespace OnnxSharp.Tensors;
 
@@ -72,7 +73,7 @@ internal static class GemmKernel
         int nb = SelectColumnBlock(n);
 
         bool useParallel = parallel && (long)m * n * k >= ParallelThreshold && m > 1;
-        int threads = Environment.ProcessorCount;
+        int threads = ParallelRange.Threads;
         int columnBlocks = (n + nb - 1) / nb;
 
         fixed (float* pa = a)
@@ -363,6 +364,8 @@ internal static class GemmKernel
         MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3]);
     }
 
+
+
     /// <summary>
     /// 列块宽度。取 16（2 个 AVX 向量）：打包后的 B 面板是 <c>k×nb×4</c> 字节，
     /// k=256 时正好 16 KB，能整块待在 32 KB 的 L1 里；取 64 的话面板 64 KB 落到 L2，
@@ -391,7 +394,8 @@ internal static class GemmKernel
     /// k 轮下来 C 只写一次。逐轮 load/store C 会让访存和 FMA 抢发射端口，是最容易踩的坑。
     /// </para>
     /// </summary>
-    private static unsafe void MultiplyRow(float* a, float* b, float* c, int k, int width, int bStride, float bias = 0f)
+    private static unsafe void MultiplyRow(
+        float* a, float* b, float* c, int k, int width, int bStride, float bias = 0f)
     {
         int j = 0;
 

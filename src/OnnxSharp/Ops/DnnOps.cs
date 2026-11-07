@@ -67,8 +67,11 @@ internal static class DnnOps
 
     // ---------------- Conv ----------------
 
-    private sealed class ConvLayer : Layer
+    private sealed class ConvLayer : Layer, IActivationFusable
     {
+        /// <inheritdoc />
+        public UnaryOpKind? FusedActivation { get; set; }
+
         private readonly int _group;
         private readonly int[] _kernelShape;
         private readonly int[] _strides;
@@ -190,6 +193,15 @@ internal static class DnnOps
                     input, weight, bias, output,
                     _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1]);
             }
+
+            // 图级融合进来的激活（yolo 里每个卷积后面都跟着 SiLU）：
+            // 输出刚写完还在 L1/L2 里，就地再过一遍比单独跑一个算子的开销小。
+            //
+            // 试过把激活塞进 GEMM 微内核的 epilogue（累加器直接激活再 store），
+            // 结果更慢 26ms：多出来的调用把 16 个累加器 YMM 全挤出寄存器，
+            // 主循环退化。所以这里保持在 GEMM 之外、但紧贴着的就地一趟。
+            if (FusedActivation is { } activation)
+                TensorOps.ElementWiseUnary(activation, output, output);
         }
     }
 
@@ -588,91 +600,87 @@ internal static class DnnOps
                 return;
 
             // 按 outer（attention 里就是 batch*heads*rows）并行；每行内部保持顺序累加，数值不变。
-            ParallelRange.For(outer, (begin, end) =>
+            var src = input.AsSpan<float>();
+            var dst = output.AsSpan<float>();
+
+            if (inner == 1)
             {
-                var src = input.AsSpan<float>();
-                var dst = output.AsSpan<float>();
-
-                for (int o = begin; o < end; o++)
+                // DFL 是 33600 组 16 元素：pin 一次、并行区间直接算，省掉每组一次
+                // Span.Slice + fixed + 函数调用的固定开销（原来 12 ns/元素）。
+                unsafe
                 {
-                    if (inner == 1)
+                    fixed (float* ps = src)
+                    fixed (float* pd = dst)
                     {
-                        SoftmaxVector(src.Slice(o * length, length), dst.Slice(o * length, length));
-                        continue;
-                    }
+                        int stride = length;
+                        long total = (long)outer * length;
 
-                    for (int i = 0; i < inner; i++)
-                    {
-                        long baseIndex = (long)o * length * inner + i;
+                        IntPtr pin = (IntPtr)ps;
+                        IntPtr pout = (IntPtr)pd;
 
-                        float max = float.NegativeInfinity;
-                        for (int k = 0; k < length; k++)
-                            max = MathF.Max(max, src[(int)(baseIndex + (long)k * inner)]);
-
-                        float sum = 0;
-                        for (int k = 0; k < length; k++)
-                            sum += MathF.Exp(src[(int)(baseIndex + (long)k * inner)] - max);
-
-                        float inverse = 1f / sum;
-                        for (int k = 0; k < length; k++)
-                            dst[(int)(baseIndex + (long)k * inner)] =
-                                MathF.Exp(src[(int)(baseIndex + (long)k * inner)] - max) * inverse;
+                        if (total >= 1 << 16 && ParallelRange.Threads > 1)
+                        {
+                            ParallelRange.For(outer, (begin, end) =>
+                            {
+                                float* s = (float*)pin;
+                                float* d = (float*)pout;
+                                for (int o = begin; o < end; o++)
+                                    VectorMath.SoftmaxRow(s + (long)o * stride, d + (long)o * stride, stride);
+                            });
+                        }
+                        else
+                        {
+                            for (int o = 0; o < outer; o++)
+                                VectorMath.SoftmaxRow(ps + (long)o * stride, pd + (long)o * stride, stride);
+                        }
                     }
                 }
-            });
-        }
 
-        /// <summary>
-        /// 末轴 Softmax（连续内存）：exp 只算一次并直接写入输出，再乘倒数归一化。
-        /// 原实现算了两遍 exp（求和一次、回填一次），是 attention 里的主要开销之一。
-        /// </summary>
-        private static void SoftmaxVector(ReadOnlySpan<float> src, Span<float> dst)
-        {
-            float max = MaxOf(src);
+                return;
+            }
 
-            // exp 与求和合并成一遍（向量版 exp），再乘倒数归一化
-            float sum = VectorMath.SumExp(src, dst, max);
-            VectorMath.Scale(dst, dst, 1f / sum);
-        }
-
-        private static unsafe float MaxOf(ReadOnlySpan<float> values)
-        {
-            int n = values.Length;
-            int i = 0;
-            float max = float.NegativeInfinity;
-
-            // DFL 的 Softmax 是 33600 组 16 元素，每组都调这个函数：
-            // 用 256 位一次吃 8 个，横向归约也压到 3 条指令。
-            if (Avx.IsSupported && n >= 8)
+            // inner > 1（DFL 的 [1,4,16,8400] 沿 16 归一化）：按列 8 个一组向量化，
+            // 多线程按 (outer × 列段) 摊开。
+            unsafe
             {
-                fixed (float* p = values)
+                fixed (float* ps = src)
+                fixed (float* pd = dst)
                 {
-                    var acc = Avx.LoadVector256(p);
-                    for (i = 8; i <= n - 8; i += 8)
-                        acc = Avx.Max(acc, Avx.LoadVector256(p + i));
+                    IntPtr pin = (IntPtr)ps;
+                    IntPtr pout = (IntPtr)pd;
 
-                    var lo = Avx.Max(acc.GetLower(), acc.GetUpper());
-                    lo = Vector128.Max(lo, Vector128.Shuffle(lo, Vector128.Create(2, 3, 0, 1)));
-                    max = MathF.Max(lo.GetElement(0), lo.GetElement(1));
+                    int perItem = 64;
+                    int perOuter = (inner + perItem - 1) / perItem;
+                    int items = outer * perOuter;
+                    long total = (long)outer * length * inner;
+
+                    if (total >= 1 << 16 && ParallelRange.Threads > 1)
+                    {
+                        ParallelRange.For(items, (begin, end) =>
+                        {
+                            float* s = (float*)pin;
+                            float* d = (float*)pout;
+                            long block = (long)length * inner;
+
+                            for (int item = begin; item < end; item++)
+                            {
+                                int o = item / perOuter;
+                                int c0 = (item % perOuter) * perItem;
+                                int c1 = Math.Min(c0 + perItem, inner);
+                                VectorMath.SoftmaxColumns(s + o * block, d + o * block, length, inner, c0, c1);
+                            }
+                        });
+                    }
+                    else
+                    {
+                        long block = (long)length * inner;
+                        for (int o = 0; o < outer; o++)
+                            VectorMath.SoftmaxColumns(ps + o * block, pd + o * block, length, inner, 0, inner);
+                    }
                 }
             }
-            else
-            {
-                int width = Vector<float>.Count;
-                var accumulator = new Vector<float>(float.NegativeInfinity);
-
-                for (; i <= n - width; i += width)
-                    accumulator = Vector.Max(accumulator, new Vector<float>(values.Slice(i)));
-
-                for (int lane = 0; lane < width; lane++)
-                    max = MathF.Max(max, accumulator[lane]);
-            }
-
-            for (; i < n; i++)
-                max = MathF.Max(max, values[i]);
-
-            return max;
         }
+
     }
 
     // ---------------- MatMul ----------------

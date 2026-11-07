@@ -27,8 +27,13 @@ public sealed class Net
     {
         var impl = Onnx.OnnxImporter.Build(Onnx.OnnxFile.Load(path));
 
-        if (impl.MainGraph is { } graph)
+        if (impl is { MainGraph: { } graph })
+        {
+            // 先折叠（会删节点、把上游改成常量），再融合（合并剩下的运行时节点）。
+            // 顺序不能反：折叠后可能又暴露出新的融合机会，而且融合不处理常量输入。
             ConstFolder.Run(impl, graph);
+            GraphFusion.Run(impl, graph);
+        }
 
         return new Net(impl);
     }

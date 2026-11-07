@@ -73,19 +73,25 @@ internal static unsafe class VectorMath
         return Avx.Divide(Vector256<float>.One, Avx.Add(Vector256<float>.One, e));
     }
 
+    /// <summary><c>x · sigmoid(x)</c>，与「先 Sigmoid 再 Mul」逐位一致（同样的指令顺序）。</summary>
+    public static Vector256<float> Silu(Vector256<float> x) => Avx.Multiply(x, Sigmoid(x));
+
     public static void Exp(ReadOnlySpan<float> src, Span<float> dst)
     {
-        int n = src.Length;
+        fixed (float* ps = src)
+        fixed (float* pd = dst)
+            Exp(ps, pd, src.Length);
+    }
+
+    /// <summary>指针版：调用方已经 pin 过、且需要按区间并行时用。</summary>
+    public static void Exp(float* src, float* dst, int n)
+    {
         int i = 0;
 
         if (Available)
         {
-            fixed (float* ps = src)
-            fixed (float* pd = dst)
-            {
-                for (; i <= n - 8; i += 8)
-                    Avx.Store(pd + i, Exp(Avx.LoadVector256(ps + i)));
-            }
+            for (; i <= n - 8; i += 8)
+                Avx.Store(dst + i, Exp(Avx.LoadVector256(src + i)));
         }
 
         for (; i < n; i++)
@@ -94,17 +100,19 @@ internal static unsafe class VectorMath
 
     public static void Erf(ReadOnlySpan<float> src, Span<float> dst)
     {
-        int n = src.Length;
+        fixed (float* ps = src)
+        fixed (float* pd = dst)
+            Erf(ps, pd, src.Length);
+    }
+
+    public static void Erf(float* src, float* dst, int n)
+    {
         int i = 0;
 
         if (Available)
         {
-            fixed (float* ps = src)
-            fixed (float* pd = dst)
-            {
-                for (; i <= n - 8; i += 8)
-                    Avx.Store(pd + i, Erf(Avx.LoadVector256(ps + i)));
-            }
+            for (; i <= n - 8; i += 8)
+                Avx.Store(dst + i, Erf(Avx.LoadVector256(src + i)));
         }
 
         for (; i < n; i++)
@@ -113,21 +121,48 @@ internal static unsafe class VectorMath
 
     public static void Sigmoid(ReadOnlySpan<float> src, Span<float> dst)
     {
-        int n = src.Length;
+        fixed (float* ps = src)
+        fixed (float* pd = dst)
+            Sigmoid(ps, pd, src.Length);
+    }
+
+    public static void Sigmoid(float* src, float* dst, int n)
+    {
         int i = 0;
 
         if (Available)
         {
-            fixed (float* ps = src)
-            fixed (float* pd = dst)
-            {
-                for (; i <= n - 8; i += 8)
-                    Avx.Store(pd + i, Sigmoid(Avx.LoadVector256(ps + i)));
-            }
+            for (; i <= n - 8; i += 8)
+                Avx.Store(dst + i, Sigmoid(Avx.LoadVector256(src + i)));
         }
 
         for (; i < n; i++)
             dst[i] = 1f / (1f + MathF.Exp(-src[i]));
+    }
+
+    /// <summary>SiLU：一遍读写完成 <c>x · sigmoid(x)</c>（原来是 Sigmoid + Mul 两遍）。</summary>
+    public static void Silu(ReadOnlySpan<float> src, Span<float> dst)
+    {
+        fixed (float* ps = src)
+        fixed (float* pd = dst)
+            Silu(ps, pd, src.Length);
+    }
+
+    public static void Silu(float* src, float* dst, int n)
+    {
+        int i = 0;
+
+        if (Available)
+        {
+            for (; i <= n - 8; i += 8)
+                Avx.Store(dst + i, Silu(Avx.LoadVector256(src + i)));
+        }
+
+        for (; i < n; i++)
+        {
+            float x = src[i];
+            dst[i] = x * (1f / (1f + MathF.Exp(-x)));
+        }
     }
 
     /// <summary>
@@ -186,22 +221,153 @@ internal static unsafe class VectorMath
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Scale(ReadOnlySpan<float> src, Span<float> dst, float factor)
     {
-        int n = src.Length;
+        fixed (float* ps = src)
+        fixed (float* pd = dst)
+            Scale(ps, pd, src.Length, factor);
+    }
+
+    public static void Scale(float* src, float* dst, int n, float factor)
+    {
         int i = 0;
 
         if (Available)
         {
             var vf = Vector256.Create(factor);
 
-            fixed (float* ps = src)
-            fixed (float* pd = dst)
-            {
-                for (; i <= n - 8; i += 8)
-                    Avx.Store(pd + i, Avx.Multiply(Avx.LoadVector256(ps + i), vf));
-            }
+            for (; i <= n - 8; i += 8)
+                Avx.Store(dst + i, Avx.Multiply(Avx.LoadVector256(src + i), vf));
         }
 
         for (; i < n; i++)
             dst[i] = src[i] * factor;
+    }
+
+    /// <summary>
+    /// 一行 Softmax（连续内存、行首指针已知时用）：一趟求 max，
+    /// 一趟算 exp 顺便求和并落盘，最后一趟乘 1/Σ。
+    /// </summary>
+    public static void SoftmaxRow(float* src, float* dst, int length)
+    {
+        float max = float.NegativeInfinity;
+
+        if (Available && length >= 8)
+        {
+            var acc = Avx.LoadVector256(src);
+            int i = 8;
+            for (; i <= length - 8; i += 8)
+                acc = Avx.Max(acc, Avx.LoadVector256(src + i));
+
+            var lo = Avx.Max(acc.GetLower(), acc.GetUpper());
+            lo = Vector128.Max(lo, Vector128.Shuffle(lo, Vector128.Create(2, 3, 0, 1)));
+            max = MathF.Max(lo.GetElement(0), lo.GetElement(1));
+
+            for (; i < length; i++)
+                max = MathF.Max(max, src[i]);
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+                max = MathF.Max(max, src[i]);
+        }
+
+        float sum = SumExp(src, dst, length, max);
+        Scale(dst, dst, length, 1f / sum);
+    }
+
+    /// <summary>
+    /// 跨步 Softmax 的列内核：<paramref name="length"/> 个元素的步长是 <paramref name="inner"/>，
+    /// 处理 <c>[colBegin, colEnd)</c> 这些列。
+    /// <para>
+    /// DFL 的 Softmax 是 <c>[1,4,16,8400]</c> 沿 16 做归一化 —— 逐行算的话每次只碰 16 个
+    /// 相隔 33 KB 的元素、还要算两遍 exp，比按列向量化慢一个数量级。按列切 8 个一起算，
+    /// 每趟都是连续读（同一条 cache line 覆盖 8 个不同行），exp 也只算一次。
+    /// </para>
+    /// </summary>
+    public static void SoftmaxColumns(float* src, float* dst, int length, int inner, int colBegin, int colEnd)
+    {
+        int c = colBegin;
+
+        if (Available)
+        {
+            for (; c <= colEnd - 8; c += 8)
+            {
+                float* ps = src + c;
+                float* pd = dst + c;
+
+                var vmax = Vector256.Create(float.NegativeInfinity);
+                for (int k = 0; k < length; k++)
+                    vmax = Avx.Max(vmax, Avx.LoadVector256(ps + (long)k * inner));
+
+                var vsum = Vector256<float>.Zero;
+                for (int k = 0; k < length; k++)
+                {
+                    var e = Exp(Avx.Subtract(Avx.LoadVector256(ps + (long)k * inner), vmax));
+                    Avx.Store(pd + (long)k * inner, e);
+                    vsum = Avx.Add(vsum, e);
+                }
+
+                var inverse = Avx.Divide(Vector256<float>.One, vsum);
+                for (int k = 0; k < length; k++)
+                {
+                    float* p = pd + (long)k * inner;
+                    Avx.Store(p, Avx.Multiply(Avx.LoadVector256(p), inverse));
+                }
+            }
+        }
+
+        for (; c < colEnd; c++)
+        {
+            float* ps = src + c;
+            float* pd = dst + c;
+
+            float max = float.NegativeInfinity;
+            for (int k = 0; k < length; k++)
+                max = MathF.Max(max, ps[(long)k * inner]);
+
+            float sum = 0;
+            for (int k = 0; k < length; k++)
+            {
+                long index = (long)k * inner;
+                float value = MathF.Exp(ps[index] - max);
+                pd[index] = value;
+                sum += value;
+            }
+
+            float inverse = 1f / sum;
+            for (int k = 0; k < length; k++)
+                pd[(long)k * inner] *= inverse;
+        }
+    }
+
+    /// <summary><c>dst = exp(src - bias)</c> 并返回 Σ（指针版，不重复 pin）。</summary>
+    public static float SumExp(float* src, float* dst, int n, float bias)
+    {
+        int i = 0;
+        float total = 0;
+
+        if (Available)
+        {
+            var vsum = Vector256<float>.Zero;
+            var vbias = Vector256.Create(bias);
+
+            for (; i <= n - 8; i += 8)
+            {
+                var e = Exp(Avx.Subtract(Avx.LoadVector256(src + i), vbias));
+                Avx.Store(dst + i, e);
+                vsum = Avx.Add(vsum, e);
+            }
+
+            for (int k = 0; k < 8; k++)
+                total += vsum.GetElement(k);
+        }
+
+        for (; i < n; i++)
+        {
+            float value = MathF.Exp(src[i] - bias);
+            dst[i] = value;
+            total += value;
+        }
+
+        return total;
     }
 }

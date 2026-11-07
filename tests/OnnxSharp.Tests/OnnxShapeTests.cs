@@ -119,7 +119,12 @@ internal static class OnnxShapeTests
                 + string.Join("\n  ", mismatches.Take(10)));
         }
 
-        Assert.True(compared >= 300, $"too few tensors compared ({compared})");
+        // 图级融合会吃掉中间量：Sigmoid+Mul→SiLU 少 78 个，Conv+SiLU→Conv 再少 78 个，
+        // 所以「产出 Arg 数」天然少于 oracle 条目数（334 → 256 → 179）。
+        // 下限取一半，只要导入器/推导整体失效（几乎不产出 Arg）就会立刻报错。
+        Assert.True(
+            compared >= oracle.Count / 2,
+            $"too few tensors compared ({compared}/{oracle.Count})");
     }
 
     // ---------------- 工具 ----------------

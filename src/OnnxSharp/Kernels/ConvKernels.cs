@@ -15,8 +15,8 @@ namespace OnnxSharp.Kernels;
 /// </summary>
 internal static class ConvKernels
 {
-    /// <summary>im2col 每次处理的输出行数：太小则 GEMM 效率低，太大则列缓冲挤爆 cache。</summary>
-    private const int BlockRows = 8;
+    /// <summary>GEMM 微内核的列向量宽度（AVX2 下 8 个 float）。列块宽度低于它只能走标量内核。</summary>
+    private const int ColumnVectorWidth = 8;
 
     /// <summary>
     /// im2col + GEMM：把卷积化成
@@ -67,9 +67,13 @@ internal static class ConvKernels
             return;
         }
 
-        // 行块大小：先按列缓冲预算（约 2 MB）取尽量大的行块 —— 块内像素越多，
-        // GEMM 的 n 越大、A 的复用越高；任务数不够喂满多核时再减半。
-        int threads = Environment.ProcessorCount;
+        // 分块策略：
+        // 1) 行块先按列缓冲预算（约 2 MB）取尽量大，任务数不够喂满多核时再减半。
+        // 2) 行块一旦缩小，块内像素（rowsPerBlock*outW）必须仍是 8 的倍数，
+        //    否则列块宽度不足 8 的尾巴会掉进标量内核 —— 20×20 这种输出宽度上
+        //    以前会缩到 1 行（n 只剩 20，其中 4 列走标量），256→256 只有 40 GMAC/s。
+        // 3) 切不动（例如 outW=20）就把并行度交给 GEMM 内部按列切分，而不是把 n 切成碎块。
+        int threads = ParallelRange.Threads;
         int budgetPixels = Math.Max(threads * 64, (2 << 20) / (4 * Math.Max(1, kernelSize)));
         int rowsPerBlock = Math.Min(outH, Math.Max(1, budgetPixels / Math.Max(1, outW)));
 
@@ -78,24 +82,39 @@ internal static class ConvKernels
             int blocks = (outH + rowsPerBlock - 1) / rowsPerBlock;
             if (batches * groups * blocks >= threads * 2)
                 break;
-            rowsPerBlock /= 2;
+
+            int half = rowsPerBlock / 2;
+            if (half < 1 || (long)half * outW % ColumnVectorWidth != 0)
+                break;
+
+            rowsPerBlock = half;
         }
 
         int blockCount = (outH + rowsPerBlock - 1) / rowsPerBlock;
+        int baseTasks = batches * groups * blockCount;
 
         // 行方向仍然不够时再把输出宽度切开（列切分要额外搬一次输出，代价更高）
-        int spatialTasks = batches * groups * blockCount;
         int colSplits = 1;
-        while (spatialTasks * colSplits < threads * 2
-               && outW / (colSplits * 2) >= 32)
+        while (baseTasks * colSplits < threads * 2
+               && outW / (colSplits * 2) >= 32
+               && outW / (colSplits * 2) % ColumnVectorWidth == 0)
         {
             colSplits *= 2;
         }
 
         int tileWidth = (outW + colSplits - 1) / colSplits;
-        int tasks = spatialTasks * colSplits;
+        int tasks = baseTasks * colSplits;
 
-        ParallelRange.For(tasks, (begin, end) =>
+        // 任务还不够：外层串行、把并行度交给 GEMM（它按 16 列的列块切分，列宽天然对齐）
+        bool innerParallel = tasks < threads;
+        if (innerParallel)
+        {
+            colSplits = 1;
+            tileWidth = outW;
+            tasks = baseTasks;
+        }
+
+        Action<int, int> runTasks = (begin, end) =>
         {
             var src = input.AsSpan<float>();
             var weights = weight.AsSpan<float>();
@@ -142,7 +161,7 @@ internal static class ConvKernels
 
                     GemmKernel.Multiply(weightSlice, colSlice, target,
                         outPerGroup, kernelSize, pixels,
-                        ldc: outH * outW, parallel: false,
+                        ldc: outH * outW, parallel: innerParallel,
                         bias: biases.IsEmpty ? ReadOnlySpan<float>.Empty : biases.Slice(g * outPerGroup, outPerGroup));
                 }
                 else
@@ -153,7 +172,7 @@ internal static class ConvKernels
 
                     GemmKernel.Multiply(weightSlice, colSlice, scratch,
                         outPerGroup, kernelSize, pixels,
-                        ldc: pixels, parallel: false,
+                        ldc: pixels, parallel: innerParallel,
                         bias: biases.IsEmpty ? ReadOnlySpan<float>.Empty : biases.Slice(g * outPerGroup, outPerGroup));
 
                     for (int oc = 0; oc < outPerGroup; oc++)
@@ -171,7 +190,12 @@ internal static class ConvKernels
 
             if (outPool is not null)
                 ArrayPool<float>.Shared.Return(outPool);
-        });
+        };
+
+        if (innerParallel)
+            runTasks(0, tasks);
+        else
+            ParallelRange.For(tasks, runTasks);
     }
 
     /// <summary>1x1 卷积：<c>out[oc, p] = Σ_ic W[oc, ic] · in[ic, p]</c>，零拷贝。</summary>
