@@ -803,9 +803,6 @@ static int Detect(string[] args)
     float? iou;
     string inputDescription;
 
-    if (image is not null)
-        Console.WriteLine($"image      : {imagePath} {image.Value.Width}x{image.Value.Height}");
-
     if (!rfdetr)
     {
         var detectorOptions = new DetectorOptions
@@ -925,6 +922,8 @@ static int Detect(string[] args)
     var labels = LoadLabels(options.GetString("--labels"));
 
     Console.WriteLine($"model      : {modelPath}");
+    if (image is { } sourceImage)
+        Console.WriteLine($"image      : {imagePath} {sourceImage.Width}x{sourceImage.Height}");
     Console.WriteLine($"family     : {(rfdetr ? "rfdetr" : "yolo")}");
     Console.WriteLine($"input      : {inputDescription}");
     if (image is not null)

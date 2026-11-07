@@ -9,11 +9,11 @@ namespace OnnxSharp.Vision;
 /// <para>
 /// 用法：
 /// <code>
-/// using var detector = YoloDetector.FromFile("yolo11n.onnx");
+/// var detector = new YoloDetector("yolo11n.onnx");
 /// foreach (var d in detector.Detect(rgb, width, height))
 ///     Console.WriteLine(d);
 /// </code>
-/// （<see cref="Net"/> 不持有非托管资源，但保留 <c>using</c> 写法以便未来加 IDisposable。）
+/// （检测器只持有托管内存，不实现 <see cref="IDisposable"/>；模型用完交给 GC 即可。）
 /// </para>
 /// </summary>
 public sealed class YoloDetector

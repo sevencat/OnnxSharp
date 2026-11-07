@@ -9,7 +9,7 @@ namespace OnnxSharp.Vision;
 /// <para>
 /// 用法：
 /// <code>
-/// using var detector = new RfDetrDetector("rfdetr-small.onnx");
+/// var detector = new RfDetrDetector("rfdetr-small.onnx");
 /// foreach (var d in detector.Detect(rgb, width, height))
 ///     Console.WriteLine(d);
 /// </code>
