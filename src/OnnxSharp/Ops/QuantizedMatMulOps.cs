@@ -27,8 +27,13 @@ internal static class QuantizedMatMulOps
 
     private sealed class DynamicQuantizeMatMulLayer : Layer
     {
-        // (w - w_zp) 的 F32 版本，常量权重只展开一次
+        /// <summary>分段计时的开关（<c>ONNXSHARP_DQM_BREAKDOWN=1</c>，配合 <c>tools/scripts/dqm_breakdown.py</c>）。</summary>
+        private static readonly bool Breakdown =
+            Environment.GetEnvironmentVariable("ONNXSHARP_DQM_BREAKDOWN") is { Length: > 0 };
+
+        // (w - w_zp) 的 F32 版本 + 预打包面板（常量权重只算一次）
         private float[]? _floatWeights;
+        private GemmKernel.PackedB? _packedWeights;
         private Tensor? _weightSource;
         private int[]? _weightZeroPoints;
 
@@ -113,11 +118,17 @@ internal static class QuantizedMatMulOps
                 ? inputs[4].AsSpan<float>()
                 : default;
 
-            var weights = GetFloatWeights(w, k, n, weightZeroPoints);
+            // 常量权重：默认走「预打包面板」（每帧零拷贝），`ONNXSHARP_NO_PREPACK=1` 退回旧路径
+            var packed = GemmKernel.PrepackEnabled ? GetPackedWeights(w, k, n, weightZeroPoints) : null;
+            var weights = packed is null ? GetFloatWeights(w, k, n, weightZeroPoints) : null;
+
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            long t0 = 0, t1 = 0, t2 = 0, t3 = 0;
 
             // ---- 1) 与原 DQL 相同的 per-tensor 动态量化参数
             var source = a.AsSpan<float>();
             var (min, max) = Quantizer.MinMax(source);
+            t1 = clock.ElapsedTicks;
 
             float scale = (max - min) / 255f;
             if (!(scale > 0f))
@@ -130,23 +141,45 @@ internal static class QuantizedMatMulOps
 
             // ---- 3) 边量化边展开成 F32（不物化 u8）
             float[] activationBuffer = ArrayPool<float>.Shared.Rent(m * k);
-            float[] accumulatorBuffer = ArrayPool<float>.Shared.Rent(m * n);
+            float[]? accumulatorBuffer = packed is null ? ArrayPool<float>.Shared.Rent(m * n) : null;
 
             try
             {
                 var activation = activationBuffer.AsSpan(0, m * k);
                 QuantizeAndWiden(source, activation, scale, zeroPoint);
+                t2 = clock.ElapsedTicks;
 
-                var accumulator = accumulatorBuffer.AsSpan(0, m * n);
-                GemmKernel.Multiply(activation, weights, accumulator, m, k, n);
+                if (packed is not null)
+                {
+                    // 反量化 epilogue 折进 GEMM 的写出：out = acc * combined[col] + bias[col]
+                    GemmKernel.MultiplyPacked(activation, packed, output.AsSpan<float>(), m,
+                        columnBias: bias, columnScale: combined);
+                    t3 = clock.ElapsedTicks;
+                }
+                else
+                {
+                    var accumulator = accumulatorBuffer!.AsSpan(0, m * n);
+                    GemmKernel.Multiply(activation, weights!, accumulator, m, k, n);
+                    t3 = clock.ElapsedTicks;
+                    Epilogue(accumulator, output.AsSpan<float>(), bias, combined, n);
+                }
 
                 // ---- 4) epilogue：乘合成 scale、加 bias
-                Epilogue(accumulator, output.AsSpan<float>(), bias, combined, n);
+                long t4 = clock.ElapsedTicks;
+
+                if (Breakdown)
+                {
+                    double tick = 1e3 / System.Diagnostics.Stopwatch.Frequency;
+                    Console.Error.WriteLine(
+                        $"[dqm] m={m} k={k} n={n}  minmax {(t1) * tick:F3} quant {(t2 - t1) * tick:F3} " +
+                        $"gemm {(t3 - t2) * tick:F3} epi {(t4 - t3) * tick:F3} ms");
+                }
             }
             finally
             {
                 ArrayPool<float>.Shared.Return(activationBuffer);
-                ArrayPool<float>.Shared.Return(accumulatorBuffer);
+                if (accumulatorBuffer is not null)
+                    ArrayPool<float>.Shared.Return(accumulatorBuffer);
             }
         }
 
@@ -185,6 +218,32 @@ internal static class QuantizedMatMulOps
             _weightSource = weight;
             _weightZeroPoints = zeroPoints;
             return buffer;
+        }
+
+        /// <summary>
+        /// <c>(w - w_zp)</c> 展开成 F32 后**打包成列块面板**（常量权重只做一次）。
+        /// <para>
+        /// 之后每帧的 GEMM 直接读面板，省掉 <see cref="GemmKernel.Multiply"/> 每次都要做的
+        /// 「B 重排成 <c>[k, 16]</c> 紧凑面板」——ASR encoder 上那是 160 次 × 3.2 MB。
+        /// 面板与 F32 权重同量级，所以不额外占内存（展开的整份 F32 会丢弃）。
+        /// </para>
+        /// </summary>
+        private GemmKernel.PackedB GetPackedWeights(Tensor weight, int k, int n, int[] zeroPoints)
+        {
+            if (_packedWeights is not null && ReferenceEquals(_weightSource, weight) && ZeroPointsEqual(_weightZeroPoints, zeroPoints))
+                return _packedWeights;
+
+            var widened = new float[checked(k * n)];
+            if (weight.DType == DType.I8)
+                Int8F32Gemm.WidenWeights(weight.AsSpan<sbyte>(), widened, k, n, zeroPoints);
+            else
+                Int8F32Gemm.WidenWeights(weight.AsSpan<byte>(), widened, k, n, zeroPoints);
+
+            _packedWeights = GemmKernel.Pack(widened, k, n);
+            _floatWeights = null;
+            _weightSource = weight;
+            _weightZeroPoints = zeroPoints;
+            return _packedWeights;
         }
 
         private static bool ZeroPointsEqual(int[]? a, int[] b)

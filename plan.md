@@ -617,6 +617,13 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 > 因此：**能安全跑的 int8 内核在 Zen4 / 老 Xeon 上拿不到加速**；
 > 主路径改成 **M10-02b「int8 权重存储 + F32 计算」**（任何 CPU 都有带宽收益），
 > VNNI 路径（`vpdpbusd`）留给 Intel 12 代+。
+>
+> **⚠️ 上表两行已过时（2026-11-11 更正，见 §M10-A）**：
+> ① 「`vpmaddubsw` 单趟会饱和」确实成立（`255×128×2 = 65280 > 32767`），但只要 **A 只占 7 位**（≤127）就不饱和；
+> ② 更重要的是有第三条路：**不用 `vpmaddubsw`，直接把两侧 `vpmovzxbw`/`vpmovsxbw` 扩到 i16 再 `vpmaddwd`**
+> —— `vpmaddwd` 累加到 **i32**，**永远不会饱和，精确**（OpenCV 的 `v_dotprod_expand(s8,s8)` 就是这么做的，
+> 见 `modules/core/include/opencv2/core/hal/intrin_avx.hpp:1846`）。代价是每 64 个 MAC 要 ~5 条指令
+> （≈13 MAC/指令，略低于 F32 的 16），所以**它不是算力上的胜利，是带宽上的胜利**（权重 1/4）。
 
 | 档位 | 触发条件（.NET 8/10 都有对应 intrinsic） | 实现 | 目标倍率（vs 我们的 FP32 GEMM） | 典型 CPU |
 |---|---|---|---|---|
@@ -658,6 +665,131 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 建议顺序：**先做 M10-01/02/03/06（一周）**，M9 的 encoder 段就能跑；再补 M10-04/05/07 收尾通用性。
 
 ---
+
+### M10-A — int8 落地计划（2026-11-11 定稿，参照 OpenCV DNN `int8layers`）
+
+> 目标从「引擎**会**跑量化图」升级为「**在 sherpa 上追平 ONNXRuntime**」。
+> 参考实现：`F:\code\opencv\modules\dnn\src\int8layers\`（重点 `matmul_int8_kernels.simd.hpp`、
+> `conv2_int8_layer.cpp`、`quantization_utils.cpp`、`eltwise2_int8_layer.cpp`）。
+
+#### A0. 先量再改：当前实测（Ryzen 9 8945HX / Zen4 / 16 线程，同一时段）
+
+| 项 | 数字 | 备注 |
+|---|---|---|
+| sherpa encoder（96 帧切图） | **43.1 ms**（sum-of-min，`profile --iters 6`） | 端到端 `asr --repeat 8` 热态：整句 **121 ms**（feat 8 / enc 89 / dec 24），mean 抖动大，A/B 只用 sum-of-min |
+| └ `DynamicQuantizeMatMul` | **31.2 ms（72.4%）**，160 次 | 现在走「int8 权重展开成 F32（缓存）+ F32 GEMM」 |
+| └ `FusedAttention` / `Conv` / `Transpose` / `LayerNorm` | 4.1 / 1.7 / 1.5 / 0.9 ms | 合计 < 20%，先不动 |
+| ONNXRuntime 同一 `encoder.onnx` | **26.8 ms（min）/ 29.2 ms（median）** | 16 线程、关 profiling → 我们是 **1.45~1.6×** |
+| 我们的 GEMM 有效率 | 302 GFLOPS（9.4 GFLOP / 31.2 ms） | 峰值 ~2 TFLOPS → **15%**，瓶颈不在 ALU |
+| **每次 GEMM 都重打包常量权重** | `[96,320,1280]`：1.6 MB 读 + 1.6 MB 写 | 160 次 ≈ **512 MB/run**（≈10 ms @30 GB/s） |
+
+**两条结论**
+1. 32 ms 的 GEMM 里约 1/3 是「把**常量** B 每帧重新打包一遍」—— 这是纯浪费，与 int8 无关，先修。
+2. int8 在本机**不是算力胜利而是带宽胜利**（`.NET` 没有 `Avx512Vnni`、`AvxVnni=False`），
+   所以必须用 micro-bench 证明它比现有 F32 GEMM 快，**证明不了就不合入**（本项目已有 4 个「想当然」被否的先例）。
+
+#### A1. OpenCV 参考实现：采纳什么、不采纳什么
+
+| OpenCV 做法 | 出处 | 我们 |
+|---|---|---|
+| B 面板打包 `MR=4 / NR=16 / KR=4`（每 panel 64 B = 16 列 × 4 个 k），**加载期一次**，`colsum` 同批算好 | `matmul_int8_kernels.simd.hpp:19-56,127-151` | ✅ 采纳（我们 `PackedInt8Weights` 布局已同构，缺的是「常量缓存 + 预打包」） |
+| 零点全部折进 epilogue：`-zp·colsum[n]`（列）、`corr[n]·rowterm[r]`（行），内层循环零减法 | 同上 `94-105` | ✅ 采纳（我们只有 `-azp·colsum` 与 `(offset-zp)·rowSum`，per-row zp 还没有） |
+| u8↔s8 用 `xor 0x80` + zp±128 切换操作数符号 | 同上 `157-164` | ✅ 采纳（VNNI 要 s8 作第二操作数） |
+| **无 VNNI 时 `v_dotprod_expand(s8,s8)` = 符号扩展 + `vpmaddwd`**（精确、不饱和） | `intrin_avx.hpp:1846-1859` | ✅ 采纳，升级到 512 位（`vpmovsxbw`+`vpmaddwd`） |
+| 任务分解 = 行块 × 列面板（`TASK_ROWS=64 × TASK_PANELS=2`） | 同上 `131-151` | ✅ 采纳做 A/B（我们的列切分在小 m 上已对，但 160 个小 GEMM 的并行粒度要重排） |
+| 每层 `outputMultiplier[ch]`（float32），epilogue 里一次乘加 | `matmul_int8_layer.cpp:378-400` | ✅ 已有等价物（`combinedScale` + `bias`） |
+| int8 张量 + `activLUT[256]`：一次查表完成「反量化→激活→重量化」 | `conv2_int8_kernels.hpp:20-28` | ✅ 采纳（第 3 阶段，省 `Add/Relu/Mul` 的 F32 往返） |
+| `Conv2Int8` / `Eltwise2Int8` / `Pool2Int8` / `BatchNormInt8` 整层 int8 家族 | `int8layers/*` | ⚠️ 按需（先算收益，encoder 里这些合计 ~4 ms） |
+| ONNX `QLinearConv/QLinearMatMul/DynamicQuantizeLinear` **反量化成 F32 跑** | `onnx_importer2.cpp:2740-2742` | ❌ 不采纳（他们新图引擎放弃了融合；我们的 `FuseQuantizedMatMul` 已经比这好，继续走融合） |
+
+#### A2. 分阶段任务（每阶段都有「决策门」，不达标就停）
+
+| 阶段 | 任务 | 关键实现 | 验收（决策门） |
+|---|---|---|---|
+| **P0** | **`M10-15` 权重预打包 + 零拷贝**（不涉及 int8） | `GemmKernel` 增 `PackPanels(b, k, n)` → `[n/nb][k][nb]` 面板数组与 `MultiplyPacked(a, packed, c, m, k, n, …)`；`QuantizedMatMulOps` / `MatMulLayer` / `FusedAttention` 按**权重张量实例**缓存面板（`ReferenceEquals` + shape 校验，同 `_floatWeights` 的写法）；开关 `ONNXSHARP_NO_PREPACK=1` | `gemmbench` 增 `--prepack` 对照：`96×320×1280`、`96×320×960`、`96×1280×320` 三形状 **≥ −25%**；encoder DQM 段 ≥ −25%；ASR 文本与 `max|diff|` 不变。**✅ 已完成，见 A5** |
+| **P1** | **`M10-16` int8 GEMM 内核分档** | `Int8KernelTier`：`Scalar` / `Avx2`（`vpmovsxbw`+`vpmaddwd` ymm）/ `Avx512Bw`（zmm，64 B = 16 列 × 4 k 一次算完）/ `Vnni256`（`AvxVnni`，Intel 12 代+）；`KR=4` 面板复用现有 `PackedInt8Weights`；零点校正 `colsum`+`rowterm` | 与标量 oracle **逐位一致**（含 u8/s8、per-column zp、非对齐 k/n）；`int8bench` 在三形状上 **≥ 1.2× 现 F32 GEMM**（**达不到就只保留 Scalar/Vnni256，别硬上**） |
+| **P2** | **`M10-17` DQM 接 int8 内核** | 量化 A 成 u8 缓冲（`m·k` 字节，不展开 F32）→ `Int8Gemm` → epilogue `acc·(a_scale·w_scale[col]) + bias[col]`；权重走 P0 的 int8 面板缓存；`ONNXSHARP_INT8_KERNEL=auto\|f32\|int8` | encoder（≤ 35 ms）且 `FusedAttention` 不变；`quant:` 用例保持 bit-exact；ASR 文本不变 |
+| **P3** | **`M10-18` int8 Conv** | im2col + int8 GEMM（1-D/depthwise 变体参照 `fastConv`/`fastDepthwiseConv`）；int32 bias + per-channel multiplier | encoder 41 个 Conv 1.7 → **≤ 1.0 ms**；与 ORT `max|diff| ≤ 1`（u8 输出） |
+| **P4** | **`M10-19` int8 逐元素 + 激活 LUT** | `activLUT[256]`（反量化→激活→重量化一次查表）；int8 `Add/Mul`（per-input scale/zp） | `Add+Relu+Mul` 合计 **≥ −40%**；int8 输出逐值一致 |
+| **P5** | **`M10-20` QDQ 覆盖** | `QuantizeLinear`/`DequantizeLinear`（per-tensor/per-axis/axis 语义）+ QDQ 对消 + `QLinearConv`/`QLinearMatMul`/`ConvInteger` | `yunet_int8.onnx` 跑通并与 ORT 逐值对齐（补上 M11-01 的遗留） |
+| **P6** | **`M10-21` 基准与文档** | CLI `int8bench`（形状 × 档位 × 预打包矩阵 + ORT DQM 对照）、`bench.md`/README/`misc.md` | 表格含「本机档位 + 数值」；复现命令一键可跑 |
+
+**顺序理由**：P0 是纯收益（不引入新数值路径、任何 CPU 都吃）；P1 先在内核层比出数字，再决定 P2 是否值得接线；
+P3/P4 只有在 P0~P2 落地后 encoder 仍 > 30 ms 才启动（现在它们合计不到 4 ms，收益上限就在那）。
+
+#### A3. 风险
+
+| # | 风险 | 对策 |
+|---|---|---|
+| A1 | P0 的预打包把内存放大 `n/nb × k × nb = k·n`（与 B 同量级），多模型常驻会涨内存 | 只对**常量权重**打包，且复用原 `B` 的生命周期；`ONNXSHARP_NO_PREPACK=1` 可回退 |
+| A2 | 预打包面板与 `n` 不是 `nb` 整数倍时的尾部对齐错 | 面板显式存 `width`；尾部用掩码/单行内核收尾；随机形状用例（`n = 1,7,16,17,127`） |
+| A3 | int8 内核在 m 小、n 大时被 B 广播拖慢（历史上 `Int8DequantGemm` 就是这样翻车的） | P1 决策门就是为此设的；三个真实 ASR 形状 + `FusedAttention` 的 head-batch 形状都要过 |
+| A4 | 分档探测与实现不一致 → `IllegalInstruction` | 每档用**同一组随机数据**与标量 oracle 逐位比对；`int8bench --info` 打印档位并进测试断言 |
+| A5 | 与 ORT 的数值口径漂移（我们 bit-exact，ORT 允许 `≤1`） | 融合层保持「与 F32 展开路径 max abs diff = 0」（已有 k=1280 用例）；端到端只比 ASR 文本与 ORT `mean/max` |
+
+#### A4. 备选路线 B：外接 BLAS / oneDNN（**不推荐作主路径，只留插槽**）
+
+调研结论（2026-11-11）：
+
+| 候选 | 判定 | 理由 |
+|---|---|---|
+| **TensorSharp** | ❌ | 最后更新 2024-01、总下载 2.8K（是 Seq2SeqSharp 的个人 fork）；CPU 后端就是 **MKL**（仍是 native）；它是**训练框架**（autodiff + device + 自带 allocator/Tensor 类型），不是「一次 GEMM」的库；无 int8、无 packed-B、无 epilogue |
+| **MathNet.Numerics** | ❌ | 5.0 起把 native provider 拆包、**删掉 managed 参考实现**（等于必须带 MKL/OpenBLAS）；无 int8；`Matrix<float>` 还要一次适配 |
+| **MKL / OpenBLAS（cblas_sgemm）** | ⚠️ | 性能够，但 `cblas` **不暴露打包接口**、**没有 per-channel 反量化 epilogue**（我们的热点正是 `acc·(a_scale·w_scale[col])+bias[col]`）→ 融合会退化成一趟额外的 `Mul/Add`；且自带 OpenMP，会与常驻线程池**过度订阅** |
+| **oneDNN** | ✅ 技术最贴合 | `matmul` primitive 自带**权重预打包缓存** + bias/scale post-op + int8 s8/u8 + 自动选 VNNI/AVX512/AVX2，基本等于我们的 P0+P1；代价：CMake 构建、10~40 MB、C API 绑定、primitive 缓存生命周期管理 |
+| **XNNPACK** | ✅ 技术贴合 | qu8/qs8 微内核 + packing + requantize 融合；但无稳定 ABI、bazel 构建重 |
+| **System.Numerics.Tensors** | ❌ | 只有逐元素/一维原语，无分块 GEMM |
+
+**为什么不算「更方便」**（用本项目自己的数字）：
+理论天花板只有 ~10 ms —— ORT（MLAS）在 encoder 上是 26.8 ms（GEMM 段约 470 GFLOPS），我们 43.1 ms（GEMM 302 GFLOPS）；
+而 P0 的预打包预计就能吃掉其中 8~10 ms。BLAS 相对 P0 的边际收益只有 2~3 ms，
+却要付出 native 依赖 + AOT/部署 + 线程池冲突 + 丢掉「纯 C#、零依赖」定位（核心 `OnnxSharp.csproj` 现在 0 个 `PackageReference`）。
+另外 encoder 里 28% 不是 GEMM（attention / conv / transpose / LN / 逐元素），BLAS 一个也帮不上。
+
+**做法（只留缝，不引依赖）**：给 `GemmKernel` 抽一个极薄的 `IGemmBackend`
+（`Multiply` / `PackPanels` / `Int8Multiply` 三个入口，默认实现 = 现有托管内核），
+将来若要接 oneDNN，只加一个**可选包**（`OnnxSharp.BlasOneDnn`，AOT 友好 P/Invoke）+ `ONNXSHARP_GEMM=onednn|openblas|managed|auto`，
+核心包仍保持零依赖（与现在 `Sevencat.ImageFacade` 只在 CLI 层引入同一套路）。
+
+**触发条件（写死，避免反复讨论）**：P0+P1 落地后若 encoder 仍 **> 34 ms**（即 GEMM > 22 ms / < 430 GFLOPS），
+才投入 2~3 天做可选 oneDNN 后端；否则不做。唯一支持「长期值得」的场景是**跨机器分发**
+（Intel 12 代+ 的 `AvxVnni`、ARM `sdot` 我们都要自己写，而 oneDNN/XNNPACK 已经覆盖）。
+
+#### A5. P0 实测结果（2026-11-11 深夜，已完成）
+
+先插桩把 `DynamicQuantizeMatMul` 内部四段拆开（`ONNXSHARP_DQM_BREAKDOWN=1` +
+`tools/scripts/dqm_breakdown.py`，每个形状取最小值）：
+
+| 形状 | minmax | quant | gemm | epilogue |
+|---|---|---|---|---|
+| 96×320×1280 | 0.005 | 0.045 | 0.082 | **0.097** |
+| 96×1280×320 | 0.018 | 0.053 | 0.113 | **0.064** |
+| 96×320×960 | 0.005 | 0.039 | 0.069 | **0.089** |
+| 96×320×320 | 0.005 | 0.041 | 0.029 | **0.065** |
+
+→ **epilogue 占 39%，和 GEMM 一样大**；而「每帧重新打包常量权重」在 k=1280 的大形状上只占 7%、
+只在 `96×320×320` 这种「权重相对计算量大」的形状上占到一半（`gemmbench` 的 packed 列：2.04×）。
+
+所以 P0 实际做了两件事（第 2 条是插桩后才发现、原计划里没有的）：
+
+1. **常量权重预打包**：`GemmKernel.Pack` → `PackedB`（`[列块][k][16]` 面板），`MultiplyPacked` 直接消费；
+   面板与 F32 权重同量级，展开用的整份 F32 会丢弃，所以不额外占内存。
+2. **反量化 epilogue 折进 GEMM 写出**：`Multiply4Rows` 新增 `columnScale`，写出前 `out = acc*scale + bias`（FMA）；
+   DQM 不再要 `m×n` 累加器缓冲，也不再跑第二趟全量读写。
+
+| 指标 | 之前 | 之后 |
+|---|---|---|
+| ASR encoder（sum-of-min，交替 4 轮取最好） | 43.1 ms | **31.7 ms（−26%）** |
+| 同上，旧路径（`ONNXSHARP_NO_PREPACK=1`） | 36.7 ms | — |
+| 与 ORT（26.8 min）之比 | 1.61× | **1.18×** |
+| `96×320×320` 单次 GEMM（gemmbench） | 0.068 ms | **0.034 ms（2.04×）** |
+
+数值：ASR 文本不变；`encoder vs ORT` mean 8.22e-4 → **8.54e-4**、max 9.25e-2 → 9.71e-2
+（FMA 把「先乘后加」并成一次舍入，属 ulp 级变化，CIF 会放大一点点）。
+新增用例 `gemm: packed panels match plain multiply` 与
+`gemm: packed column scale and bias fold the epilogue`（含 `n=45/17/7` 的尾面板与 `m=7` 的单行路径，
+后者第一版把 bias 加了两遍、被这条用例抓住）。
+
 
 ## 5. 核心设计
 

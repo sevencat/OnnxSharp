@@ -261,7 +261,7 @@ static int Run(string[] args)
     var net = LoadModel(path, options);
     loadWatch.Stop();
 
-    var feeds = BindInputs(net, options.Inputs, SingleShape(options));
+    var feeds = BindInputs(net, options.Inputs, SingleShape(options), NamedShapes(options));
     int repeat = options.GetInt("--repeat", 1);
 
     Console.WriteLine($"model     : {path}");
@@ -342,7 +342,7 @@ static int Bench(string[] args)
     }
 
     var net = LoadModel(path, options);
-    BindInputs(net, options.Inputs, SingleShape(options));
+    BindInputs(net, options.Inputs, SingleShape(options), NamedShapes(options));
 
     int warmup = options.GetInt("--warmup", 1);
     int iters = options.GetInt("--iters", 5);
@@ -436,7 +436,7 @@ static int GemmBench(string[] args)
     Console.WriteLine($"iters   : {iters}");
     Console.WriteLine($"batch   : {batches}");
     Console.WriteLine();
-    Console.WriteLine("     m       k       n    batch    per-batch ms    GFLOPS");
+    Console.WriteLine("     m       k       n    batch    per-batch ms    GFLOPS   packed ms   speedup");
 
     foreach (var (m, k, n) in shapes)
     {
@@ -447,30 +447,47 @@ static int GemmBench(string[] args)
         for (int i = 0; i < a.Length; i++) a[i] = (float)rng.NextDouble();
         for (int i = 0; i < b.Length; i++) b[i] = (float)rng.NextDouble();
 
-        void Run() => RunBatched(a, b, c, batches, m, k, n);
-
-        // 按时间预热：分层编译下「调用次数」比「迭代次数」更重要，固定 3 次预热会把
-        // tier-0 的慢样本算进来（实测同形状能差 4 倍以上）。
-        var warm = System.Diagnostics.Stopwatch.StartNew();
-        do
+        double Best(Action body)
         {
-            Run();
-        }
-        while (warm.Elapsed.TotalMilliseconds < 400);
+            // 按时间预热：分层编译下「调用次数」比「迭代次数」更重要，固定 3 次预热会把
+            // tier-0 的慢样本算进来（实测同形状能差 4 倍以上）。
+            var warm = System.Diagnostics.Stopwatch.StartNew();
+            do
+            {
+                body();
+            }
+            while (warm.Elapsed.TotalMilliseconds < 400);
 
-        double best = double.MaxValue;
-        for (int i = 0; i < iters; i++)
-        {
-            var watch = System.Diagnostics.Stopwatch.StartNew();
-            Run();
-            watch.Stop();
-            if (watch.Elapsed.TotalMilliseconds < best)
-                best = watch.Elapsed.TotalMilliseconds;
+            double best = double.MaxValue;
+            for (int i = 0; i < iters; i++)
+            {
+                var watch = System.Diagnostics.Stopwatch.StartNew();
+                body();
+                watch.Stop();
+                if (watch.Elapsed.TotalMilliseconds < best)
+                    best = watch.Elapsed.TotalMilliseconds;
+            }
+
+            return best;
         }
 
+        double best = Best(() => RunBatched(a, b, c, batches, m, k, n));
         double perBatch = best / batches;
         double gflops = 2.0 * m * k * n / (perBatch * 1e6);
-        Console.WriteLine($"{m,6}  {k,6}  {n,6}  {batches,6}   {perBatch,12:F3}  {gflops,8:F1}");
+
+        // 预打包对照：常量权重（MatMul / 量化图）每帧都不必重新打包 B。
+        // batch > 1 时每个 batch 是不同的矩阵，面板不能共享，所以只比单批。
+        string packedText = "        -";
+        string speedupText = "        -";
+        if (batches == 1)
+        {
+            var packed = GemmKernel.Pack(b, k, n);
+            double packedBest = Best(() => GemmKernel.MultiplyPacked(a, packed, c, m));
+            packedText = $"{packedBest,13:F3}";
+            speedupText = $"{best / packedBest,10:F2}x";
+        }
+
+        Console.WriteLine($"{m,6}  {k,6}  {n,6}  {batches,6}   {perBatch,12:F3}  {gflops,8:F1} {packedText} {speedupText}");
     }
 
     return 0;
@@ -730,7 +747,7 @@ static int Profile(string[] args)
     }
 
     var net = LoadModel(path, options);
-    BindInputs(net, options.Inputs, SingleShape(options));
+    BindInputs(net, options.Inputs, SingleShape(options), NamedShapes(options));
 
     int iters = Math.Max(1, options.GetInt("--iters", 2));
     int top = options.GetInt("--top", 20);
@@ -1627,6 +1644,32 @@ static int[]? SingleShape(CliOptions options)
     return options.Shapes.Count == 0 ? null : ParseShape(options.Shapes[^1]);
 }
 
+/// <summary>
+/// 命名形状 <c>--shape name=1,96,560</c> → 字典，供多输入模型按名字覆盖
+/// （如 ASR encoder 的 <c>speech</c> + <c>speech_lengths</c>：两者形状不同，共用一个 <c>--shape</c> 会失败）。
+/// 没有命名形状时返回 null。
+/// </summary>
+static Dictionary<string, int[]>? NamedShapes(CliOptions options)
+{
+    Dictionary<string, int[]>? named = null;
+
+    foreach (string text in options.Shapes)
+    {
+        int separator = text.IndexOf('=');
+        if (separator <= 0)
+            continue;
+
+        var dims = ParseShape(text[(separator + 1)..]);
+        if (dims is null)
+            continue;
+
+        named ??= new Dictionary<string, int[]>(StringComparer.Ordinal);
+        named[text[..separator]] = dims;
+    }
+
+    return named;
+}
+
 static ChannelNormalization ParseNormalization(string? text) => text?.ToLowerInvariant() switch
 {
     "255" or "unit" or "div255" => ChannelNormalization.Divide255,
@@ -1785,7 +1828,11 @@ static Net LoadModel(string path, CliOptions? options)
     return single is { Length: > 0 } ? Net.ReadModel(path, single) : Net.ReadModel(path);
 }
 
-static List<Tensor> BindInputs(Net net, List<string> inputs, int[]? shapeOverride = null)
+static List<Tensor> BindInputs(
+    Net net,
+    List<string> inputs,
+    int[]? shapeOverride = null,
+    Dictionary<string, int[]>? namedShapes = null)
 {
     if (inputs.Count == 0)
         throw new OnnxSharpException("no --input given");
@@ -1812,7 +1859,12 @@ static List<Tensor> BindInputs(Net net, List<string> inputs, int[]? shapeOverrid
             file = inputs[i];
         }
 
-        var tensor = LoadTensor(net, name, file, shapeOverride);
+        // 命名形状按输入名优先（多输入模型每个输入形状不同）；否则退回单一 --shape
+        int[]? shapeForInput = namedShapes is not null && namedShapes.TryGetValue(name, out var named)
+            ? named
+            : shapeOverride;
+
+        var tensor = LoadTensor(net, name, file, shapeForInput);
         net.SetInput(name, tensor);
         tensors.Add(tensor);
     }

@@ -299,6 +299,7 @@ internal static class Int8Tests
             $"        int8 tier: {Int8Kernel.Tier} ({Int8Kernel.Describe()})   " +
             $"Avx2={System.Runtime.Intrinsics.X86.Avx2.IsSupported} " +
             $"Avx512BW={System.Runtime.Intrinsics.X86.Avx512BW.IsSupported} " +
+            $"Avx512F={System.Runtime.Intrinsics.X86.Avx512F.IsSupported} " +
             $"AvxVnni={System.Runtime.Intrinsics.X86.AvxVnni.IsSupported} " +
             $"AdvSimd={System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported}");
 
