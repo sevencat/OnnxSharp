@@ -42,6 +42,8 @@ public static class LayerRegistry
         Ops.MiscOps.Register();
         Ops.NormOps.Register();
         Ops.QuantOps.Register();
+        Ops.ArgMaxOps.Register();
+        Ops.MatMulArgMaxOps.Register();
         Ops.AttnOps.Register();
         Ops.FusedEltwiseLayer.Register();
     }

@@ -695,6 +695,83 @@ Tile TopK Transpose Unsqueeze Where
     编解码要额外引 `Sdcb.SimdCodecs.Jpeg / Png / Bmp` 并在 `ImageHost.RegisterCodecs()` 里显式注册；
     没注册的格式调用时抛 `FeatureNotSupportedException`。产品库 `OnnxSharp` 一行都不引 —— 它只吃像素。
 
+### 6.16 端到端语音识别打通（M9-07/08/09，2026-11-11 早晨）
+
+- **decoder 段**：`tools/scripts/split_decoder.py` 去掉两个 `Loop`/`Sequence*`、剪掉不可达节点、把 loop 的输出
+  提升成图输入 → `decoder.onnx`（7828 节点）。ORT 验证切图与全模型 `logits` **逐位一致**；
+  我们的引擎跑通（5302 op），**21/21 token 的 argmax 与 ORT 一致**。
+- **补的引擎缺口**：`LogSoftmax`、**运行期 `Slice`**（`Slice(..., max_label_len)`）、
+  **标量输入的 dtype**（`Dims.Length == 0` 时原来直接丢掉了类型）。
+- **token 解码**：`Speech/TokenTable.cs`，规则 = argmax → 跳过 `<blank>` → 折叠连续重复 → 遇 `</s>` 停。
+- **识别门面 + CLI**：`Speech/Paraformer/ParaformerRecognizer` + `asr <wav> --models <dir>`。
+- **真实语音验证**：`tools/scripts/tts_huihui.ps1` 用 Windows 自带的 **Microsoft Huihui（微软慧慧）**
+  合成 16 kHz wav（4.54 s）→ 76 帧特征 → 16 个 token → 文本
+  **「今天气真不错我们出去走一走吧」**，与 ORT 全模型的参考文本**逐字一致**。
+- 首次端到端 1.7 s（JIT + 两次图加载各 ~0.5/0.2 s）；测试全量 **93/96 passed, 3 skipped**。
+- **目录约定**（对齐 `Ocr/PaddleOCR`）：`Speech/` 只留**模型无关**的东西
+  （`WavReader` / `FbankExtractor` / `LfrCmvn` / `SpeechFeatureExtractor` / `TokenTable`），
+  模型专属实现放子目录 —— 现在有 `Speech/Paraformer/`（`ContinuousIntegrateAndFire` + `ParaformerRecognizer`），
+  以后的 Whisper / Zipformer / streaming paraformer 各开一个兄弟目录，互不干扰。
+
+### 6.15 纯 C# 语音前端（M9-02，2026-11-11 凌晨）
+
+- **新增 `Speech/`**：`WavReader`（PCM 8/16/24/32 + float32，多声道混单声道，不做重采样）、
+  `FbankOptions` / `FbankExtractor`（kaldi 风格 fbank）、`LfrCmvn`（funasr 的 LFR + CMVN）、
+  `SpeechFeatureExtractor`（wav → `[T, 560]`，参数可从模型 metadata 自动读）。
+- **ONNX reader 补了 metadata**：`OnnxFile.Metadata`（`ModelProto.metadata_props`，字段 14）。
+  Paraformer 把 `lfr_window_size=7`、`lfr_window_shift=6`、`neg_mean`/`inv_stddev`（560 维，
+  正好是 80 维平铺 7 次）都放在那里，前端不用再要 CMVN 文件。
+- **金标准**：`tools/scripts/fbank_probe.py` 用 **kaldi-native-fbank**（sherpa 内部同一个库，
+  `pip install kaldi_native_fbank`）合成 6 s 扫频 + 噪声的 wav，落 598×80 的 fbank 与 100×560 的 LFR。
+  为搞清细节还把 sdist 拉下来读了 `feature-fbank.cc` / `mel-computations.cc`。
+- **结果**：fbank **median|diff| 4.8e-7、有声 bin ≤ 9.7e-5**；LFR+CMVN **median 0**、max 3.4e-4；
+  CLI `features` 端到端 22.6 ms（6 s 音频），与 Python 参考 54.9% 元素逐位相同。
+- 新增回归 `fbank: matches kaldi-native-fbank frames`、`fbank: LFR + CMVN matches funasr semantics`，
+  全量 **91/94 passed, 3 skipped**。
+
+### 6.14 CIF 用 C# 重写（M9-06，2026-11-11 凌晨）
+
+- **新增 `src/OnnxSharp/Speech/Paraformer/ContinuousIntegrateAndFire.cs`**：把模型里 80 节点的 `Loop` body
+  逐节点移植成十几行循环，产出「每步候选帧 / 每步累加 alpha / 触发下标 / token 级 embeddings /
+  残留 frame 与 alpha」。API 只支持单条语音（`[T, dim]` + `[T]`），批量在外面循环。
+- **金标准**：`tools/scripts/sherpa_cif_probe.py` 把 `/predictor/Concat_5_output_0`（enc）、
+  `/predictor/Add_output_0`（alphas）、`fires`、`frames`、`frame.7`、`integrate.7`、`token_num`
+  一起加成 graph output，用 ORT 跑一遍落盘。
+- **结果**：`frames` / `fires` / `frame.7` / `integrate.7` **全部 `max|diff| = 0`**（逐位一致），
+  token 数 **21 = ORT 21**。新增回归 `cif: candidates/fires/leftovers match the ONNX loop body`
+  与 `cif: token count matches the model output`。
+- **踩过的三个语义点**（照抄 body 才不会错）：
+  1. `completion = 1 - integrate` 用的是**上一步的** integrate（不是加完 alpha 之后的）；
+  2. `fire` 时 `frame` 是**替换**成 `remainds * enc[t]`，不是「先发出、再清零」；
+  3. token 选择是 `frames[fires >= 1]`（`fires` 存的是**累加后的 alpha**），
+     不是 `fires >= 0.5`、也不是按 `alphas` 排序。
+- **顺带**：`MatMulArgMaxKernel` 的 `m ≥ 2` 路径改成 **4 行分块**（B 只读 `ceil(m/4)` 遍），
+  之前逐行做会把 B 重扫 m 遍，CTC 形状下不如「先 GEMM 再 argmax」。
+- 另外记一笔：**bench 结论会被后台负载污染**。同一份代码在机器空闲时 encoder 104 ms，
+  VS Code/微信 占满核心时是 152~190 ms（`gemmbench` 从 ~500 掉到 ~100-200 GFLOPS）；
+  以后对比数字要连同「当时的微基准」一起报，别拿不同负载下的两组数比。
+
+### 6.13 MatMul+ArgMax 与 encoder 性能收尾（2026-11-10 深夜）
+
+- **新增 `ArgMax` 算子**（axis / keepdims / select_last_index，I64 输出，支持 F32/I32/I64 输入）——
+  之前完全没有，是 decoder / CTC 贪心解码的前置。
+- **`Kernels/MatMulArgMaxKernel`**：`ArgMax(MatMul(a,b)+bias)` 不物化 logits；m ≥ 2 按行并行，
+  m == 1（逐 token 解码）按列并行后合并（「值大者胜、相等取小下标」，与 `select_last_index=0` 一致）。
+- **图融合**：`GraphFusion.FuseMatMulArgMax` 把 `MatMul →(Add 常量 bias)→ ArgMax(axis=-1, keepdims=0)`
+  替换成单层 `MatMulArgMax`（新建层 + `graph.Reset`，因为输出形状/类型都变了）。
+  校验：中间张量单消费者、非图输出、ArgMax 属性匹配（层内接口 `ILastAxisArgMax` 暴露给融合器）。
+- **实测**：与 ORT 逐值一致（`1×512×8000` 单 token、`24×256×8000` CTC 两档）。
+  **性能如实说**：与「先 GEMM 再 argmax」基本持平（同一进程内 0.9~1.3×，纯噪声）；
+  原因是手写 GEMV 循环（8 路累加器）打不过寄存器分块 + 打包的 `GemmKernel`。
+  所以内核分两层：logits ≤ 4M 元素走「GEMM 到池化缓冲 + 扫描」（省一次调度与分配），
+  超过才走不物化的流式路径（长语音 CTC 的几 MB 写读才真的有收益）。
+  CLI：decode 0.2 ms / ctc 0.9 ms。
+- **M10-02d 完成**：1-D `Conv` 改「按输出向量化 + 按输出通道并行」（41 → 9 ms）、
+  `DynamicQuantizeLinear` 的 min/max 向量化（16.8 → 11.5 ms）。
+  encoder 段 **170 → 104 ms**（累计 **104×**），与 ORT 的 30.9 ms 差 3.4×。
+- **测试**：新增 `MatMulArgMaxTests`（3 例：ArgMax 语义、融合 vs ORT、融合 vs 两趟吞吐），
+  全量 **87/90 passed, 3 skipped**。
+
 ### 6.12 int8 量化算子与 ASR encoder 段（2026-11-10 晚）
 
 这一轮的目标是「把 Paraformer 的 encoder 段跑起来」，过程中把「int8 加速」的假设全部证伪了，
@@ -762,9 +839,12 @@ Tile TopK Transpose Unsqueeze Where
     慢的不是 `vpmovzxbw` 解包（per call 也就 40 万次），而是**把「小 GEMM 的固定开销（B 面板打包 +
     `Parallel.For` 调度）」乘上了列块数**（1280/64 = 20 次调用）。教训：测「带宽优化」之前先确认
     **不是固定开销主导**。代码留在 `Kernels/Int8DequantGemm.cs` 作反例与回归基准。
-77. **ASR 形状的 FP32 GEMM 只有 73 GFLOPS**（机器峰值 400+，yolo 的 640² 形状能到 300+）。
-    `m≈96` 时 `GemmKernel` 的行块（m/40）与 `Parallel.For` 固定开销占了主导。想快就得改这里，
-    而不是换数据类型 —— 这条把「int8 加速」的讨论直接改了结论（plan.md 里新增 M10-02c）。
+77. **ASR 形状的 GEMM 并不慢 —— 我上一版记的「73 GFLOPS」是单线程数字**（已更正）。
+    `gemmbench --shape 96,320,1280 --threads 16` 实测 **496 GFLOPS**（`96×320×320` 是 112 GFLOPS）。
+    当初那个 73 是在测试进程里量的（同一进程里 int8 路径 7 GFLOPS，比值 0.10× 仍然成立）。
+    教训：**A/B 比值可以在测试进程里取，绝对吞吐必须用 CLI + 明确线程数**；
+    另外 `gemmbench --shape` 之前根本没生效（`ParseOptions` 把 `--shape` 收进 `Shapes` 列表，
+    而 `GemmBench` 读的是通用字典），已修，现在支持重复传多个 `--shape`。
 78. **运行期形状只有一条路：`DynamicOutputShapes()` + 在 `Forward` 里 `outputs[i].Fit(...)`**。
     Paraformer 的 `Range(0, ReduceMax(speech_lengths))`、`Reshape(Shape→Gather→Concat)`、
     `ConstantOfShape(pads)` 都属于「形状要跑了才知道」，`GetMemoryShapes` 里 `RequireConstInput`
@@ -790,6 +870,60 @@ Tile TopK Transpose Unsqueeze Where
     mean|diff| 8e-4、max 8.7e-2，padded 帧却完全一致。
     `tools/scripts/probe_tensors.py` 把任意中间张量追加成 graph output，ORT / 引擎各跑一次，
     直接给「哪个张量开始变坏」；盯着最终输出瞎猜会浪费一整天。
+85. **`Cast` 的通用实现是纯标量的**（逐元素 `switch` + `double` 中转，~200 M 元素/秒）。
+    Paraformer encoder 里 170 个 `Cast(i32 → f32)` 就占了 **33%**。`Tensors/CastKernel.cs` 给
+    `i32↔f32`、`u8/i8→f32`、`u8/i8→i32`、`f32→u8`、`i32→u8` 开了 AVX2 通道后降到 **0.8%**。
+    注意 ONNX 的 float→int 是**向零截断**（`Avx.ConvertToVector256Int32WithTruncation`），不是四舍五入。
+86. **`Pow` 的向量化通道实际上退化成逐 lane `MathF.Pow`**（~14 ns/元素，35 ms 占 12%）。
+    LayerNorm 的 `Pow(x, 2)` 在 `ElementWiseBinary` 里直接改写成 `Mul(x, x)` 即可（0.2 ms）；
+    顺手把 `Pow(x,1)` → 拷贝、`Pow(x,0.5)` → `Sqrt`。这类「指数是标量常量」的改写要放在
+    通用广播循环之前，否则永远走不到。
+87. **广播逐元素还缺一档：「每段一个标量」**。我们原有 ① 同形 ② 标量 ③ 尾部广播（`[384]` 对
+    `[1,1024,384]`）三条快路径，但 `[1,97,1] op [1,97,320]`（LayerNorm 减均值、掩码相乘）落到通用
+    循环（逐元素算索引，~13 ns/元素，ASR 图里 33 ms）。补 `IsInnerConstantBroadcast` +
+    `ApplyInnerScalar` 后降到 ~10 ms —— 这是 SimdOnnx 的 `EwInner` 给我的提示。
+    **踩坑**：这条路径隐含假设「其中一个操作数的形状 == 输出形状」，我第一版没判这个前提，
+    遇到 `[1,97,1] op [1,1,320]`（两边都不等于输出）时用错了 `full` 的形状，直接越界读崩在
+    ASR 用例里。现在两条入口都加了 `x.Shape.Equals(c.Shape)` 前置条件，并有
+    `broadcast: …` 三个形状的回归用例钉住。
+88. **「加索引算偏移」的小算子要先算清摊薄对象**。`ApplyInnerScalar` 每段只调一次 `ApplyScalar`
+    （段长 320 时开销可忽略），但如果段长只有 4~8，逐段调用的固定开销会反噬 —— 这种形状还是走
+    通用循环或 `ApplyBroadcast` 更稳。
+89. **`Span` 和 `fixed` 局部变量都不能进 lambda**（`CS9108` / `CS1764`）。写并行内核时：
+    `fixed (float* p = span) { float* p0 = p; Parallel.For(..., i => 用 p0); }` ——
+    必须再赋给一个**普通**指针局部，直接把 `p`（fixed 局部）捕获会被编译器拒绝。
+90. **`MatMul + ArgMax` 融合的收益完全取决于 logits 体积**。逐 token 解码 `m=1, n=8000` 只有 32 KB，
+    融合只省一次算子调度（0.2 ms 量级）；CTC 那种 `m = 帧数(几百) × n = 词表(几千)` 才是几 MB 的
+    写读，实测 **1.8~2.0×**。别指望它在所有 shape 上都加速，做 A/B 再吹。
+91. **融合「替换整层」比「就地加输出」简单**：激活融合靠 `op.Outputs[0] = act.Outputs[0]`
+    （形状/类型相同才能这么做）；`MatMul → ArgMax` 的输出形状/类型都变了（F32 `[m,n]` → I64 `[m]`），
+    只能新建一个 `MatMulArgMax` 层、把 ArgMax 的输出 Arg 挂上去，再 `graph.Reset(...)`。
+    另外融合前必须查三件事：中间张量**只有一个消费者**、**不是图输出**、ArgMax 的属性
+    是「最后一维 + `keepdims=0` + `select_last_index=0`」（后者通过层内接口暴露给融合器，
+    因为 `LayerInfo` 不保存 `LayerParams`）。
+92. **`OnnxFile.Parse` 里有两个 `new OnnxFile`**（先造一个临时对象解 initializer，最后再造一个返回）。
+    给 `Metadata` 加字段时只在第一个里赋值，结果 `Metadata.Count == 0`，表现为「LFR 参数拿了默认 1/1、
+    特征输出 `[598, 80]` 而不是 `[100, 560]`」。凡是新增的「文件级」属性都要两处都带。
+93. **梅尔滤波器必须全程 float（连 `MelScale` 也是）**。用 double 算会让「恰好落在三角边上的 FFT bin」
+    的**包含关系翻转**（`mel > left` 差 1e-7 就换结果），实测在响亮 bin 上造成 **~3e-4 的相对能量差**；
+    照抄 float 之后与 kaldi-native-fbank **54.9% 元素逐位相同、median|diff| 4.8e-7**。
+94. **别用「静音 bin 的对数差」当精度指标**。能量贴着 log 下限（`float epsilon` 1.19e-7）时，
+    1e-8 的绝对能量差就能放大成 1e-2 的对数差 —— 但那是 ASR 里完全无意义的区间。
+    判据要分三层：中位数（浮点级一致）、有声 bin 的最大差、以及静音区间单独放宽，
+    否则会为了「修」这个假失败去改本来正确的实现。
+95. **标量（rank 0）输入的 dtype 会被丢掉**：`OnnxImporter.ApplyValueInfo` 原来 `Dims.Length == 0` 直接 return，
+    于是 `max_label_len`（int64 标量）被当成 F32，跑到 `Slice` 才炸「expected 4 B for [] F32」。
+    现在 dtype 无条件记下，只有**形状**交给运行时。
+96. **`Slice` 的 starts/ends 可能来自运行时**（Paraformer decoder 的 `Slice(..., max_label_len)`）。
+    和 `Reshape`/`Range` 一样处理：`DynamicOutputShapes()` 里判「有没有非常量输入」，`Forward` 里用
+    真实张量算出输出形状再 `Fit`；常量路径保持原样（不影响常量折叠）。
+97. **decoder 那个 `Loop` 不是 transformer**：body 106 个节点全是「批内 Gather/NonZero/GatherND 取本句
+    embedding → ScatterND 写进 padded buffer → `If` 更新最大长度」。单条音频下它等价于
+    「memory = CIF 的 `[1, tokenNum, 320]`、max_label_len = tokenNum」，**不需要实现 `Loop` 本身**；
+    切图时把这两个输出提升成图输入即可（切完与全模型 `logits` 逐位一致，已用 ORT 验证）。
+
+
+
 
 
 

@@ -72,6 +72,33 @@ def build_signed(path: str) -> None:
     onnx.save(model, path)
 
 
+def build_argmax(path: str, m: int, k: int, n: int) -> None:
+    """MatMul → Add(bias) → ArgMax(axis=-1, keepdims=0)：解码/CTC 贪心解码的形状。"""
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [m, k])
+    out = helper.make_tensor_value_info("out", TensorProto.INT64, [m])
+
+    rng = np.random.RandomState(11)
+    weights = (rng.rand(k, n).astype(np.float32) - 0.5) * 0.1
+    bias = (rng.rand(n).astype(np.float32) - 0.5) * 0.01
+
+    initializers = [
+        numpy_helper.from_array(weights, "W"),
+        numpy_helper.from_array(bias, "b"),
+    ]
+
+    nodes = [
+        helper.make_node("MatMul", ["x", "W"], ["logits"], name="matmul"),
+        helper.make_node("Add", ["logits", "b"], ["biased"], name="add"),
+        helper.make_node("ArgMax", ["biased"], ["out"], name="argmax", axis=-1, keepdims=0),
+    ]
+
+    graph = helper.make_graph(nodes, "argmax", [x], [out], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)], producer_name="onnxsharp-tests")
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+
+
 def main(out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     model_path = os.path.join(out_dir, "quant.onnx")
@@ -92,7 +119,19 @@ def main(out_dir: str) -> None:
 
     print("ort out (u8)  =\n", result)
     print("ort out (s8)  =\n", signed_result)
-    print(f"wrote {model_path} and {signed_path}")
+
+    # 解码/CTC 的 MatMul + ArgMax 融合用例（m=1 逐 token，和一个「帧数」形状）
+    for tag, (m, k, n) in {"decode": (1, 512, 8000), "ctc": (24, 256, 8000)}.items():
+        path = os.path.join(out_dir, f"argmax_{tag}.onnx")
+        build_argmax(path, m, k, n)
+
+        xm = ((np.random.RandomState(12).rand(m, k).astype(np.float32)) - 0.5) * 2.0
+        xm.tofile(os.path.join(out_dir, f"argmax_{tag}_x.f32"))
+        (ort_out,) = ort.InferenceSession(path, providers=["CPUExecutionProvider"]).run(None, {"x": xm})
+        ort_out.astype(np.int64).tofile(os.path.join(out_dir, f"argmax_{tag}_golden.i64"))
+        print(f"{tag}: ORT argmax head = {ort_out[:8].tolist()}")
+
+    print(f"wrote {model_path}, {signed_path} and argmax models")
 
 
 if __name__ == "__main__":

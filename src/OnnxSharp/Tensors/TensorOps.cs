@@ -97,6 +97,31 @@ public static class TensorOps
         var strideB = ComputeStrides(b.Shape, rank);
         var index = new int[rank];
 
+        // Pow 的指数是标量、且为常见值时改写成更便宜的算子：
+        // LayerNorm 的 Pow(x, 2) 在 ASR 图里有 81 个（每个 97×320），逐 lane 调 MathF.Pow
+        // 要 ~14 ns/元素，改写成 Mul 后走向量化路径（~0.5 ns）。
+        if (op == BinaryOpKind.Pow && b.Count == 1 && a.Shape.Equals(c.Shape))
+        {
+            float exponent = b.AsSpan<float>()[0];
+            if (exponent == 2f)
+            {
+                ElementWiseBinary(BinaryOpKind.Mul, a, a, c);
+                return;
+            }
+
+            if (exponent == 1f)
+            {
+                a.Buffer.AsSpan(a.ByteOffset, a.ByteLength).CopyTo(c.Buffer.AsSpan(c.ByteOffset, c.ByteLength));
+                return;
+            }
+
+            if (exponent == 0.5f)
+            {
+                ElementWiseUnary(UnaryOpKind.Sqrt, a, c);
+                return;
+            }
+        }
+
         if (a.Shape.Equals(c.Shape) && b.Shape.Equals(c.Shape))
         {
             // 无广播快速路径
@@ -130,6 +155,20 @@ public static class TensorOps
         {
             // 参数顺序固定为 (全长, 重复)，再靠 leftIsFull 决定谁在 operator 左边
             ApplyBroadcast(op, sb, sa, sc, innerA, leftIsFull: false);
+            return;
+        }
+
+        // 「每段一个标量」广播：LayerNorm 的 x - mean[1,97,1]、掩码相乘 [1,97,1] × [1,97,320] 都是这种。
+        // 之前只能落到通用循环（逐元素算 6 个索引，~13 ns/元素）；这里按段广播后在段内走向量化路径。
+        if (a.Shape.Equals(c.Shape) && IsInnerConstantBroadcast(b.Shape, c.Shape, out int runB))
+        {
+            ApplyInnerScalar(op, a.Shape, b.Shape, sa, sb, sc, runB, operandIsLeft: false);
+            return;
+        }
+
+        if (b.Shape.Equals(c.Shape) && IsInnerConstantBroadcast(a.Shape, c.Shape, out int runA))
+        {
+            ApplyInnerScalar(op, b.Shape, a.Shape, sb, sa, sc, runA, operandIsLeft: true);
             return;
         }
 
@@ -503,6 +542,114 @@ public static class TensorOps
             {
                 for (; i < n; i++)
                     pc[i] = T.Apply(px[i], s);
+            }
+        }
+    }
+
+    /// <summary>把 <paramref name="dims"/> 左补 1 到 <paramref name="rank"/>（广播对齐用）。</summary>
+    private static int[] AlignLeft(ReadOnlySpan<int> dims, int rank)
+    {
+        var result = new int[rank];
+        int offset = rank - dims.Length;
+        for (int i = 0; i < dims.Length; i++)
+            result[offset + i] = dims[i];
+        for (int i = 0; i < offset; i++)
+            result[i] = 1;
+        return result;
+    }
+
+    /// <summary>
+    /// 判断操作数是否「在最内连续段内恒定」，并给出段长。
+    /// <para>
+    /// <c>[1,97,1]</c> 对 <c>[1,97,320]</c> → 段长 320，每段一个标量（LayerNorm 的减均值、掩码相乘）；
+    /// <c>[384]</c> 对 <c>[1,1024,384]</c> 是「段内也要变化」的情形，走 <see cref="ApplyBroadcast"/>。
+    /// </para>
+    /// </summary>
+    private static bool IsInnerConstantBroadcast(TensorShape operand, TensorShape full, out int runLength)
+    {
+        runLength = 1;
+        int rank = full.Rank;
+        if (operand.Rank > rank)
+            return false;
+
+        var dims = AlignLeft(operand.Dims, rank);
+        int axis = rank - 1;
+
+        for (; axis >= 0; axis--)
+        {
+            if (dims[axis] != 1)
+                break;
+            runLength *= full.Dims[axis];
+        }
+
+        if (runLength <= 1 || full.Total() % runLength != 0)
+            return false;
+
+        for (int i = 0; i <= axis; i++)
+        {
+            if (dims[i] != 1 && dims[i] != full.Dims[i])
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>每段一个标量的广播：段内复用向量化的 <see cref="ApplyScalar"/>。</summary>
+    private static void ApplyInnerScalar(
+        BinaryOpKind op,
+        TensorShape fullShape,
+        TensorShape operandShape,
+        ReadOnlySpan<float> full,
+        ReadOnlySpan<float> operand,
+        Span<float> destination,
+        int runLength,
+        bool operandIsLeft)
+    {
+        int rank = fullShape.Rank;
+        var fullDims = fullShape.ToArray();
+        var aligned = AlignLeft(operandShape.Dims, rank);
+
+        var operandStrides = new int[rank];
+        int acc = 1;
+        for (int axis = rank - 1; axis >= 0; axis--)
+        {
+            operandStrides[axis] = acc;
+            acc *= aligned[axis];
+        }
+
+        // 段内恒定 ⇒ 这些轴在外层循环里不需要推进
+        var counts = new int[rank];
+        for (int axis = 0; axis < rank; axis++)
+            counts[axis] = aligned[axis] == 1 && fullDims[axis] > 1 ? 1 : fullDims[axis];
+
+        long offset = 0;
+        int operandOffset = 0;
+        long total = destination.Length;
+        var coords = new int[rank];
+
+        while (offset < total)
+        {
+            ApplyScalar(
+                op,
+                full.Slice((int)offset, runLength),
+                operand[operandOffset],
+                destination.Slice((int)offset, runLength),
+                operandIsLeft);
+
+            offset += runLength;
+
+            for (int axis = rank - 1; axis >= 0; axis--)
+            {
+                if (counts[axis] == 1)
+                    continue;
+
+                coords[axis]++;
+                operandOffset += operandStrides[axis];
+                if (coords[axis] < counts[axis])
+                    break;
+
+                operandOffset -= operandStrides[axis] * counts[axis];
+                coords[axis] = 0;
             }
         }
     }

@@ -72,6 +72,13 @@ internal sealed class OnnxFile
 
     public required IReadOnlyList<OnnxValueInfo> ValueInfos { get; init; }
 
+    /// <summary>
+    /// 模型自带的 metadata（<c>ModelProto.metadata_props</c>，字段 14）。
+    /// 语音模型用它携带 <c>lfr_window_size</c> / <c>neg_mean</c> / <c>inv_stddev</c> 等前端参数。
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Metadata { get; init; } =
+        new Dictionary<string, string>(0, StringComparer.Ordinal);
+
     /// <summary>仅用于测试/工具：构造一个空的模型壳子（<see cref="DecodeTensor"/> 只需要 BaseDirectory）。</summary>
     internal static OnnxFile CreateBare(string baseDirectory) => new()
     {
@@ -129,6 +136,7 @@ internal sealed class OnnxFile
             BaseDirectory = BaseDirectory,
             Opset = Opset,
             Producer = Producer,
+            Metadata = Metadata,
             Nodes = Nodes,
             Initializers = Initializers,
             Inputs = inputs,
@@ -201,6 +209,7 @@ internal sealed class OnnxFile
             BaseDirectory = baseDir,
             Opset = opset,
             Producer = model.Text(2),
+            Metadata = ReadMetadata(model),
             Nodes = Array.Empty<OnnxNodeProto>(),
             Initializers = new Dictionary<string, Tensor>(0, StringComparer.Ordinal),
             Inputs = Array.Empty<OnnxValueInfo>(),
@@ -246,6 +255,7 @@ internal sealed class OnnxFile
             BaseDirectory = baseDir,
             Opset = opset,
             Producer = file.Producer,
+            Metadata = file.Metadata,
             Nodes = nodes,
             Initializers = initializers,
             Inputs = ReadValueInfos(graph, 11, initializers),
@@ -453,6 +463,20 @@ internal sealed class OnnxFile
     /// <c>Resize(X, "", scales)</c>），丢掉空串会让后面的输入整体错位。
     /// </para>
     /// </summary>
+    /// <summary><c>ModelProto.metadata_props</c>（字段 14）：每个条目是 <c>{key=1, value=2}</c>。</summary>
+    private static Dictionary<string, string> ReadMetadata(Proto model)
+    {
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var entry in model.Messages(14))
+        {
+            string key = entry.Text(1);
+            if (key.Length != 0)
+                metadata[key] = entry.Text(2);
+        }
+
+        return metadata;
+    }
+
     private static string[] Strings(Proto message, int field)
     {
         var list = new List<string>(4);

@@ -80,7 +80,12 @@ internal static class GemmKernel
 
         int nb = SelectColumnBlock(n);
 
-        bool useParallel = parallel && (long)m * n * k >= ParallelThreshold && m > 1;
+        // 注意没有 m > 1 的限制：自回归解码（ASR/LLM 的每个 token）就是 m = 1，
+        // 只能靠「按列切分」并行；否则每步都是单线程 GEMV。
+        // m = 1 时总工作量是 n·k（不是 m·n·k），单独给一个更低的阈值，
+        // 否则 1×512×8000 这种「输出词表」形状会一直串行（实测 7.9 → 60+ GFLOPS）。
+        long work = (long)m * n * k;
+        bool useParallel = parallel && (work >= ParallelThreshold || (m == 1 && (long)n * k >= (1 << 20)));
         int threads = ParallelRange.Threads;
         int columnBlocks = (n + nb - 1) / nb;
 

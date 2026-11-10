@@ -92,6 +92,9 @@ internal static class MiscOps
                 return;
             }
 
+            if (CastKernel.TryCast(source, output))
+                return;
+
             for (long i = 0; i < output.Count; i++)
                 SetValue(output, i, GetValue(source, i));
         }

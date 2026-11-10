@@ -469,6 +469,32 @@ internal static class ShapeOps
                 throw new OnnxSharpException(
                     $"Slice '{Name}': starts/ends/axes/steps must have the same length");
 
+            return Normalize(starts, ends, axes, steps, rank);
+        }
+        private (int[] Starts, int[] Ends, int[] Axes, int[] Steps) ResolveRuntime(
+            IReadOnlyList<Tensor> inputs, int rank)
+        {
+            if (Inputs.Count <= 1)
+                return Resolve(rank);
+
+            var starts = OpUtil.ReadInts(inputs[1]);
+            var ends = Inputs.Count > 2 && Inputs[2].Idx != 0 ? OpUtil.ReadInts(inputs[2]) : _endsAttr;
+            var axes = IsEmptyInput(3) ? DefaultAxes(starts.Length) : OpUtil.ReadInts(inputs[3]);
+            var steps = IsEmptyInput(4) ? Fill(starts.Length, 1) : OpUtil.ReadInts(inputs[4]);
+
+            return Normalize(starts, ends, axes, steps, rank);
+        }
+
+        private (int[] Starts, int[] Ends, int[] Axes, int[] Steps) Normalize(
+            int[] starts, int[] ends, int[] axes, int[] steps, int rank)
+        {
+            if (starts.Length != ends.Length)
+                throw new OnnxSharpException(
+                    $"Slice '{Name}': starts({starts.Length}) / ends({ends.Length}) mismatch");
+            if (axes.Length != starts.Length || steps.Length != starts.Length)
+                throw new OnnxSharpException(
+                    $"Slice '{Name}': starts/ends/axes/steps must have the same length");
+
             var normalized = new int[axes.Length];
             for (int i = 0; i < axes.Length; i++)
             {
@@ -478,6 +504,24 @@ internal static class ShapeOps
             }
 
             return (starts, ends, normalized, steps);
+        }
+
+        private bool HasRuntimeSliceInputs()
+            => (Inputs.Count > 1 && Inputs[1].Idx != 0 && !IsConstInput(1))
+            || (Inputs.Count > 2 && Inputs[2].Idx != 0 && !IsConstInput(2))
+            || (Inputs.Count > 3 && Inputs[3].Idx != 0 && !IsConstInput(3))
+            || (Inputs.Count > 4 && Inputs[4].Idx != 0 && !IsConstInput(4));
+
+        /// <summary>starts/ends 来自运行时：形状要在 <see cref="Forward"/> 里算完再 Fit。</summary>
+        public override bool DynamicOutputShapes() => HasRuntimeSliceInputs();
+
+        private TensorShape ShapeOf(TensorShape input, int[] starts, int[] ends, int[] axes, int[] steps)
+        {
+            var dims = input.ToArray();
+            for (int i = 0; i < axes.Length; i++)
+                dims[axes[i]] = SliceLength(dims[axes[i]], starts[i], ends[i], steps[i]);
+
+            return new TensorShape(dims);
         }
 
         private static int[] DefaultAxes(int count)
@@ -512,12 +556,7 @@ internal static class ShapeOps
         {
             var input = inShapes[0];
             var (starts, ends, axes, steps) = Resolve(input.Rank);
-
-            var dims = input.ToArray();
-            for (int i = 0; i < axes.Length; i++)
-                dims[axes[i]] = SliceLength(dims[axes[i]], starts[i], ends[i], steps[i]);
-
-            outShapes.Add(new TensorShape(dims));
+            outShapes.Add(ShapeOf(input, starts, ends, axes, steps));
         }
 
         public override unsafe void Forward(
@@ -527,7 +566,14 @@ internal static class ShapeOps
         {
             var input = inputs[0];
             var output = outputs[0];
-            var (starts, _, axes, steps) = Resolve(input.Shape.Rank);
+
+            int rank = input.Shape.Rank;
+            var (starts, ends, axes, steps) = HasRuntimeSliceInputs()
+                ? ResolveRuntime(inputs, rank)
+                : Resolve(rank);
+
+            if (DynamicOutputShapes())
+                output.Fit(ShapeOf(input.Shape, starts, ends, axes, steps), input.DType);
 
             var inDims = input.Shape.ToArray();
             var outDims = output.Shape.ToArray();

@@ -124,6 +124,9 @@ def split(path_in: str, path_out: str, explicit_outputs: list[str] | None = None
     new_graph = helper.make_graph(ordered, "encoder", inputs, output_infos, used_initializers)
     new_model = helper.make_model(new_graph, opset_imports=model.opset_import, producer_name="onnxsharp-split")
     new_model.ir_version = 10
+    # 保留原模型的 metadata（lfr_window_size / neg_mean / inv_stddev 等前端参数都在里面）
+    del new_model.metadata_props[:]
+    new_model.metadata_props.extend(model.metadata_props)
 
     # 用 shape_inference 补齐缺类型的新输出（checker 不跑：原图本身就不满足拓扑序检查）
     try:

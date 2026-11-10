@@ -116,19 +116,30 @@ internal static class OnnxImporter
     /// </summary>
     private static void ApplyValueInfo(NetImpl net, Arg arg, OnnxValueInfo info)
     {
-        if (info.Type == DType.Invalid || info.Dims.Length == 0)
+        if (info.Type == DType.Invalid)
             return;
 
+        bool dynamic = false;
         for (int i = 0; i < info.Dims.Length; i++)
         {
             if (info.Dims[i] < 0)
-                return;   // 含动态维度：交给运行时决定
+            {
+                dynamic = true;
+                break;
+            }
         }
 
         var data = net.GetArgData(arg);
+
+        // dtype 总要记住：标量输入（rank 0，Dims.Length == 0）也要有正确类型，
+        // 否则 int64 的 `max_label_len` 会被当成 F32（decoder 里当 Slice 的 starts 用）。
+        data.DType = info.Type;
+
+        if (dynamic || info.Dims.Length == 0)
+            return;   // 动态维度 / 标量：形状交给运行时或调用方
+
         data.Shape = new TensorShape(info.Dims);
         data.HasShape = true;
-        data.DType = info.Type;
         data.Layout = Layout.NCHW;
     }
 

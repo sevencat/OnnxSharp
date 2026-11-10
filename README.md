@@ -66,7 +66,7 @@
 | **后端** | **只有 CPU**（FP32，AVX2 / AVX-512 + 多线程）；**没有** CUDA / TensorRT / Vulkan / OpenCL / DirectML 后端 |
 | 依赖 | 零第三方包（不引用 `Google.Protobuf`、`Microsoft.ML.OnnxRuntime`），全部手写 |
 | 目标框架 | `net8.0` / `net10.0`，AOT 友好（不用反射、不用 `dynamic`） |
-| 算子 | 75 个注册算子，覆盖 YOLO11/v8、RF-DETR、PP-OCRv6 与 sherpa Paraformer 的 encoder 段导出图（清单见 [支持算子](#支持算子)） |
+| 算子 | 76 个注册算子，覆盖 YOLO11/v8、RF-DETR、PP-OCRv6 与 sherpa Paraformer 的 encoder 段导出图（清单见 [支持算子](#支持算子)） |
 | 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链等） |
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
 | 线程 | 默认 `Environment.ProcessorCount`，可用环境变量 `ONNXSHARP_THREADS` 覆盖 |
@@ -370,6 +370,38 @@ ImageTensor.ToChw(source, 0, 0, width, height,
 | `OcrImage.ToChw`（PaddleOCR） | 裁剪文本行 + 高 48 | 0 | `(v/255-0.5)/0.5` |
 | `Sam3Segmenter`（SAM3） | `Contain(centered:false)` | 1.0（白） | `/255` |
 
+### 库用法 9：语音识别一条龙（Paraformer，纯 C#）
+
+```csharp
+var recognizer = new ParaformerRecognizer(new ParaformerOptions
+{
+    EncoderPath = @"sherpa\encoder.onnx",   // split_before_control_flow.py 切出来的 encoder 段
+    DecoderPath = @"sherpa\decoder.onnx",   // split_decoder.py 切出来的 decoder 段
+    TokensPath = @"sherpa\tokens.txt",
+});
+
+var result = recognizer.TranscribeWav("test.wav");      // 16 kHz 单声道
+Console.WriteLine(result.Text);        // 今天气真不错我们出去走一走吧
+Console.WriteLine(result.TokenIds);    // [5308, 8301, 4474, ...]  (16 个 token)
+```
+
+整条链都在 C# 里：`wav → fbank/LFR/CMVN → encoder → CIF → decoder → argmax → 文本`。
+其中 CIF 是手工移植的（模型里是 80 节点的 `Loop` + 两个 `Sequence*` 输出），
+token 解码规则与 sherpa 一致：argmax → 跳过 `<blank>` → **折叠连续重复** → 遇 `</s>` 停。
+
+命令行等价写法：
+
+```
+OnnxSharp.Cli asr test.wav --models sherpa --tokens sherpa\tokens.txt [--json] [--out text.txt]
+```
+
+模型只需切一次：
+
+```
+python tools/scripts/split_before_control_flow.py model.int8.onnx encoder.onnx /predictor/Concat_5_output_0,/predictor/Add_output_0
+python tools/scripts/split_decoder.py model.int8.onnx decoder.onnx
+```
+
 ### 命令行
 
 ```powershell
@@ -385,6 +417,8 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | `bench <model.onnx> --input in.f32 [--iters N] [--warmup N]` | 计时迭代，输出 median / min |
 | `profile <model.onnx> --input in.f32 [--iters N] [--top N]` | 逐算子耗时排行（找热点） |
 | `detect <model.onnx> <image> [--out marked.jpg]` | 内建预处理 + 解码，直接给出原图坐标的框（可画出标注图） |
+| `features <model.onnx> <wav> [--out feats.f32]` | wav → fbank → LFR → CMVN（Paraformer 的 `speech` 输入），参数取自模型 metadata |
+| `asr <wav> --models <dir> [--tokens f] [--json] [--out text.txt]` | 端到端语音识别（fbank → encoder → CIF → decoder → 文本），<dir> 里放 `encoder.onnx` / `decoder.onnx` / `tokens.txt` |
 | `ocr <image> --det det.onnx --rec rec.onnx --dict keys.txt [--cls cls.onnx] [--out marked.jpg]` | PaddleOCR：DB 检测 → 方向分类 → CTC 识别，给出原图坐标的文本行（可画出标注图） |
 | `sam3 <image> --models <fp32 dir> --box x1,y1,x2,y2 [--box ...] [--out marked.jpg]` | SAM3 框提示分段：`--conf 0.3` / `--iou 0.5` 做框级 NMS / `--max-items 5` / `--format cxcywh\|xyxy\|px` |
 | `gemmbench` / `convbench` / `flopsbench` / `parbench` | 微基准：GEMM、卷积、FLOPS、并行扩展性 |
@@ -427,7 +461,7 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 
 ### 支持算子
 
-75 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` 是图融合的产物）：
+76 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` / `MatMulArgMax` 是图融合的产物）：
 
 | 类别 | 算子 |
 |---|---|
@@ -437,6 +471,7 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | 比较/逻辑 (8) | `Equal` `Less` `Greater` `GreaterOrEqual` `And` `Not` `Where` `IsNaN` |
 | 归约/索引 (7) | `ReduceSum` `ReduceMax` `ReduceMean` `TopK` `Gather` `GatherElements` `GatherND` |
 | 量化 (2) | `DynamicQuantizeLinear` `MatMulInteger` |
+| 索引补充 (1) | `ArgMax`（axis / keepdims / select_last_index；融合成 `MatMulArgMax` 时不物化 logits） |
 | 重算子 (16) | `Conv` `ConvTranspose` `MatMul` `Gemm` `Einsum` `RoiAlign` `MaxPool` `AveragePool` `GlobalAveragePool` `GlobalMaxPool` `Softmax` `LayerNormalization` `BatchNormalization` `InstanceNormalization` `Resize` `GridSample` |
 
 > 与目标模型的关系：YOLO11/v8 用前五类里的大部分；RF-DETR 额外要 `GridSample` / `TopK` / `GatherElements` /
@@ -456,12 +491,52 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 
 | 设想 | 实测 | 结论 |
 |---|---|---|
-| int8 权重 + F32 计算（`vpmovzxbw` 解包后走现有 FMA 内核），把权重带宽降到 1/4 | `96×320×1280`：int8 权重 10.88 ms vs FP32 1.07 ms（**0.10×**） | 否定。按列块反量化等于把小 GEMM 的打包/调度开销重复了 20 次 |
-| 瓶颈是权重带宽 | 同形状 FP32 GEMM 只有 **73 GFLOPS**（机器峰值 400+） | 否定。瓶颈是**小矩阵 GEMM 效率**（ASR 的 m≈96），不是带宽 |
+| int8 权重 + F32 计算（`vpmovzxbw` 解包后走现有 FMA 内核），把权重带宽降到 1/4 | `96×320×1280`：int8 权重 10.88 ms vs FP32 1.07 ms（**0.10×**，同在单线程测试进程里） | 否定。按列块反量化把每个列块的 GEMM 做到了 96×320×64 这种「低于并行阈值」的尺寸，20 次串行调用 |
+| 瓶颈是权重带宽 | 16 线程实测 `96×320×1280` 的 FP32 GEMM 有 **496 GFLOPS**（机器峰值 400~600） | 否定。带宽不是瓶颈；之前记的「73 GFLOPS」是测试进程里的单线程数字，已更正 |
 | VNNI（`vpdpbusd`，理论 4× 整数吞吐） | Zen4 + .NET 10：`AvxVnni.IsSupported = False`，且没有 `Avx512Vnni` 类型 | 待验。需要 Intel 12 代+ 的机器 |
 
-所以现阶段量化图的正确性已经有了，速度靠「把 FP32 GEMM 在小 m 形状上做快」而不是靠 int8 指令
-（见 [plan.md](plan.md) 的 M10-02c）。
+**真正有效的替代**（已实现并回归）：没有 VNNI 时 `MatMulInteger` 不走向量化的标量 int32 内核，
+而是把「整数矩阵乘」交给 F32 GEMM —— 权重一次性展开成 `(w - w_zp)` 的 F32 并缓存，
+激活按 `(a - a_zp)` 展开，算完四舍五入回 int32。反量化后因子都是小整数、累加和远在 2^24 内，
+**结果与整数点积逐位相同**。Paraformer encoder 段实测：
+
+| 阶段 | 耗时（`speech[1,96,560]`，97 帧） |
+|---|---|
+| 标量 int32 `MatMulInteger` | 10,871 ms |
+| + F32 GEMM 替代 | 578 ms（18.8×） |
+| + `Cast` 内核化（170 个 i32→f32，占 33% → 0.8%） | 411 ms |
+| + `Pow(x,2)` 改写成 `Mul`（占 12% → 0.1%） | 443 ms |
+| + 「每段一个标量」广播快路径（`EwInner` 思路） | 171 ms |
+| + 1-D `Conv` 向量化 + `DynamicQuantizeLinear` 的 min/max 向量化 | **104 ms（累计 104×）** |
+| ONNXRuntime（同一切图，MLAS int8 + VNNI） | 30.9 ms |
+
+即：**量化图的正确性 + 可用的吞吐都有了**，剩下的 5.5× 差距主要来自 ORT 的 VNNI 整数内核。
+
+### 语音前端（fbank → LFR → CMVN）
+
+Paraformer 的 `speech` 输入是 <c>[T, 560]</c> 的 560 维特征，不是原始波形。这一层现在是纯 C#：
+
+```csharp
+// 从模型 metadata 自动读 LFR / CMVN 参数（lfr_window_size / neg_mean / inv_stddev）
+var extractor = SpeechFeatureExtractor.FromModel(@"sherpa\model.int8.onnx");
+var feats = extractor.ComputeFromWav("test.wav");     // [Frames, 560]
+```
+
+或者直接命令行（产出可以直接喂给 `run` / ORT）：
+
+```
+OnnxSharp.Cli features sherpa\model.int8.onnx test.wav --out feats.f32
+# wav/meta/feats 三行：feats : [100, 560]  (22.6 ms)
+```
+
+实现细节（都实测对齐过 kaldi-native-fbank，sherpa 内部用的同一个库）：
+
+- 分帧 25/10 ms、snip_edges、去直流、预加重 0.97、povey 窗、补零到 512、实 FFT、功率谱
+- 梅尔三角滤波 **全程 float**（用 double 会让「恰好落在三角边上的 FFT bin」包含关系翻转，响亮 bin 上能差 3e-4）
+- 取对数下限 `1.1920929e-7`（`float epsilon`）；只算到 `FftSize/2`（不含 Nyquist）
+- LFR：`T_lfr = ceil(T/6)`，左侧补 3 帧、右侧重复最后一帧（funasr `WavFrontend` 语义）
+
+实测：**median \|diff\| 4.8e-7、54.9% 逐位相同、有声 bin ≤ 9.7e-5**；剩下的差异只在全静音的 bin（能量贴着 log 下限，对数会把 1e-8 的绝对差放大成 1e-2），对 ASR 无影响。
 
 ### 性能
 
@@ -487,7 +562,8 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | rfdetr-small / rfdetr-medium | 跑通并纳入基准；解码结果与官方 `rfdetr.export._runtime.decode_detections` 逐框一致（41/41 框，坐标 0.00 px） |
 | PP-OCRv6 tiny（det / rec / cls） | det 与 rec 的**原始输出**与 ONNXRuntime 对齐（64² + 960² 输入：max\|diff\| 1.4e-7 / 7.6e-6）；900×300 合成图两行文字全对（`Hello OnnxSharp 123` 0.957、`第二行文字 PaddleOCR` 0.982） |
 | 单算子微模型 | GEMM / attention / 逐元素链，用于内核定点调优 |
-| sherpa Paraformer encoder 段（int8） | 用手写脚本把 `model.int8.onnx` 在第一个 `Loop`（CIF）前切开，5715 节点的 encoder 子图**直接跑通**（`speech[1,96,560]` → `[1,97,320]`）；`DynamicQuantizeLinear` + `MatMulInteger`(+s8 权重、per-column 零点) 与 ONNXRuntime **逐位一致**（max\|diff\| = 0） |
+| sherpa Paraformer encoder + CIF（int8） | 用手写脚本把 `model.int8.onnx` 在第一个 `Loop`（CIF）前切开，5715 节点的 encoder 子图**直接跑通**（`speech[1,96,560]` → `[1,97,320]`，**104 ms/帧**；同图 ORT 30.9 ms）；`DynamicQuantizeLinear` + `MatMulInteger`(+s8 权重、per-column 零点) 与 ONNXRuntime **逐位一致**（max\|diff\| = 0）。CIF 用 `Speech/Paraformer/ContinuousIntegrateAndFire` 重写（绕开 `Loop`/`Sequence*`），与 ORT 录的 `frames`/`fires`/`frame.7`/`integrate.7` **逐位一致**，token 数 21 = ORT 21 |
+| **Paraformer 端到端（中文）** | Windows 自带的 Microsoft Huihui 合成 4.54 s 中文 wav → 76 帧特征 → 16 个 token → **「今天气真不错我们出去走一走吧」**，与 ORT 全模型参考文本**逐字一致**；整链纯 C#（fbank/LFR/CMVN + encoder + CIF + decoder + token 解码） |
 
 ### 限制
 
@@ -502,10 +578,11 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 - `OnnxSharp.Ocr.PaddleOCR` 只覆盖 **PP-OCRv6 系列**（DB 检测 + CTC 识别 + 文本行方向分类）；表格识别、
   版面分析、SAST 等其它 OCR 结构未实现。检测后处理是**轴对齐框**（不做 pyclipper 的多边形外扩），
   竖排 / 大角度倾斜文本能框住但框是正的。
-- **语音识别只做到 encoder 段**：`Loop`（CIF）/ `NonZero` / `Sequence*` 这类控制流未实现，整张
-  `model.int8.onnx` 不能直接导入。用 `tools/scripts/split_before_control_flow.py` 切掉控制流后的
-  encoder 子图可以跑（与 ORT 主输出 mean\|diff\| 8e-4，逐层 1e-6~3.6e-5，CIF 会把小误差放大）。
-  需要完整 ASR 请直接用 sherpa-onnx（见 [库用法 6](#库用法-6语音识别sherpa-onnx不在引擎里)）。
+- **语音识别已打通（Paraformer）**：`Speech/Paraformer/ParaformerRecognizer` 走 `wav → fbank/LFR/CMVN → encoder → CIF → decoder → 文本`，
+  与 ONNXRuntime 全模型的参考文本逐字一致。**前提**：模型要先按
+  `tools/scripts/split_*.py` 切成 `encoder.onnx` / `decoder.onnx`（整图里的两个 `Loop` 引擎不执行）。
+  只验证过这一个中文模型（`speech_paraformer_asr_nat-zh-cn-16k-common-vocab8358`），
+  流式 / 热词 / 标点 / 时间戳都没有；英文模型、其它语种未验证。
 
 ### 目录结构
 
@@ -523,9 +600,14 @@ src/OnnxSharp/
     PaddleOCR/  OcrLine / OcrPixelFormat / 像素→NCHW / CTC 解码
                 + PaddleOcrModel / PaddleOcrPipeline / DbPostprocess / PaddleOcrOptions
   Sam3/      可选门面：Sam3Segmenter（vision → geometry → decoder）+ Sam3Box / Sam3Item / Sam3Nms
+  Speech/    语音（可整体删除，不影响推理）
+    通用前端：WavReader / FbankOptions / FbankExtractor（kaldi fbank）/ LfrCmvn / SpeechFeatureExtractor
+              / TokenTable（tokens.txt + argmax 解码规则）
+    Paraformer/  ContinuousIntegrateAndFire（CIF，替代图里的 Loop）/ ParaformerRecognizer（端到端）
+                其它 ASR 模型（Whisper / Zipformer / streaming paraformer）以后放同级的兄弟目录
   Imaging/   共享图像预处理：ImagePixels / ImageGeometry / AxisMap / ImageTensor（Vision / OCR / SAM3 共用）
 tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / sam3 / 微基准 + ImageFacade 图像 IO
-tools/scripts/         dump_shapes / gen_golden / extract_ocr_models.ps1 / onnx_fp16_to_f32
+tools/scripts/         dump_shapes / gen_golden / extract_ocr_models.ps1 / onnx_fp16_to_f32 / fbank_probe
                        / make_quant_model / split_before_control_flow / sherpa_encoder_probe
                        / probe_tensors / inspect_loop / compare_outputs
 tests/OnnxSharp.Tests/ 零依赖测试运行器（80 用例），直接 dotnet run
@@ -606,7 +688,7 @@ A few conventions follow from that:
 | **Backend** | **CPU only** (FP32, AVX2 / AVX-512 + threads); **no** CUDA / TensorRT / Vulkan / OpenCL / DirectML backend |
 | Dependencies | None — protobuf reader, kernels and runtime are all hand-written |
 | Targets | `net8.0` / `net10.0`, AOT-friendly (no reflection, no `dynamic`) |
-| Operators | 75 registered ops, covering YOLO11/v8, RF-DETR, PP-OCRv6 and the encoder part of sherpa Paraformer exports |
+| Operators | 76 registered ops, covering YOLO11/v8, RF-DETR, PP-OCRv6 and the encoder part of sherpa Paraformer exports |
 | Graph passes | Constant folding (Shape→Gather→Concat→Reshape chains), operator fusion |
 | Runtime | Static buffer pool (outputs detach), shape inference, `Parallel.For` + AVX2/AVX-512 |
 | Threads | `Environment.ProcessorCount` by default, overridable via `ONNXSHARP_THREADS` |
@@ -834,6 +916,8 @@ code; it is deliberately not bundled here so an optional feature does not drag i
 | `bench <model.onnx> --input in.f32 [--iters N] [--warmup N]` | Timed iterations (median / min) |
 | `profile <model.onnx> --input in.f32 [--iters N] [--top N]` | Per-operator timing ranking |
 | `detect <model.onnx> <image> [--out marked.jpg]` | Preprocess + forward + decode, boxes in source pixels |
+| `features <model.onnx> <wav> [--out feats.f32]` | fbank → LFR → CMVN (Paraformer `speech` input), params from the model metadata |
+| `asr <wav> --models <dir> [--tokens f] [--json] [--out text.txt]` | End-to-end recognition (fbank → encoder → CIF → decoder → text); `<dir>` holds `encoder.onnx` / `decoder.onnx` / `tokens.txt` |
 | `gemmbench` / `convbench` / `flopsbench` / `parbench` | Micro-benchmarks for tuning |
 
 Key `detect` flags: `--family auto|yolo|rfdetr`, `--conf`, `--iou` (YOLO), `--max-det`, `--classes`, `--layout`, `--class-agnostic`, `--background -1|none` and `--norm imagenet|255` (RF-DETR), `--labels`, `--json`, `--input <f32.bin> --shape 1,3,640,640`, `--iters N`, `--size N`.
@@ -850,12 +934,45 @@ Three ideas for an "int8 weights + int8 MAC" fast path were measured; all of the
 
 | Idea | Measurement | Verdict |
 |---|---|---|
-| Keep int8 weights, dequantise per column block with `vpmovzxbw` and reuse the FMA kernel (4× less weight traffic) | `96×320×1280`: 10.88 ms vs 1.07 ms FP32 (**0.10×**) | No — per-block re-packing multiplies the fixed cost of a small GEMM by 20 |
-| Weight bandwidth is the bottleneck | The same FP32 GEMM reaches only **73 GFLOPS** (machine peak 400+) | No — the bottleneck is small-matrix GEMM efficiency (ASR's m≈96) |
+| Keep int8 weights, dequantise per column block with `vpmovzxbw` and reuse the FMA kernel (4× less weight traffic) | `96×320×1280`: 10.88 ms vs 1.07 ms FP32 (**0.10×**, both single-threaded in the test process) | No — per-block dequantisation turns each GEMM into `96×320×64`, below the parallel threshold, 20 serial calls |
+| Weight bandwidth is the bottleneck | With 16 threads the same FP32 GEMM runs at **496 GFLOPS** | No — bandwidth is not the limit; the earlier "73 GFLOPS" figure was single-threaded and is corrected |
 | VNNI (`vpdpbusd`, 4× integer throughput) | Zen4 + .NET 10: `AvxVnni.IsSupported = False`, and there is no `Avx512Vnni` type | Unverified — needs an Intel 12th-gen+ machine |
 
-So correctness for quantized graphs is in place; speed has to come from making FP32 GEMM fast at small `m`
-(see M10-02c in [plan.md](plan.md)), not from int8 instructions.
+**What actually works** (implemented + covered by tests): without VNNI, `MatMulInteger` hands the integer
+matrix product to the F32 GEMM — weights are widened once to `(w - w_zp)` floats and cached, activations are
+widened per call, and the result is rounded back to int32. Every factor is a small integer and the running
+sums stay far below 2^24, so the result is **bit-identical** to the integer dot product.
+The Paraformer encoder sub-graph measured (`speech[1,96,560]`, 97 frames):
+
+| Step | Time |
+|---|---|
+| Scalar int32 `MatMulInteger` | 10,871 ms |
+| + F32-GEMM substitute | 578 ms (18.8×) |
+| + SIMD `Cast` (170 × i32→f32, 33% → 0.8%) | 411 ms |
+| + `Pow(x,2)` rewritten as `Mul` (12% → 0.1%) | 443 ms |
+| + per-run scalar broadcast fast path (`EwInner` idea) | 171 ms |
+| + vectorised 1-D `Conv` and `DynamicQuantizeLinear` min/max | **104 ms (104× overall)** |
+| ONNXRuntime (same split graph, MLAS int8 + VNNI) | 30.9 ms |
+
+So quantized graphs are both correct and usable; the remaining 3.4× gap is ORT's VNNI integer kernels.
+
+### Speech (Paraformer, pure C#)
+
+```csharp
+var recognizer = new ParaformerRecognizer(new ParaformerOptions
+{
+    EncoderPath = @"sherpa\encoder.onnx",   // cut by split_before_control_flow.py
+    DecoderPath = @"sherpa\decoder.onnx",   // cut by split_decoder.py
+    TokensPath = @"sherpa\tokens.txt",
+});
+
+var result = recognizer.TranscribeWav("test.wav");   // 16 kHz mono
+Console.WriteLine(result.Text);       // 今天气真不错我们出去走一走吧
+```
+
+CLI: `OnnxSharp.Cli asr test.wav --models sherpa --tokens sherpa\tokens.txt`.
+CIF (`ContinuousIntegrateAndFire`) is hand-ported from the 80-node `Loop` body and matches ORT bit-exactly;
+token decoding follows sherpa: argmax → skip `<blank>` → fold repeats → stop at `</s>`.
 
 ### Performance
 
@@ -880,16 +997,19 @@ Forward pass only, batch=1, FP32, 16 threads, median of 40 frames (Ryzen 7 8845H
 | yolov8n / yolo11s / yolov8s | Runs; included in benchmarks |
 | rfdetr-small / rfdetr-medium | Runs; decoding matches official `rfdetr.export._runtime.decode.decode_detections` (41/41 boxes, 0.00 px) |
 | Micro models | Single-operator graphs for kernel-level tuning |
-| sherpa Paraformer encoder (int8) | The 5715-node encoder sub-graph (split before the first `Loop`) runs end-to-end (`speech[1,96,560]` → `[1,97,320]`); `DynamicQuantizeLinear` + `MatMulInteger` (s8 weights, per-column zero points) match ONNXRuntime **bit-exactly** (max\|diff\| = 0) |
+| sherpa Paraformer encoder (int8) | The 5715-node encoder sub-graph (split before the first `Loop`) runs end-to-end (`speech[1,96,560]` → `[1,97,320]`) in **104 ms** (ORT: 30.9 ms); `DynamicQuantizeLinear` + `MatMulInteger` (s8 weights, per-column zero points) match ONNXRuntime **bit-exactly** (max\|diff\| = 0) |
 
 ### Limitations
 
 - **CPU only** — no CUDA / DirectML / OpenVINO backends.
 - **FP32 compute**, with support for the legacy QOperator pair `DynamicQuantizeLinear` + `MatMulInteger`
   (u8/i8 inputs, scalar or per-column zero points); `QuantizeLinear` / `DequantizeLinear` / `QLinearConv` (QDQ) are not implemented.
-- **ASR stops at the encoder**: `Loop` (CIF) / `NonZero` / `Sequence*` are not implemented, so `model.int8.onnx`
-  cannot be imported as a whole. `tools/scripts/split_before_control_flow.py` cuts the encoder out and that
-  runs (mean\|diff\| 8e-4 vs ORT on the main output). For full ASR use sherpa-onnx itself.
+- **Speech recognition works (Paraformer)**: `Speech/Paraformer/ParaformerRecognizer` runs
+  `wav → fbank/LFR/CMVN → encoder → CIF → decoder → text` and matches the full-model ONNXRuntime
+  reference text character-by-character. **Prerequisite**: split the model first with
+  `tools/scripts/split_*.py` into `encoder.onnx` / `decoder.onnx` (the engine does not execute the two
+  `Loop` subgraphs). Only this one Chinese model is verified; no streaming, hotwords, punctuation or
+  timestamps; other languages are untested.
 - Dynamic dimensions are minimally supported (batch=1 focus); dynamic H/W needs `TargetWidth/TargetHeight`.
 - WASM / IL2CPP are not targeted; NativeAOT is not validated (code stays AOT-friendly).
 - **No image decoding in the library**; bring your own pixels. The CLI decodes JPEG/PNG/BMP through ImageFacade and can draw/save the result.
@@ -899,7 +1019,7 @@ Forward pass only, batch=1, FP32, 16 threads, median of 40 frames (Ryzen 7 8845H
 
 ```
 src/OnnxSharp/   Core (graph/runtime) · Onnx (protobuf reader) · Tensors (incl. Quantization) · Ops (incl. QuantOps) · Kernels (incl. Int8Gemm)
-                 Threading · Vision / Ocr / Sam3 (optional facades) · Imaging (shared preprocessing)
+                 Threading · Vision / Ocr (PaddleOCR) / Sam3 / Speech (Paraformer) — optional facades · Imaging (shared preprocessing)
 tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / sam3 / micro-benchmarks
 tests/OnnxSharp.Tests/ zero-dependency test runner (80 cases)
 bench/                 four-engine × six-model comparison scripts

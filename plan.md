@@ -508,14 +508,14 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 | ID | 任务 | 估时 | 验收 |
 |---|---|---|---|
 | M9-01 | **基线取证**：ORT 跑 int8 图 + sherpa 跑同一 wav，落 `tests/Fixtures/asr/` | 0.5 天 | **部分完成**：`tools/scripts/sherpa_encoder_probe.py` 已能录 encoder 段的输入/金标准；正式 fixture（含 fbank、logits、文本、sha256）仍缺 |
-| M9-02 | **fbank 前端（纯 C#）**：25 ms/10 ms、povey 窗、preemph 0.97、nfft 512、mel 80、20~8000 Hz、log、**LFR(7,6)**、CMVN | 2~4 天 | 与 kaldi-native-fbank 逐值 `max|diff| < 1e-5`；`speech` 与 ORT 输入对齐 |
+| M9-02 | **fbank 前端（纯 C#）**（已完成）：`Speech/{WavReader,FbankOptions,FbankExtractor,LfrCmvn,SpeechFeatureExtractor}.cs` —— kaldi 风格 fbank（povey 窗、预加重 0.97、去直流、mel 80、20~7600 Hz、log）+ funasr 的 LFR(7,6) + CMVN（参数从模型 metadata 读） | 2~4 天（实际 1 天） | ✅ 与 kaldi-native-fbank 逐帧对齐：**median\|diff\| 4.8e-7、54.9% 逐位相同、有声 bin ≤ 9.7e-5**；LFR+CMVN median **0**、max 3.4e-4；`features` 命令 22.6 ms / 6 s 音频 |
 | M9-03 | **（先跑通用）int8 → F32 图改写**（`tools/scripts/onnx_int8_to_f32.py`）：U8 权重按 `(W-zp)*scale` 还原、`MatMulInteger→MatMul`、清掉配套 `DynamicQuantizeLinear` | 1~2 天 | 改写后 ORT 输出与原模型一致（`max|diff| < 1e-3`）；**只用于打通链路与做基线，不作终态** |
 | M9-04 | **补小算子**：`Pad`(constant) ✅、`LogSoftmax`（未做） | 1~2 天 | **完成一半**：`Pad` 三种 mode + 负 pads 已实现并有单测；顺带补了 1-D `Conv`（FSMN）与 `Range`/`Reshape`/`ConstantOfShape` 的**运行期形状** |
 | M9-05 | **图切分**：`tools/scripts/split_before_control_flow.py` —— 在第一个 `Loop`/`If`/`Scan` 前切开，自动拓扑排序（sherpa 的导出不是拓扑序），跳过 `Sequence*` 边界值，可显式追加输出张量 | 0.5~1 天 | ✅ `model.int8.onnx` 7881 → 5715 节点，encoder 段被引擎直接加载并跑通 |
-| M9-06 | **CIF 用 C# 重写**：`cif_conv1d` + integrate-and-excite（alpha 累加、阈值 1.0、取整、remainder）→ acoustic embeddings | 2~4 天 | token 数与 ORT 相同；embeddings `max|diff| < 1e-4` |
-| M9-07 | **decoder 跑通**：`logits_length = token_num` 特化（必要时按 8 的倍数分桶） | 1~2 天 | logits 与 ORT `max|diff| < 1e-3` |
-| M9-08 | **token 解码**：argmax + `tokens.txt` 去词/去重 + 标点 | 1 天 | 文本与 sherpa 逐字一致 |
-| M9-09 | **门面 + CLI**：`src/OnnxSharp/Speech/ParaformerRecognizer`（`WavReader` + 上述链路），CLI `asr <wav> --models <dir> [--json]` | 2 天 | 一条命令出文本；`tts-zh.wav` 端到端 < 3 s（FP32/16 线程） |
+| M9-06 | **CIF 用 C# 重写**（已完成）：`src/OnnxSharp/Speech/Paraformer/ContinuousIntegrateAndFire.cs`，逐节点移植自模型里的 ONNX `Loop` body（`tools/scripts/dump_loop_body.py` 可打印那份 body）。语义：`completion = 1 - integrate`、`fire = integrate+alpha >= 1`、`cur = fire ? completion : alpha`、`remainds = alpha - cur`、**fire 时 frame 是「替换成 remainds×enc[t]」而不是累加**；token 选择 = `frames[fires >= 1]`（图里是 `NonZero` + `GatherND`） | 2~4 天（实际 0.5 天） | ✅ 与 ORT 录的 Loop 中间量**逐位一致**（`frames` / `fires` / `frame.7` / `integrate.7` 全部 `max\|diff\| = 0`），token 数 **21 = ORT 21** |
+| M9-07 | **decoder 跑通**（基本完成）：`tools/scripts/split_decoder.py` 去掉两个 `Loop`/`Sequence*`，把 loop 输出提升成图输入，剪掉不可达节点 → `decoder.onnx`（7828 节点，输入 `speech/speech_lengths/onnx::Slice_6785/max_label_len.28`，输出 `logits`/`token_num`）。另补了 `LogSoftmax`、**运行期 `Slice`**、**标量输入 dtype** 三处引擎缺口 | 1~2 天 | ✅ ORT 上切图与全模型 `logits` **逐位一致**（max\|diff\|=0）；我们引擎跑通（5302 op，714 ms），**21/21 token 的 argmax 与 ORT 一致**；数值 mean\|diff\| 6.6e-2（来自 encoder/CIF 累积） |
+| M9-08 | **token 解码**（已完成）：`Speech/TokenTable.cs` —— 读 `tokens.txt`（兼容 `token id` / `id token` 两种行格式），规则：argmax → 跳过 `<blank>`(0) → **折叠连续重复** → 遇 `</s>`(2) 停 | 1 天 | ✅ 单测覆盖 blank/重复/EOS；`huihui.wav` 的 16 个 token 解出 14 个 id |
+| M9-09 | **门面 + CLI**（已完成）：`Speech/Paraformer/ParaformerRecognizer`（`wav → fbank/LFR/CMVN → encoder → CIF → decoder → argmax → 文本`）+ CLI `asr <wav> --models <dir> [--tokens] [--json] [--out]` | 2 天 | ✅ 4.54 s 中文 wav → **「今天气真不错我们出去走一走吧」**，与 ORT 参考文本**逐字一致**；首次 1.7 s（含 JIT 与两次图加载） |
 | M9-10 | **回归 + 文档**：fixture 对拍用例（缺模型 SKIP）、README「库用法 9」、坑清单 | 1~2 天 | `dotnet run --project tests` 全绿；文档含复现命令 |
 | M9-11 | **int8 GEMM 内核**：U8 权重预打包 + `vpdpbusd`(AVX512-VNNI) 主路径 + `vpmaddubsw`/`vpmaddwd`(AVX2) 回退；A 的 zero-point 用「行和 × zp」校正，避免逐元素减 | 4~6 天 | 同形状单算子吞吐 ≥ **3×** 现有 FP32 内核；与 ORT `MatMulInteger` 输出 `max|diff| ≤ 1`（int32 累加应逐位一致） |
 | M9-12 | **两个 int8 算子 + 融合**：`DynamicQuantizeLinear`（per-tensor min/max → scale/zp → u8）、`MatMulInteger`（u8×u8 + zp → i32）；再把 `DQL → MatMulInteger` 融合成一层（省一次 u8 写回和一遍 min/max 扫描） | 3~4 天 | encoder 段与 ORT int8 逐值对齐（`max|diff| < 1e-3`）；融合后不再物化 u8 激活 |
@@ -564,8 +564,10 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 |---|---|---|---|
 | M10-01 | **int8 类型与工具**：`Tensor` 上 `Span<sbyte>/Span<byte>/Span<int>` 访问、饱和转换（f32↔u8 带 zp/scale）、量化参数常量读取（`OpUtil.QuantParams`） | 0.5~1 天 | 单元测试：饱和边界、zp 偏移、per-axis 取值 |
 | M10-02 | **int8 GEMM 主路径（VNNI）**：权重 U8/S8 预打包（列块）、`vpdpbusd`（`AvxVnni`，256 位；512 位向量拆两次）累加、A 的 zero-point 用「行和 × zp」校正、epilogue per-column 反量化 | 3~4 天 | 与 ORT `MatMulInteger` **int32 逐位一致**；VNNI 机器吞吐 ≥ **2×** 现有 FP32 GEMM |
-| M10-02b | **（已实测，结论：不可行）int8 权重 + F32 计算**：权重保持 u8，按列块 `k×64` 用 `vpmovzxbw` 解包成 F32 再调 GEMM。**实测 ASR 形状反而慢 5~10×**（`96×320×1280`：10.88 ms vs FP32 1.07 ms），原因是逐列块重复打包 + 小 GEMM 固定开销，而不是解包本身 | 2~3 天（已完成，结论否定） | ~~≥1.5×~~ 实测 0.10~0.19×；代码保留在 `Kernels/Int8DequantGemm.cs`，等 M10-02c 的「融合解包进微内核」再评估 |
-| M10-02c | **小 GEMM 效率（新发现的主线）**：ASR 形状下 FP32 GEMM 只有 **73 GFLOPS**（机器峰值 400+），瓶颈是 row-block 打包与 `Parallel.For` 固定开销。按形状自适应（m≤128 时用细粒度列切分 / 合并 batch 维 / 免打包路径） | 2~3 天 | `96×320×1280` ≥ **150 GFLOPS**；ASR encoder 端到端 ≥1.5× |
+| M10-02b | **（已实测，结论：不可行）int8 权重 + F32 计算**：权重保持 u8，按列块 `k×64` 用 `vpmovzxbw` 解包成 F32 再调 GEMM。**实测 ASR 形状反而慢 5~10×**（`96×320×1280`：10.88 ms vs FP32 1.07 ms），原因是每次列块调用都把 B 面板打包一遍、且 96×320×64 低于并行阈值。已被 M10-02c 的「整矩阵展开一次 + 缓存」方案取代（同样 bit-exact，快 9×） | 2~3 天（已完成，结论否定） | ~~≥1.5×~~ 实测 0.10~0.19×；代码保留在 `Kernels/Int8DequantGemm.cs` 作反例 |
+| M10-02c | **（已完成）ASR 图上的实际加速**：① 无 VNNI 时 `MatMulInteger` 改走「权重展开成 F32 并缓存 + F32 GEMM」（整数小值，结果 bit-exact，18.8×）；② `Cast` 内核化（170 个 i32→f32，33% → 0.8%）；③ `Pow(x,2)` 改写成 `Mul`（12% → 0.1%）；④ 「每段一个标量」广播快路径（`EwInner` 思路） | 1 天 | ✅ encoder **10,871 → 170 ms（64×）**；`gemmbench` 16 线程实测 `96×320×1280` = **496 GFLOPS**，GEMM 本身不再是瓶颈 |
+| M10-02d | **剩余热点（已完成）**：① 1-D `Conv` 改「按输出向量化 + 按输出通道并行」（cif_conv1d 41 ms → 9 ms）；② `DynamicQuantizeLinear` 的 min/max 扫描向量化（16.8 → 11.5 ms）；③ 「每段一个标量」广播（局部，见 M10-02c） | 1 天 | ✅ encoder **170 → 104 ms（累计 104×）**；与 ORT 差 3.4× |
+| M10-11 | **`ArgMax` 算子 + `MatMul+ArgMax` 融合**（decoder / CTC 贪心解码的前置）：新增 `ArgMax`（axis/keepdims/select_last_index，I64 输出）；`Kernels/MatMulArgMaxKernel` 分两层——logits ≤ 4M 元素时走「`GemmKernel` 算到池化缓冲 + 向量化扫描」（与两趟持平，省一次算子调度与分配），超过才走不物化流式路径；`GraphFusion` 把 `MatMul →(Add 常量 bias)→ ArgMax(axis=-1,keepdims=0)` 融成一层 | 1 天 | ✅ 与 ORT 逐值一致（`1×512×8000`、`24×256×8000`）；CTC 形状与两趟持平（噪声内 0.9~1.3×）；单 token 解码 0.2 ms |
 
 > **AVX-512 子集取舍（2026-11-10 本机实测：F/BW/CD/DQ/VBMI 全 True，VNNI False）**
 >

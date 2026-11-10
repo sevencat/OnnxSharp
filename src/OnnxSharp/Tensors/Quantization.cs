@@ -102,6 +102,57 @@ public static class Quantizer
             destination[i] = ClampToByte(MathF.Round(source[i] * inverse, MidpointRounding.ToEven) + zeroPoint);
     }
 
+    /// <summary>
+    /// 求 <c>[min(x), max(x)]</c> 并**把 0 纳入区间**（ONNX <c>DynamicQuantizeLinear</c> 的 x_min/x_max 定义）。
+    /// NaN 会被忽略；向量化后一次性扫完（原来是逐元素 <c>if</c>，ASR 图里 160 次调用共 17 ms）。
+    /// </summary>
+    public static (float Min, float Max) MinMax(ReadOnlySpan<float> source)
+    {
+        float min = 0f;
+        float max = 0f;
+        int i = 0;
+
+        if (Avx.IsSupported)
+        {
+            var vectorMin = Vector256<float>.Zero;
+            var vectorMax = Vector256<float>.Zero;
+
+            for (; i + Vector256<float>.Count <= source.Length; i += Vector256<float>.Count)
+            {
+                var value = Vector256.LoadUnsafe(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source[i..]));
+
+                // NaN 的 lane 置 0（minps/maxps 对 NaN 的行为是「返回第二个操作数」，不能直接喂进去）
+                value = Avx.And(value, Avx.CompareEqual(value, value));
+
+                vectorMin = Vector256.Min(vectorMin, value);
+                vectorMax = Vector256.Max(vectorMax, value);
+            }
+
+            Span<float> lanes = stackalloc float[Vector256<float>.Count];
+            vectorMin.CopyTo(lanes);
+            for (int lane = 0; lane < lanes.Length; lane++)
+                min = MathF.Min(min, lanes[lane]);
+
+            vectorMax.CopyTo(lanes);
+            for (int lane = 0; lane < lanes.Length; lane++)
+                max = MathF.Max(max, lanes[lane]);
+        }
+
+        for (; i < source.Length; i++)
+        {
+            float value = source[i];
+            if (float.IsNaN(value))
+                continue;
+
+            if (value < min)
+                min = value;
+            if (value > max)
+                max = value;
+        }
+
+        return (min, max);
+    }
+
     public static void QuantizeToInt8(ReadOnlySpan<float> source, Span<sbyte> destination, float scale, int zeroPoint)
     {
         if (destination.Length < source.Length)

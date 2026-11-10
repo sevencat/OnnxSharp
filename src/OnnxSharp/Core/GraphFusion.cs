@@ -21,6 +21,7 @@ internal static class GraphFusion
         // 顺序有讲究：先造出 SiLU，再把它吸收进上游卷积。
         total += FuseSilu(net, graph);
         total += FuseActivationIntoProducer(net, graph);
+        total += FuseMatMulArgMax(net, graph);
 
         // 逐元素链融合放最后：前面两步可能已经把 Sigmoid+Mul 变成单个 Silu，
         // 那样链里就少一个节点，融合结果的寄存器也更省。
@@ -290,6 +291,133 @@ internal static class GraphFusion
     /// 只在上游输出恰好只有这一个消费者时成立，否则上游的其它消费者会拿到激活后的值。
     /// </para>
     /// </summary>
+    /// <summary>
+    /// <c>MatMul(a, b) → ArgMax(axis = -1, keepdims = 0)</c>（中间可夹一个「常量 bias 的 <c>Add</c>」）
+    /// 融成单层 <c>MatMulArgMax</c>：**不物化 logits**。
+    /// <para>
+    /// 收益取决于 logits 的大小：逐 token 解码 <c>m=1, n=8000</c> 只省一次 32 KB 的写读，
+    /// 但 CTC / 强制对齐是 <c>m = 帧数（几百）</c>×<c>n = 词表（几千）</c>，能省几 MB 的流量，
+    /// 顺带省掉一次算子调度。
+    /// </para>
+    /// <para>
+    /// 只融 <c>MatMul</c>（<c>Gemm</c> 的 transA/transB/alpha/beta 没有暴露给融合层，先不做），
+    /// 且要求 MatMul 的输出<b>只有一个消费者</b>、也不是图输出。
+    /// </para>
+    /// </summary>
+    private static int FuseMatMulArgMax(NetImpl net, Graph graph)
+    {
+        var prog = graph.Prog;
+        if (prog.Count < 2)
+            return 0;
+
+        var uses = new Dictionary<int, int>();
+        var consumerOf = new Dictionary<int, LayerInfo>();
+        var consumerCount = new Dictionary<int, int>();
+
+        foreach (var op in prog)
+        {
+            foreach (var arg in op.Inputs)
+            {
+                if (arg.IsEmpty)
+                    continue;
+
+                uses[arg.Idx] = uses.TryGetValue(arg.Idx, out int count) ? count + 1 : 1;
+                consumerCount[arg.Idx] = consumerCount.TryGetValue(arg.Idx, out int seen) ? seen + 1 : 1;
+                if (consumerCount[arg.Idx] == 1)
+                    consumerOf[arg.Idx] = op;
+            }
+        }
+
+        var graphOutputs = CollectOutputs(graph);
+        var replacements = new Dictionary<LayerInfo, LayerInfo>();
+        var drop = new HashSet<LayerInfo>();
+        int fused = 0;
+
+        foreach (var op in prog)
+        {
+            if (op.Type != "MatMul" || op.Outputs.Count != 1 || op.Outputs[0].IsEmpty)
+                continue;
+
+            var produced = op.Outputs[0];
+            if (graphOutputs.Contains(produced.Idx))
+                continue;
+
+            if (!uses.TryGetValue(produced.Idx, out int count) || count != 1)
+                continue;
+
+            if (!consumerOf.TryGetValue(produced.Idx, out var consumer) || consumer is not Layer mid)
+                continue;
+
+            LayerInfo? argMaxOp = null;
+            LayerInfo? addOp = null;
+            int biasSlotIndex = -1;
+
+            if (mid.Type == "ArgMax")
+            {
+                argMaxOp = mid;
+            }
+            else if (mid.Type == "Add" && mid.Inputs.Count == 2 && mid.Outputs.Count == 1 && !mid.Outputs[0].IsEmpty)
+            {
+                // Add(MatMul_out, bias) —— bias 必须是**常量向量**，且这个 Add 只有 ArgMax 一个消费者
+                int biasSlot = mid.Inputs[0].Idx == produced.Idx ? 1 : 0;
+                if (!mid.IsConstInput(biasSlot))
+                    continue;
+
+                var addOutput = mid.Outputs[0];
+                if (graphOutputs.Contains(addOutput.Idx))
+                    continue;
+                if (!uses.TryGetValue(addOutput.Idx, out int addCount) || addCount != 1)
+                    continue;
+                if (!consumerOf.TryGetValue(addOutput.Idx, out var afterAdd) || afterAdd.Type != "ArgMax")
+                    continue;
+
+                addOp = mid;
+                biasSlotIndex = biasSlot;
+                argMaxOp = afterAdd;
+            }
+
+            if (argMaxOp is not Ops.ArgMaxOps.ILastAxisArgMax { IsLastAxisNoKeep: true })
+                continue;
+            if (argMaxOp.Inputs.Count != 1 || argMaxOp.Outputs.Count != 1)
+                continue;
+
+            // MatMul 输出必须是 2-D [m, n]，融合层只处理这一种
+            if (!TryGetOutputShape(net, op, out var matMulShape) || matMulShape.Rank != 2)
+                continue;
+
+            var parameters = new LayerParams { Type = "MatMulArgMax", Name = op.Name + "/argmax" };
+            if (LayerRegistry.Create("MatMulArgMax", parameters) is not Layer fusedLayer)
+                continue;
+
+            fusedLayer.Inputs.Add(op.Inputs[0]);
+            fusedLayer.Inputs.Add(op.Inputs[1]);
+            if (biasSlotIndex >= 0 && addOp is not null)
+                fusedLayer.Inputs.Add(addOp.Inputs[biasSlotIndex]);
+            fusedLayer.Outputs.Add(argMaxOp.Outputs[0]);
+
+            replacements[op] = fusedLayer;
+            drop.Add(argMaxOp);
+            if (addOp is not null)
+                drop.Add(addOp);
+            fused++;
+        }
+
+        if (replacements.Count == 0)
+            return 0;
+
+        var result = new List<LayerInfo>(prog.Count);
+        foreach (var op in prog)
+        {
+            if (drop.Contains(op))
+                continue;
+
+            result.Add(replacements.TryGetValue(op, out var replacement) ? replacement : op);
+        }
+
+        graph.Reset(result);
+        return fused;
+    }
+
     private static int FuseActivationIntoProducer(NetImpl net, Graph graph)
     {
         var prog = graph.Prog;

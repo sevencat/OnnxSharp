@@ -27,6 +27,7 @@ internal static class DnnOps
         LayerRegistry.Register("RoiAlign", p => new RoiAlignLayer(p));
         LayerRegistry.Register("Resize", p => new ResizeLayer(p));
         LayerRegistry.Register("Softmax", p => new SoftmaxLayer(p));
+        LayerRegistry.Register("LogSoftmax", p => new LogSoftmaxLayer(p));
         LayerRegistry.Register("MatMul", p => new MatMulLayer(p));
     }
 
@@ -198,6 +199,32 @@ internal static class DnnOps
             var target = output.AsSpan<float>();
             var biasSpan = bias is null ? default : bias.AsSpan<float>();
 
+            // stride = 1 时按「输出向量化」做（每个 k 一条连续的 FMA），
+            // FSMN / CIF 的 1-D 卷积都是这种形状；stride ≠ 1 才回退到朴素实现。
+            if (stride == 1 && Avx.IsSupported)
+            {
+                unsafe
+                {
+                    fixed (float* ps = source)
+                    fixed (float* pw = weights)
+                    fixed (float* pb = biasSpan)
+                    fixed (float* pt = target)
+                    {
+                        for (int n = 0; n < batch; n++)
+                        {
+                            Conv1DFast(
+                                ps + (long)n * inChannels * inLength,
+                                pw, bias is null ? null : pb,
+                                pt + (long)n * outChannels * outLength,
+                                inChannels, inLength, outChannels, outLength,
+                                channelsPerGroup, outPerGroup, kernel, dilation, padBegin);
+                        }
+                    }
+                }
+
+                return;
+            }
+
             for (int n = 0; n < batch; n++)
             {
                 for (int m = 0; m < outChannels; m++)
@@ -226,6 +253,68 @@ internal static class DnnOps
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// 一帧 1-D 卷积（stride = 1）：按输出通道并行，每个 (输入通道, k) 做一条 8 路 FMA —— 
+        /// 越界位置贡献为 0，所以只在有效区间 <c>[tLo, tHi)</c> 内加减，边界不额外判断。
+        /// </summary>
+        private static unsafe void Conv1DFast(
+            float* source,
+            float* weights,
+            float* bias,
+            float* target,
+            int inChannels,
+            int inLength,
+            int outChannels,
+            int outLength,
+            int channelsPerGroup,
+            int outPerGroup,
+            int kernel,
+            int dilation,
+            int padBegin)
+        {
+            var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, ParallelRange.Threads) };
+
+            Parallel.For(0, outChannels, options, m =>
+            {
+                int inBase = m / outPerGroup * channelsPerGroup;
+                float* outRow = target + (long)m * outLength;
+
+                float initial = bias is null ? 0f : bias[m];
+                for (int t = 0; t < outLength; t++)
+                    outRow[t] = initial;
+
+                for (int j = 0; j < channelsPerGroup; j++)
+                {
+                    float* inRow = source + (long)(inBase + j) * inLength;
+                    float* wRow = weights + (long)(m * channelsPerGroup + j) * kernel;
+
+                    for (int k = 0; k < kernel; k++)
+                    {
+                        float w = wRow[k];
+                        int shift = -padBegin + k * dilation;
+
+                        int tLo = Math.Max(0, -shift);
+                        int tHi = Math.Min(outLength, inLength - shift);
+                        if (tHi <= tLo)
+                            continue;
+
+                        float* src = inRow + shift;
+                        var vw = Vector256.Create(w);
+
+                        int t = tLo;
+                        for (; t + 8 <= tHi; t += 8)
+                        {
+                            var value = Vector256.Add(Vector256.Load(outRow + t), Vector256.Multiply(vw, Vector256.Load(src + t)));
+                            value.Store(outRow + t);
+                        }
+
+                        for (; t < tHi; t++)
+                            outRow[t] += w * src[t];
+                    }
+                }
+            });
         }
 
         /// <summary>解析 stride / dilation / pads（含 auto_pad），与 <see cref="GetMemoryShapes"/> 同源。</summary>
@@ -1310,6 +1399,77 @@ internal static class DnnOps
         }
 
     }
+
+    // ---------------- LogSoftmax ----------------
+
+    /// <summary>
+    /// <c>LogSoftmax(axis)</c> = <c>x - max - log(Σ exp(x - max))</c>。
+    /// Paraformer 的 <c>logits</c> 就是 decoder 输出过一层 LogSoftmax（每个 token 一行）。
+    /// </summary>
+    private sealed class LogSoftmaxLayer : Layer
+    {
+        private readonly long _axis;
+
+        public LogSoftmaxLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _axis = parameters.GetInt("axis", -1);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            OpUtil.NormalizeAxis(_axis, inShapes[0].Rank, $"LogSoftmax '{Name}'");
+            outShapes.Add(inShapes[0]);
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var input = inputs[0];
+            var output = outputs[0];
+
+            int axis = OpUtil.NormalizeAxis(_axis, input.Shape.Rank, $"LogSoftmax '{Name}'");
+            var dims = input.Shape.ToArray();
+
+            int outer = OpUtil.Product(dims.AsSpan(0, axis));
+            int inner = axis + 1 < dims.Length ? OpUtil.Product(dims.AsSpan(axis + 1)) : 1;
+            int length = dims[axis];
+
+            if (outer <= 0 || length <= 0)
+                return;
+
+            var source = input.AsSpan<float>();
+            var target = output.AsSpan<float>();
+
+            for (int o = 0; o < outer; o++)
+            {
+                for (int i = 0; i < inner; i++)
+                {
+                    long baseIndex = (long)o * length * inner + i;
+
+                    float max = float.NegativeInfinity;
+                    for (int k = 0; k < length; k++)
+                        max = MathF.Max(max, source[(int)(baseIndex + (long)k * inner)]);
+
+                    double sum = 0;
+                    for (int k = 0; k < length; k++)
+                        sum += Math.Exp(source[(int)(baseIndex + (long)k * inner)] - max);
+
+                    float logSum = MathF.Log((float)sum) + max;
+                    for (int k = 0; k < length; k++)
+                        target[(int)(baseIndex + (long)k * inner)] = source[(int)(baseIndex + (long)k * inner)] - logSum;
+                }
+            }
+        }
+    }
+
 
     // ---------------- MatMul ----------------
 

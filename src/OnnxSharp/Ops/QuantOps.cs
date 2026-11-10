@@ -1,3 +1,4 @@
+using System.Buffers;
 using OnnxSharp.Core;
 using OnnxSharp.Kernels;
 using OnnxSharp.Tensors;
@@ -17,6 +18,27 @@ internal static class QuantOps
     {
         LayerRegistry.Register("DynamicQuantizeLinear", p => new DynamicQuantizeLinearLayer(p));
         LayerRegistry.Register("MatMulInteger", p => new MatMulIntegerLayer(p));
+    }
+
+    /// <summary>
+    /// <c>MatMulInteger</c> 是否用「F32 GEMM + 权重展开缓存」而不是 <see cref="Int8Gemm"/> 的标量 int32 内核。
+    /// <para>
+    /// 默认：<b>没有 VNNI 时开启</b>（标量 int32 只有 ~0.9 GFLOPS，同样形状的 F32 GEMM 有 73 GFLOPS）。
+    /// 有 VNNI 时关掉 —— 那时 <c>vpdpbusd</c> 既更快也是逐位精确的整数路径。
+    /// 环境变量 <c>ONNXSHARP_INT8_F32GEMM=0/1</c> 可强制关闭/开启（对照实验用）。
+    /// </para>
+    /// </summary>
+    internal static readonly bool PreferFloatWeights = ResolvePreferFloatWeights();
+
+    private static bool ResolvePreferFloatWeights()
+    {
+        string? setting = Environment.GetEnvironmentVariable("ONNXSHARP_INT8_F32GEMM");
+        if (setting is "0")
+            return false;
+        if (setting is "1")
+            return true;
+
+        return Int8Kernel.Tier == Int8KernelTier.Scalar;
     }
 
     // ---------------- DynamicQuantizeLinear ----------------
@@ -76,15 +98,7 @@ internal static class QuantOps
         {
             var source = inputs[0].AsSpan<float>();
 
-            float min = 0f;
-            float max = 0f;
-            foreach (float value in source)
-            {
-                if (float.IsNaN(value))
-                    continue;
-                if (value < min) min = value;
-                if (value > max) max = value;
-            }
+            var (min, max) = Quantizer.MinMax(source);
 
             float scale = (max - min) / 255f;
             if (!(scale > 0f))
@@ -113,6 +127,10 @@ internal static class QuantOps
         private PackedInt8Weights? _packed;
         private Tensor? _packedSource;
         private int[]? _packedZeroPoints;
+
+        private float[]? _floatWeights;
+        private Tensor? _floatSource;
+        private int[]? _floatZeroPoints;
 
         public MatMulIntegerLayer(LayerParams parameters)
         {
@@ -181,6 +199,29 @@ internal static class QuantOps
             int aZeroPoint = ReadScalar(inputs, 2);
             int[] bZeroPoints = ReadVector(inputs, 3);
 
+            if (QuantOps.PreferFloatWeights)
+            {
+                var weights = GetFloatWeights(b, k, n, bZeroPoints);
+                float[] buffer = ArrayPool<float>.Shared.Rent(m * k);
+
+                try
+                {
+                    var activation = buffer.AsSpan(0, m * k);
+                    if (a.DType == DType.I8)
+                        Int8F32Gemm.WidenActivation(a.AsSpan<sbyte>(), activation, aZeroPoint);
+                    else
+                        Int8F32Gemm.WidenActivation(a.AsSpan<byte>(), activation, aZeroPoint);
+
+                    Int8F32Gemm.MultiplyInteger(activation, weights, outputs[0].AsSpan<int>(), m, k, n);
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(buffer);
+                }
+
+                return;
+            }
+
             PackedInt8Weights packed = GetPacked(b, k, n, bZeroPoints);
 
             ReadOnlySpan<byte> aBytes = a.DType == DType.I8
@@ -188,6 +229,26 @@ internal static class QuantOps
                 : a.AsSpan<byte>();
 
             Int8Gemm.MultiplyInteger(aBytes, packed, outputs[0].AsSpan<int>(), m, aZeroPoint);
+        }
+
+        /// <summary>
+        /// 权重的 F32 展开缓存：常量权重只展开一次（体积是 int8 的 4 倍，但换来 80× 的吞吐）。
+        /// </summary>
+        private float[] GetFloatWeights(Tensor weight, int k, int n, int[] zeroPoints)
+        {
+            if (_floatWeights is not null && ReferenceEquals(_floatSource, weight) && ZeroPointsEqual(_floatZeroPoints, zeroPoints))
+                return _floatWeights;
+
+            var buffer = new float[checked(k * n)];
+            if (weight.DType == DType.I8)
+                Int8F32Gemm.WidenWeights(weight.AsSpan<sbyte>(), buffer, k, n, zeroPoints);
+            else
+                Int8F32Gemm.WidenWeights(weight.AsSpan<byte>(), buffer, k, n, zeroPoints);
+
+            _floatWeights = buffer;
+            _floatSource = weight;
+            _floatZeroPoints = zeroPoints;
+            return buffer;
         }
 
         private static int ReadScalar(IReadOnlyList<Tensor> inputs, int index)

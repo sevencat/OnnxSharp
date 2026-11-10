@@ -7,6 +7,8 @@ using OnnxSharp.Core;
 using OnnxSharp.Ocr.PaddleOCR;
 using OnnxSharp.Onnx;
 using OnnxSharp.Sam3;
+using OnnxSharp.Speech;
+using OnnxSharp.Speech.Paraformer;
 using OnnxSharp.Tensors;
 using OnnxSharp.Vision;
 using ImageFacade;
@@ -30,6 +32,8 @@ return args[0].ToLowerInvariant() switch
     "bench" => Bench(args),
     "profile" => Profile(args),
     "detect" => Detect(args),
+    "features" => Features(args),
+    "asr" => Asr(args),
     "ocr" => Ocr(args),
     "sam3" => Sam3(args),
     "gemmbench" => GemmBench(args),
@@ -395,10 +399,17 @@ static int GemmBench(string[] args)
     var shapes = new List<(int M, int K, int N)>();
     string? single = options.GetString("--shape");
 
-    if (!string.IsNullOrEmpty(single))
+    // --shape 被 ParseOptions 收进 Shapes 列表（不是通用字典），这里两种写法都支持，
+    // 并且允许重复传多个 --shape。
+    var custom = single is not null ? new List<string> { single } : options.Shapes;
+
+    if (custom.Count > 0)
     {
-        var parts = single.Split(',', StringSplitOptions.RemoveEmptyEntries);
-        shapes.Add((int.Parse(parts[0]), int.Parse(parts[1]), int.Parse(parts[2])));
+        foreach (string text in custom)
+        {
+            var parts = text.Split(',', StringSplitOptions.RemoveEmptyEntries);
+            shapes.Add((int.Parse(parts[0]), int.Parse(parts[1]), int.Parse(parts[2])));
+        }
     }
     else
     {
@@ -767,6 +778,131 @@ static int Profile(string[] args)
 // ---------------- 检测：图进、框出（预处理 / 解码 / NMS 都在 OnnxSharp.Vision） ----------------
 // 两种检测头：YOLO（letterbox + 逐锚点 argmax + NMS）与 RF-DETR（拉伸 + 逐类 sigmoid + top-k）。
 // 默认按输出个数判族（RF-DETR 是 dets + labels 双输出），也可以用 --family 强制指定。
+/// <summary>
+/// <c>asr &lt;wav&gt; --models &lt;dir&gt;</c>（或分别给 <c>--encoder/--decoder/--tokens</c>）：
+/// wav → fbank/LFR/CMVN → encoder → CIF → decoder → argmax → 文本，全在 C# 里跑。
+/// </summary>
+static int Asr(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: asr <wav> --models <dir> [--json] [--out text.txt]");
+        Console.Error.WriteLine("       asr <wav> --encoder encoder.onnx --decoder decoder.onnx --tokens tokens.txt");
+        return 2;
+    }
+
+    string wavPath = args[1];
+    var options = ParseOptions(args, 2);
+
+    string? directory = options.GetString("--models");
+    string encoder = options.GetString("--encoder")
+        ?? (directory is null ? string.Empty : Path.Combine(directory, "encoder.onnx"));
+    string decoder = options.GetString("--decoder")
+        ?? (directory is null ? string.Empty : Path.Combine(directory, "decoder.onnx"));
+    string tokens = options.GetString("--tokens")
+        ?? (directory is null ? string.Empty : Path.Combine(directory, "tokens.txt"));
+
+    foreach (string path in new[] { wavPath, encoder, decoder, tokens })
+    {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path))
+        {
+            Console.Error.WriteLine($"not found: {path}");
+            return 2;
+        }
+    }
+
+    var recognizer = new ParaformerRecognizer(new ParaformerOptions
+    {
+        EncoderPath = encoder,
+        DecoderPath = decoder,
+        TokensPath = tokens,
+    });
+
+    var result = recognizer.TranscribeWav(wavPath);
+
+    if (options.Has("--json"))
+    {
+        var json = new
+        {
+            wav = wavPath,
+            text = result.Text,
+            tokenIds = result.TokenIds,
+            tokenCount = result.TokenCount,
+            featureFrames = result.FeatureFrames,
+            featureMs = Math.Round(result.FeatureMs, 1),
+            encoderMs = Math.Round(result.EncoderMs, 1),
+            decoderMs = Math.Round(result.DecoderMs, 1),
+            totalMs = Math.Round(result.TotalMs, 1),
+        };
+
+        Console.WriteLine(JsonSerializer.Serialize(json, new JsonSerializerOptions { WriteIndented = true }));
+    }
+    else
+    {
+        Console.WriteLine($"wav    : {wavPath}");
+        Console.WriteLine($"feats  : {result.FeatureFrames} frames");
+        Console.WriteLine($"tokens : {result.TokenCount}  ids {string.Join(",", result.TokenIds)}");
+        Console.WriteLine($"time   : {result.TotalMs:F0} ms (feat {result.FeatureMs:F0} / enc {result.EncoderMs:F0} / dec {result.DecoderMs:F0})");
+        Console.WriteLine($"text   : {result.Text}");
+    }
+
+    if (options.GetString("--out") is { } outPath)
+    {
+        File.WriteAllText(outPath, result.Text, new UTF8Encoding(false));
+        Console.WriteLine($"wrote  : {outPath}");
+    }
+
+    return 0;
+}
+
+
+/// <summary>
+/// <c>features &lt;model.onnx&gt; &lt;wav&gt; [--out feats.f32]</c>：
+/// wav → fbank(80) → LFR(7,6) → CMVN → <c>[T, 560]</c>，参数从模型 metadata 读。
+/// 产出就是 Paraformer 的 <c>speech</c> 输入（可以直接喂给 <c>run</c> 或 ORT）。
+/// </summary>
+static int Features(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: features <model.onnx> <wav> [--out feats.f32]");
+        return 2;
+    }
+
+    string modelPath = args[1];
+    string wavPath = args[2];
+    var options = ParseOptions(args, 3);
+
+    if (!File.Exists(modelPath) || !File.Exists(wavPath))
+    {
+        Console.Error.WriteLine($"not found: {(File.Exists(modelPath) ? wavPath : modelPath)}");
+        return 2;
+    }
+
+    var extractor = SpeechFeatureExtractor.FromModel(modelPath);
+    var watch = Stopwatch.StartNew();
+    var features = extractor.ComputeFromWav(wavPath);
+    watch.Stop();
+
+    var metadata = OnnxFile.Load(modelPath).Metadata;
+    Console.WriteLine($"wav    : {wavPath}");
+    Console.WriteLine($"model  : {modelPath}");
+    Console.WriteLine($"meta   : {metadata.Count} entries" +
+        (metadata.TryGetValue("lfr_window_size", out string? w) ? $" (lfr {w},{metadata.GetValueOrDefault("lfr_window_shift")})" : string.Empty));
+    Console.WriteLine($"feats  : [{features.Frames}, {features.Dim}]  ({watch.Elapsed.TotalMilliseconds:F1} ms)");
+
+    if (options.GetString("--out") is { } outPath)
+    {
+        var bytes = new byte[features.Values.Length * sizeof(float)];
+        Buffer.BlockCopy(features.Values, 0, bytes, 0, bytes.Length);
+        File.WriteAllBytes(outPath, bytes);
+        Console.WriteLine($"wrote  : {outPath}");
+    }
+
+    return 0;
+}
+
+
 
 static int Detect(string[] args)
 {
