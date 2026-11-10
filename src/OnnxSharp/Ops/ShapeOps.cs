@@ -60,7 +60,7 @@ internal static class ShapeOps
             List<TensorShape> tempShapes)
         {
             var input = inShapes[0];
-            int[] target = Inputs.Count > 1
+            int[] target = Inputs.Count > 1 && Inputs[1].Idx != 0
                 ? OpUtil.ReadInts(OpUtil.RequireConstInput(this, 1))
                 : _shapeAttr;
 
@@ -147,7 +147,12 @@ internal static class ShapeOps
             List<TensorShape> tempShapes)
         {
             var input = inShapes[0];
-            int axis = OpUtil.NormalizeAxis(_axis, input.Rank, $"Flatten '{Name}'");
+
+            // ONNX Flatten 的 axis 允许等于 rank（[-r, r]），表示「整张量拍平成 [total, 1]」；
+            // OpUtil.NormalizeAxis 只接受 [-r, r-1]，所以这里自己归一化。
+            int axis = _axis < 0 ? (int)_axis + input.Rank : (int)_axis;
+            if (axis < 0 || axis > input.Rank)
+                throw new OnnxSharpException($"Flatten '{Name}': axis {_axis} out of range for rank {input.Rank}");
 
             long outer = 1;
             for (int i = 0; i < axis; i++)

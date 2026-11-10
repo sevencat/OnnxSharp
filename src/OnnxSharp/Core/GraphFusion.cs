@@ -186,19 +186,26 @@ internal static class GraphFusion
         return data.HasShape && data.DType == DType.F32;
     }
 
-    /// <summary>输入的每个操作数：要么与链同形，要么元素数为 1（标量常量，splat 处理）。</summary>
+    /// <summary>
+    /// 输入的每个操作数：要么与链<b>严格同形</b>，要么元素数为 1（标量常量，splat 处理）。
+    /// <para>
+    /// 不能只比元素总数：`[1,1,256]` 与 `[256]` 的元素数相同但广播语义不同，
+    /// SAM3 的 decoder 里就有这种 Add —— 融合层只做线性遍历，不理解广播，
+    /// 放行会在运行期抛「shape does not match」。
+    /// </para>
+    /// </summary>
     private static bool InputsCompatible(NetImpl net, LayerInfo op, TensorShape shape)
     {
-        long total = shape.Total();
-
         foreach (var arg in op.Inputs)
         {
             var data = net.GetArgData(arg);
             if (!data.HasShape || data.DType != DType.F32)
                 return false;
 
-            long t = data.Shape.Total();
-            if (t != total && t != 1)
+            if (data.Shape.Total() == 1)
+                continue;
+
+            if (!data.Shape.Equals(shape))
                 return false;
         }
 

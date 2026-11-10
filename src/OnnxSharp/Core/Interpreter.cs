@@ -24,7 +24,8 @@ internal static class Interpreter
         NetImpl net,
         Graph graph,
         bool executeLayers = true,
-        Dictionary<LayerInfo, (double Milliseconds, int Calls)>? timings = null)
+        Dictionary<LayerInfo, (double Milliseconds, int Calls)>? timings = null,
+        bool detectNaN = false)
     {
         // 绑定 LayerInfo.Net 并按生命周期分槽（图结构变化时才重算）。
         net.PrepareForGraph(graph);
@@ -136,6 +137,9 @@ internal static class Interpreter
                 timings[layer] = (acc.Milliseconds + ms, acc.Calls + 1);
             }
 
+            if (detectNaN)
+                CheckNaN(layer, outs);
+
             if (op.DynamicOutputShapes())
             {
                 // 动态 op 自己决定形状，回填 ArgData 供下游/输出读取。
@@ -145,6 +149,30 @@ internal static class Interpreter
                     data.Shape = outs[i].Shape;
                     data.DType = outs[i].DType;
                     data.Layout = outs[i].Layout;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 调试用：检查该算子的每个 F32 输出是否含 NaN（第一个命中的输出直接抛，带算子名与形状）。
+    /// 只在 <c>detectNaN</c> 打开时调用；共享缓冲槽不参与判断（只看本算子刚写完的输出）。
+    /// </summary>
+    private static void CheckNaN(Layer layer, IReadOnlyList<Tensor> outputs)
+    {
+        for (int i = 0; i < outputs.Count; i++)
+        {
+            var tensor = outputs[i];
+            if (tensor is null || tensor.DType != DType.F32 || tensor.Count == 0)
+                continue;
+
+            var span = tensor.AsSpan<float>();
+            for (int j = 0; j < span.Length; j++)
+            {
+                if (float.IsNaN(span[j]))
+                {
+                    throw new OnnxSharpException(
+                        $"op '{layer.Name}' ({layer.Type}) output #{i} {tensor.Shape} contains NaN at index {j}");
                 }
             }
         }

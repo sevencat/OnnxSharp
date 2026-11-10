@@ -23,6 +23,8 @@ internal static class DnnOps
         LayerRegistry.Register("GlobalAveragePool", p => new AveragePoolLayer(p));
         LayerRegistry.Register("GlobalMaxPool", p => new MaxPoolLayer(p));
         LayerRegistry.Register("ConvTranspose", p => new ConvTransposeLayer(p));
+        LayerRegistry.Register("Einsum", p => new EinsumLayer(p));
+        LayerRegistry.Register("RoiAlign", p => new RoiAlignLayer(p));
         LayerRegistry.Register("Resize", p => new ResizeLayer(p));
         LayerRegistry.Register("Softmax", p => new SoftmaxLayer(p));
         LayerRegistry.Register("MatMul", p => new MatMulLayer(p));
@@ -1382,6 +1384,261 @@ internal static class DnnOps
                     coords[i] = 0;
                 }
             }
+        }
+    }
+
+    // ---------------- Einsum ----------------
+
+    /// <summary>
+    /// 爱因斯坦求和。**只实现 SAM3 用到的那一种**：<c>bqc,bchw-&gt;bqhw</c>
+    /// （mask embedder 的 <c>[B,Q,C]</c> 与特征图 <c>[B,C,H,W]</c> 做逐批矩阵乘）。
+    /// <para>
+    /// 其它方程一律抛 <see cref="OnnxSharpException"/> 并报出方程原文 ——
+    /// 通用 einsum 需要下标解析 + 路径规划，收益不成正比；真需要时按方程逐个加特化。
+    /// </para>
+    /// </summary>
+    private sealed class EinsumLayer : Layer
+    {
+        private readonly string _equation;
+
+        public EinsumLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _equation = parameters.GetString("equation", string.Empty);
+        }
+
+        private bool IsSupported => _equation.Replace(" ", string.Empty) == "bqc,bchw->bqhw";
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            if (!IsSupported)
+                throw new OnnxSharpException(
+                    $"Einsum '{Name}': only \"bqc,bchw->bqhw\" is implemented (got \"{_equation}\")");
+
+            var a = inShapes[0];
+            var b = inShapes[1];
+            if (a.Rank != 3 || b.Rank != 4 || a[2] != b[1])
+                throw new OnnxSharpException(
+                    $"Einsum '{Name}': expected [B,Q,C]x[B,C,H,W], got {a}x{b}");
+
+            outShapes.Add(new TensorShape(a[0], a[1], b[2], b[3]));
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var a = inputs[0];
+            var b = inputs[1];
+            var output = outputs[0];
+
+            int batches = a.Shape[0];
+            int queries = a.Shape[1];
+            int channels = a.Shape[2];
+            int height = b.Shape[2];
+            int width = b.Shape[3];
+            int plane = height * width;
+
+            var sa = a.AsSpan<float>();
+            var sb = b.AsSpan<float>();
+            var dst = output.AsSpan<float>();
+
+            // 每个 query 都是 [C, H*W] 的加权和：标量广播 + SIMD 累加（200×256×5184 ≈ 265 MMAC）。
+            for (int batch = 0; batch < batches; batch++)
+            {
+                for (int q = 0; q < queries; q++)
+                {
+                    var target = dst.Slice((batch * queries + q) * plane, plane);
+                    target.Clear();
+
+                    for (int c = 0; c < channels; c++)
+                    {
+                        float weight = sa[(batch * queries + q) * channels + c];
+                        if (weight == 0f)
+                            continue;
+
+                        var source = sb.Slice((batch * channels + c) * plane, plane);
+                        int i = 0;
+
+                        if (Fma.IsSupported)
+                        {
+                            var vw = Vector256.Create(weight);
+                            for (; i + Vector256<float>.Count <= plane; i += Vector256<float>.Count)
+                            {
+                                var acc = Vector256.LoadUnsafe(ref target[i]);
+                                var v = Vector256.LoadUnsafe(ref source[i]);
+                                Vector256.StoreUnsafe(Fma.MultiplyAdd(v, vw, acc), ref target[i]);
+                            }
+                        }
+
+                        for (; i < plane; i++)
+                            target[i] += source[i] * weight;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- RoiAlign ----------------
+
+    /// <summary>
+    /// 兴趣区域对齐（SAM3 的 geometry-encoder：把一个框对应的特征采样成 7×7）。
+    /// <para>
+    /// 按 ONNX 语义实现：<c>avg</c> / <c>max</c>、<c>spatial_scale</c>、
+    /// <c>coordinate_transformation_mode</c>（<c>half_pixel</c> 偏移 0.5；<c>output_half_pixel</c>
+    /// 不偏移、宽高最小取 1）、<c>sampling_ratio = 0</c> 时自适应采样数。
+    /// 双线性采样把坐标夹到 <c>[0, H-1]</c>（与 ORT 一致）。
+    /// </para>
+    /// </summary>
+    private sealed class RoiAlignLayer : Layer
+    {
+        private readonly string _mode;
+        private readonly string _coordinateMode;
+        private readonly int _outputHeight;
+        private readonly int _outputWidth;
+        private readonly int _samplingRatio;
+        private readonly float _spatialScale;
+
+        public RoiAlignLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _mode = parameters.GetString("mode", "avg");
+            _coordinateMode = parameters.GetString("coordinate_transformation_mode", "half_pixel");
+            _outputHeight = (int)parameters.GetInt("output_height", 1);
+            _outputWidth = (int)parameters.GetInt("output_width", 1);
+            _samplingRatio = (int)parameters.GetInt("sampling_ratio", 0);
+            _spatialScale = (float)parameters.GetFloat("spatial_scale", 1.0);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            var x = inShapes[0];
+            var rois = inShapes[1];
+            if (x.Rank != 4 || rois.Rank != 2 || rois[1] != 4)
+                throw new OnnxSharpException(
+                    $"RoiAlign '{Name}': expected X [N,C,H,W] and rois [num,4], got {x}x{rois}");
+
+            outShapes.Add(new TensorShape(rois[0], x[1], _outputHeight, _outputWidth));
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var x = inputs[0];
+            var output = outputs[0];
+
+            int batches = x.Shape[0];
+            int channels = x.Shape[1];
+            int height = x.Shape[2];
+            int width = x.Shape[3];
+
+            int numRois = output.Shape[0];
+            int outHeight = output.Shape[2];
+            int outWidth = output.Shape[3];
+
+            var rois = inputs[1].AsSpan<float>();
+            int[] batchIndices = OpUtil.ReadInts(inputs[2]);
+
+            var src = x.AsSpan<float>();
+            var dst = output.AsSpan<float>();
+
+            bool average = !_mode.Equals("max", StringComparison.OrdinalIgnoreCase);
+            bool halfPixel = !_coordinateMode.Equals("output_half_pixel", StringComparison.OrdinalIgnoreCase);
+            double offset = halfPixel ? 0.5 : 0.0;
+
+            for (int r = 0; r < numRois; r++)
+            {
+                int batch = batchIndices.Length > r ? batchIndices[r] : 0;
+                if ((uint)batch >= (uint)batches)
+                    continue;
+
+                double x1 = rois[r * 4 + 0] * _spatialScale - offset;
+                double y1 = rois[r * 4 + 1] * _spatialScale - offset;
+                double x2 = rois[r * 4 + 2] * _spatialScale - offset;
+                double y2 = rois[r * 4 + 3] * _spatialScale - offset;
+
+                double roiWidth = x2 - x1;
+                double roiHeight = y2 - y1;
+                if (!halfPixel)
+                {
+                    roiWidth = Math.Max(roiWidth, 1.0);
+                    roiHeight = Math.Max(roiHeight, 1.0);
+                }
+
+                double binWidth = roiWidth / outWidth;
+                double binHeight = roiHeight / outHeight;
+
+                int gridWidth = _samplingRatio > 0 ? _samplingRatio : (int)Math.Ceiling(roiWidth / outWidth);
+                int gridHeight = _samplingRatio > 0 ? _samplingRatio : (int)Math.Ceiling(roiHeight / outHeight);
+                gridWidth = Math.Max(gridWidth, 1);
+                gridHeight = Math.Max(gridHeight, 1);
+                double sampleCount = gridWidth * gridHeight;
+
+                for (int c = 0; c < channels; c++)
+                {
+                    var plane = src.Slice((batch * channels + c) * height * width, height * width);
+                    long dstBase = ((long)r * channels + c) * outHeight * outWidth;
+
+                    for (int ph = 0; ph < outHeight; ph++)
+                    {
+                        for (int pw = 0; pw < outWidth; pw++)
+                        {
+                            double sum = 0;
+                            double best = double.NegativeInfinity;
+
+                            for (int iy = 0; iy < gridHeight; iy++)
+                            {
+                                double y = y1 + ph * binHeight + (iy + 0.5) * binHeight / gridHeight;
+
+                                for (int ix = 0; ix < gridWidth; ix++)
+                                {
+                                    double sampleX = x1 + pw * binWidth + (ix + 0.5) * binWidth / gridWidth;
+                                    double value = SampleBilinear(plane, height, width, y, sampleX);
+
+                                    sum += value;
+                                    if (value > best)
+                                        best = value;
+                                }
+                            }
+
+                            dst[(int)(dstBase + (long)ph * outWidth + pw)] =
+                                (float)(average ? sum / sampleCount : best);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>双线性采样；坐标先夹到 [0, size-1]（ONNX RoiAlign 的边界约定）。</summary>
+        private static double SampleBilinear(ReadOnlySpan<float> plane, int height, int width, double y, double x)
+        {
+            double cy = Math.Clamp(y, 0.0, height - 1);
+            double cx = Math.Clamp(x, 0.0, width - 1);
+
+            int y0 = (int)Math.Floor(cy);
+            int x0 = (int)Math.Floor(cx);
+            int y1 = Math.Min(y0 + 1, height - 1);
+            int x1 = Math.Min(x0 + 1, width - 1);
+
+            double ly = cy - y0;
+            double lx = cx - x0;
+
+            double top = plane[y0 * width + x0] + (plane[y0 * width + x1] - plane[y0 * width + x0]) * lx;
+            double bottom = plane[y1 * width + x0] + (plane[y1 * width + x1] - plane[y1 * width + x0]) * lx;
+            return top + (bottom - top) * ly;
         }
     }
 }

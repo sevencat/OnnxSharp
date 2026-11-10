@@ -81,8 +81,11 @@ public sealed class ActivationLayer : Layer
             IReadOnlyList<Tensor> outputs,
             IReadOnlyList<Tensor> temps)
         {
-            float min = inputs.Count > 1 ? Scalar(inputs[1], "min", Name) : _minAttr;
-            float max = inputs.Count > 2 ? Scalar(inputs[2], "max", Name) : _maxAttr;
+            // min / max 是**可选**输入：ONNX 用空串占位，importer 会把它变成 Arg(0)。
+            // 直接按 inputs.Count 判断会把「缺失」当成「值为 0 的张量」——
+            // SAM3 的 Clip(x, min=1) 就是这么被截成 0 的，随后 Div 除零 → ∞ → NaN。
+            float min = Inputs.Count > 1 && Inputs[1].Idx != 0 ? Scalar(inputs[1], "min", Name) : _minAttr;
+            float max = Inputs.Count > 2 && Inputs[2].Idx != 0 ? Scalar(inputs[2], "max", Name) : _maxAttr;
 
             var src = inputs[0].AsSpan<float>();
             var dst = outputs[0].AsSpan<float>();

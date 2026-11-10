@@ -164,6 +164,9 @@ public sealed class Net
 
     public List<Tensor> ForwardAll() => _impl.ForwardAll();
 
+    /// <summary>调试版前向：逐算子检查 NaN，命中即抛（见 <see cref="NetImpl.ForwardAll(bool)"/>）。</summary>
+    public List<Tensor> ForwardAll(bool detectNaN) => _impl.ForwardAll(detectNaN);
+
     /// <summary>
     /// 逐算子耗时统计（对应 OpenCV <c>Net::getPerfProfile</c>），按耗时降序返回。
     /// <para>

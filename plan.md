@@ -3,8 +3,8 @@
 > 纯 C# 的 ONNX 推理运行时，以 OpenCV 5 dnn 新版 graph 引擎为参考实现。
 > 首版目标：跑通 YOLOv11 检测 与 RF-DETR。
 >
-> **当前状态：M0 + M0.5 + M1 + M2 + M3 + M7（OCR）已完成，M4 进行中（微内核已定稿，缺并行扩展性）**
-> 已完成：引擎内核（共享缓冲槽 + temp 池 + 动态形状）、ONNX 全链路导入、67 个注册算子、yolo11n / rfdetr-small / rfdetr-medium / PP-OCRv6（det/rec/cls）端到端数值对齐
+> **当前状态：M0 + M0.5 + M1 + M2 + M3 + M7（OCR）+ M8（SAM3 / 共享图像预处理）已完成，M4 进行中**
+> 已完成：引擎内核（共享缓冲槽 + temp 池 + 动态形状）、ONNX 全链路导入、72 个注册算子、yolo11n / rfdetr-small / rfdetr-medium / PP-OCRv6（det/rec/cls）/ SAM3（vision+geometry+decoder）端到端对齐
 > 校验：`dotnet build` 0 警告 0 错误；`tests` 56/59 PASS（3 个用例需本地模型，缺失则 SKIP）
 > **性能数字只看 `bench.md`**（本节 §9 只留目标与口径，不再重复实测表）
 > 下一步：M4 收尾 —— GEMM 二维 cache blocking（16 线程只跑出 8 核的 45%）
@@ -429,6 +429,47 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 - [ ] 表格识别 / 版面分析 / SAST 等其它 OCR 结构
 - [ ] 多边形（pyclipper）检测框：当前是轴对齐框 + 面积/周长外扩
 
+### M8 — SAM3（框提示）与共享图像预处理 — **已完成（2026-11-10）**
+
+**引擎侧**
+
+- [x] `IsNaN`（softmax 后的 NaN 保护，40 处）、`GreaterOrEqual`
+- [x] `InstanceNormalization`（mask decoder 的 pixel_decoder）
+- [x] `Einsum`：只实现 `bqc,bchw->bqhw`（mask embedder 的逐批矩阵乘），其它方程报错
+- [x] `RoiAlign`：avg/max、`spatial_scale`、`half_pixel` / `output_half_pixel`、`sampling_ratio=0` 自适应
+- [x] 修三个真 bug：`Clip` 的可选 min/max 占位被当成 0、`FusedEltwise` 放行广播形状、`Flatten` 的 `axis == rank`
+- [x] 调试能力：`run --debug` 逐算子检 NaN（`Net.ForwardAll(detectNaN)`），`--input` 支持 I64/Bool
+
+**FP16 → FP32 工具**
+
+- [x] `tools/scripts/onnx_fp16_to_f32.py`：改 F16 initializer / `Constant`·`ConstantOfShape` 的 value、
+      剥掉 FP16 边界的 `Cast`、修 `value_info` 类型、每个模型写**独立**外部权重文件
+
+**门面侧（`src/OnnxSharp/Sam3/`）**
+
+- [x] `Sam3Segmenter`：vision → geometry（归一化 cxcywh + label=1）→ decoder，按框数/提示长度缓存特化图
+- [x] `Sam3Nms`：框级贪心 NMS（默认 IoU 0.5）+ `MaxItems`（实测把同一人的 79 条降到 5 条）
+- [x] 掩码是 logits → sigmoid 成概率；源图坐标用 `MaskScaleX/Y`
+
+**共享图像预处理（`src/OnnxSharp/Imaging/`）**
+
+- [x] `ImagePixels`（4 种像素排列 + rowStride）、`ImageGeometry`（Contain / Stretch）、`AxisMap`（双线性 / 最近邻）
+- [x] `ImageTensor.ToChw`：唯一的「裁剪 + 缩放 + 归一化 + 填边 + 可选 180°」实现
+- [x] Vision（YOLO letterbox 114 / RF-DETR stretch）、OCR（文本行 48 高 + 右侧补 0）、SAM3（白边左上）全部改用它们
+- [x] 回归：YOLO persons.jpg 的检测结果与重构前**逐位一致**（0.7537 [1080.5,732.2,127.9x325.6] …）
+
+**实测**
+
+- [x] decoder 与 ORT 逐值一致（`pred_logits -4.8116~2.2649`、`presence 9.2011`）
+- [x] 1568×1068 + 行人框提示：top-1 **0.932**，框与提示框几乎重合；整链 **30 s**（vision 26 s 主导）
+- [x] 测试：`ImagingTests` 6 例 + `Sam3Tests` 4 例；全套 66/69 PASS
+
+**明确不做**
+
+- [ ] 文本提示：需要纯托管 BPE tokenizer（`tokenizer.json`），当前只支持框提示
+- [ ] vision 特征复用：现在每次 `Segment` 都重跑 vision（26 s），拆出 `EncodeImage` 可省 80%+ 时间
+- [ ] int8 / FP16 计算：见 `misc.md §6.11`（Zen4 无 AVX512-FP16，FP16 计算是负收益）
+
 ---
 
 ## 5. 核心设计
@@ -644,7 +685,7 @@ OCR 的 rec 图里挂在上激活之后，直接按算子实现（每通道一�
 
 ---
 
-## 7. 算子清单（67 个）
+## 7. 算子清单（72 个）
 
 > 早期按「目标模型所需」分批（Batch A~E，42 个）；后续补的算子在 Batch F/G 里，总数已经是
 > `LayerRegistry` 里注册的 67 个（另有 `Constant` 导入期内联，`Silu` / `FusedEltwise` 是融合产物）。
@@ -666,6 +707,9 @@ OCR 的 rec 图里挂在上激活之后，直接按算子实现（每通道一�
 
 **Batch F — OCR（PP-OCRv6，2026-11-10）** (7)
 `HardSigmoid` `BatchNormalization`（推理模式） `Identity` `AveragePool` `GlobalAveragePool` `ReduceMean` `ConvTranspose`(2×2/s2)
+
+**Batch H — SAM3（2026-11-10）** (5)
+`IsNaN` `GreaterOrEqual` `InstanceNormalization` `Einsum`(bqc,bchw-&gt;bqhw) `RoiAlign`(avg/max, output_half_pixel)
 
 **Batch G — 其它导出带出来的** (18)
 `Abs` `Neg` `Log` `Tanh` `Clip` `Pow` `Max` `Min` `Mod` `Ceil` `Floor` `Round` `Sign` `Reciprocal`

@@ -6,6 +6,7 @@ using System.Text.Json;
 using OnnxSharp.Core;
 using OnnxSharp.Ocr.PaddleOCR;
 using OnnxSharp.Onnx;
+using OnnxSharp.Sam3;
 using OnnxSharp.Tensors;
 using OnnxSharp.Vision;
 using ImageFacade;
@@ -30,6 +31,7 @@ return args[0].ToLowerInvariant() switch
     "profile" => Profile(args),
     "detect" => Detect(args),
     "ocr" => Ocr(args),
+    "sam3" => Sam3(args),
     "gemmbench" => GemmBench(args),
     "parbench" => ParBench(args),
     "flopsbench" => FlopsBench(args),
@@ -64,6 +66,9 @@ static int Usage()
     Console.WriteLine("                     [--cls cls.onnx] [--limit 960] [--box 0.6] [--unclip 1.6] [--json]");
     Console.WriteLine("                                      # PaddleOCR：DB 检测 → 方向分类 → CTC 识别");
     Console.WriteLine("  （<image> 由 ImageFacade 解码：JPEG / PNG / BMP / PPM 都可以）");
+    Console.WriteLine("  OnnxSharp.Cli sam3 <image> --models <fp32 dir> --box x1,y1,x2,y2 [--box ...]");
+    Console.WriteLine("                     [--out marked.jpg] [--conf 0.3] [--format cxcywh|xyxy|px] [--json]");
+    Console.WriteLine("                                      # SAM3：图像 + 框提示 → 掩码（模型需先 FP16→FP32）");
     Console.WriteLine("  OnnxSharp.Cli gemmbench [--iters N] [--shape m,k,n]");
     Console.WriteLine("                                      # GEMM 微内核吞吐（GFLOPS），调优用");
     return 2;
@@ -167,19 +172,9 @@ static int DumpGraph(string[] args)
     }
 
     string path = args[1];
-    string? filter = null;
-    int limit = int.MaxValue;
-    int[]? shape = null;
-
-    for (int i = 2; i < args.Length - 1; i++)
-    {
-        if (args[i] == "--type")
-            filter = args[++i];
-        else if (args[i] == "--limit")
-            limit = int.Parse(args[++i]);
-        else if (args[i] == "--shape")
-            shape = ParseShape(args[++i]);
-    }
+    CliOptions options = ParseOptions(args, 2);
+    string? filter = options.GetString("--type");
+    int limit = options.GetInt("--limit", int.MaxValue);
 
     if (!File.Exists(path))
     {
@@ -188,7 +183,7 @@ static int DumpGraph(string[] args)
     }
 
     var watch = System.Diagnostics.Stopwatch.StartNew();
-    var net = LoadModel(path, shape);
+    var net = LoadModel(path, options);
     var graph = net.MainGraph ?? throw new OnnxSharpException("no main graph");
     Interpreter.Run(net.Impl, graph, executeLayers: false);
     watch.Stop();
@@ -255,20 +250,32 @@ static int Run(string[] args)
     }
 
     var loadWatch = System.Diagnostics.Stopwatch.StartNew();
-    var net = LoadModel(path, ParseShape(options.GetString("--shape")));
+    var net = LoadModel(path, options);
     loadWatch.Stop();
 
-    var feeds = BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
+    var feeds = BindInputs(net, options.Inputs, SingleShape(options));
     int repeat = options.GetInt("--repeat", 1);
 
     Console.WriteLine($"model     : {path}");
     Console.WriteLine($"imported  : {loadWatch.ElapsedMilliseconds} ms    ops: {net.MainGraph?.Prog.Count}");
 
     var first = (List<Tensor>?)null;
+    bool detectNaN = options.Has("--debug");
     var watch = System.Diagnostics.Stopwatch.StartNew();
-    for (int i = 0; i < repeat; i++)
-        first = net.ForwardAll();
+    try
+    {
+        for (int i = 0; i < repeat; i++)
+            first = net.ForwardAll(detectNaN);
+    }
+    catch (OnnxSharpException ex)
+    {
+        Console.Error.WriteLine($"debug     : {ex.Message}");
+        return 1;
+    }
     watch.Stop();
+
+    if (options.Has("--debug"))
+        ScanForNaN(net);
 
     Console.WriteLine($"forward   : {watch.Elapsed.TotalMilliseconds / repeat:F1} ms/iter ({repeat} iter)");
 
@@ -326,8 +333,8 @@ static int Bench(string[] args)
         return 2;
     }
 
-    var net = LoadModel(path, ParseShape(options.GetString("--shape")));
-    BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
+    var net = LoadModel(path, options);
+    BindInputs(net, options.Inputs, SingleShape(options));
 
     int warmup = options.GetInt("--warmup", 1);
     int iters = options.GetInt("--iters", 5);
@@ -707,8 +714,8 @@ static int Profile(string[] args)
         return 2;
     }
 
-    var net = LoadModel(path, ParseShape(options.GetString("--shape")));
-    BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
+    var net = LoadModel(path, options);
+    BindInputs(net, options.Inputs, SingleShape(options));
 
     int iters = Math.Max(1, options.GetInt("--iters", 2));
     int top = options.GetInt("--top", 20);
@@ -1126,6 +1133,261 @@ static int Ocr(string[] args)
     return 0;
 }
 
+// ---------------- SAM3：图像 + 框提示 → 掩码 ----------------
+
+static int Sam3(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: sam3 <image> --models <fp32 dir> --box x1,y1,x2,y2 [--box ...]");
+        Console.Error.WriteLine("                     [--out marked.jpg] [--conf 0.3] [--format cxcywh|xyxy|px] [--json out.json]");
+        Console.Error.WriteLine("       模型目录需要 vision-encoder / geometry-encoder / decoder 的 FP32 版本；");
+        Console.Error.WriteLine("       官方导出是 FP16，先用 tools/scripts/onnx_fp16_to_f32.py 转换。");
+        return 2;
+    }
+
+    string imagePath = args[1];
+    CliOptions options = ParseOptions(args, 2);
+
+    string? modelDirectory = options.GetString("--models");
+    if (modelDirectory is null)
+    {
+        Console.Error.WriteLine("sam3 需要 --models <fp32 模型目录>");
+        return 2;
+    }
+
+    if (!File.Exists(imagePath))
+    {
+        Console.Error.WriteLine($"image not found: {imagePath}");
+        return 2;
+    }
+
+    var boxes = new List<Sam3Box>();
+    foreach (string text in options.Values("--box"))
+    {
+        int[]? parsed = ParseShape(text);
+        if (parsed is not { Length: 4 })
+        {
+            Console.Error.WriteLine($"sam3: --box 需要 4 个数（x1,y1,x2,y2），收到 '{text}'");
+            return 2;
+        }
+
+        boxes.Add(new Sam3Box(parsed[0], parsed[1], parsed[2], parsed[3]));
+    }
+
+    if (boxes.Count == 0)
+    {
+        Console.Error.WriteLine("sam3: 至少给一个 --box（源图像素坐标）");
+        return 2;
+    }
+
+    Sam3PromptBoxFormat format = options.GetString("--format")?.ToLowerInvariant() switch
+    {
+        "xyxy" => Sam3PromptBoxFormat.XyxyNormalized,
+        "px" or "pixels" => Sam3PromptBoxFormat.XyxyModelPixels,
+        _ => Sam3PromptBoxFormat.CxcywhNormalized,
+    };
+
+    var sam3Options = new Sam3Options
+    {
+        ModelDirectory = modelDirectory,
+        ScoreThreshold = options.GetFloat("--conf", 0.3f),
+        IouThreshold = options.GetFloat("--iou", 0.5f),
+        MaxItems = options.GetInt("--max-items", 0),
+        BoxFormat = format,
+        BoxLabel = options.GetInt("--label", 1),
+        Diagnostic = options.Has("--debug") ? line => Console.WriteLine("  [dbg] " + line) : null,
+    };
+
+    using CliImage image = CliImage.Load(imagePath);
+    var segmenter = new Sam3Segmenter(sam3Options);
+
+    var watch = System.Diagnostics.Stopwatch.StartNew();
+    Sam3Result result = segmenter.Segment(image.Pixels, image.Width, image.Height, boxes);
+    watch.Stop();
+
+    Console.WriteLine($"{Path.GetFileName(imagePath)} {image.Width}x{image.Height}  ->  " +
+                      $"embedded {result.EmbeddedWidth}x{result.EmbeddedHeight} in {result.ImageSize}²");
+    Console.WriteLine($"  models  : {Path.GetFullPath(modelDirectory)}");
+    Console.WriteLine($"  prompt  : {boxes.Count} box(es), format {format}, label {sam3Options.BoxLabel}");
+    Console.WriteLine($"  timing  : {watch.Elapsed.TotalSeconds:F1} s（vision + geometry + decoder）");
+    Console.WriteLine($"  presence: {result.PresenceScore:F4}    items: {result.Items.Count}");
+
+    foreach (Sam3Item item in result.Items)
+    {
+        int covered = 0;
+        foreach (float value in item.Mask)
+        {
+            if (value >= 0.5f)
+                covered++;
+        }
+
+        Console.WriteLine($"    score {item.Score:F3}  box " +
+                          $"[{item.Box.X1:F0},{item.Box.Y1:F0} - {item.Box.X2:F0},{item.Box.Y2:F0}]  " +
+                          $"mask {(float)covered / item.Mask.Length:P1}");
+    }
+
+    string? outPath = options.GetString("--out");
+    if (!string.IsNullOrEmpty(outPath))
+    {
+        SaveSam3(image, result, outPath);
+        Console.WriteLine($"  output  : {Path.GetFullPath(outPath)}");
+    }
+
+    if (options.GetString("--json") is { } jsonPath)
+    {
+        using var stream = File.Create(jsonPath);
+        using var json = new Utf8JsonWriter(stream, new JsonWriterOptions
+        {
+            Indented = true,
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+
+        json.WriteStartObject();
+        json.WriteString("image", Path.GetFileName(imagePath));
+        json.WriteNumber("width", image.Width);
+        json.WriteNumber("height", image.Height);
+        json.WriteNumber("presence", Math.Round(result.PresenceScore, 4));
+        json.WriteStartArray("items");
+        foreach (Sam3Item item in result.Items)
+        {
+            json.WriteStartObject();
+            json.WriteNumber("score", Math.Round(item.Score, 4));
+            json.WriteStartArray("box");
+            json.WriteNumberValue(Math.Round(item.Box.X1, 1));
+            json.WriteNumberValue(Math.Round(item.Box.Y1, 1));
+            json.WriteNumberValue(Math.Round(item.Box.X2, 1));
+            json.WriteNumberValue(Math.Round(item.Box.Y2, 1));
+            json.WriteEndArray();
+            json.WriteEndObject();
+        }
+        json.WriteEndArray();
+        json.WriteEndObject();
+        json.Flush();
+        Console.WriteLine($"  json    : {Path.GetFullPath(jsonPath)}");
+    }
+
+    return 0;
+}
+
+// ---------------- 画掩码（ImageFacade） ----------------
+
+/// <summary>把 288² 掩码按最近邻上采样、50% 绿色叠加到源图，再画框与分数。</summary>
+static void SaveSam3(CliImage image, Sam3Result result, string path)
+{
+    int width = image.Width;
+    int height = image.Height;
+    byte[] rgba = image.Image.CopyPixels(PixelFormat.Rgba32);
+
+    foreach (Sam3Item item in result.Items)
+    {
+        int maskSize = item.MaskWidth;
+        for (int my = 0; my < maskSize; my++)
+        {
+            int y0 = (int)(my * result.MaskScaleY);
+            int y1 = Math.Min(height, (int)((my + 1) * result.MaskScaleY) + 1);
+
+            for (int mx = 0; mx < maskSize; mx++)
+            {
+                if (item.Mask[my * maskSize + mx] < 0.5f)
+                    continue;
+
+                int x0 = (int)(mx * result.MaskScaleX);
+                int x1 = Math.Min(width, (int)((mx + 1) * result.MaskScaleX) + 1);
+
+                for (int y = y0; y < y1; y++)
+                {
+                    int row = y * width;
+                    for (int x = x0; x < x1; x++)
+                    {
+                        int index = (row + x) * 4;
+                        rgba[index + 0] = (byte)((rgba[index + 0] + 40) / 2);      // R
+                        rgba[index + 1] = (byte)((rgba[index + 1] + 255) / 2);     // G
+                        rgba[index + 2] = (byte)((rgba[index + 2] + 60) / 2);      // B
+                    }
+                }
+            }
+        }
+    }
+
+    using FacadeImage maskImage = ImageHost.Engine.FromPixels(rgba, width, height, width * 4, PixelFormat.Rgba32);
+
+    var drawn = new FacadeDetection[result.Items.Count];
+    for (int i = 0; i < drawn.Length; i++)
+    {
+        Sam3Box box = result.Items[i].Box;
+        drawn[i] = new FacadeDetection(
+            new RectF(box.X1, box.Y1, Math.Max(1, box.Width), Math.Max(1, box.Height)),
+            $"mask {result.Items[i].Score:F2}",
+            result.Items[i].Score);
+    }
+
+    ImageFacade.Pipeline.DetectionDrawing.DrawDetections(maskImage, drawn, LabelStyle(width, height));
+    maskImage.Save(path, new SaveOptions { Quality = 92 });
+}
+
+/// <summary>
+/// 扫描所有运行时 Arg，报告含 NaN 的张量（用于定位「输出 NaN 但不知道是哪个算子」）。
+/// 注意共享缓冲槽会被后来的算子覆盖，所以这里看到的是「某个时刻写过 NaN」的槽，
+/// 结合 Arg 名字仍能定位到第一个出问题的算子。
+/// </summary>
+static void ScanForNaN(Net net)
+{
+    int hits = 0;
+    var lines = new List<string>();
+
+    for (int i = 1; i < net.Impl.ArgCount; i++)
+    {
+        var data = net.Impl.GetArgData(new Arg(i));
+        if (data.Kind is ArgKind.Const or ArgKind.Empty || data.DType != DType.F32 || !data.HasShape)
+            continue;
+
+        Tensor tensor;
+        try
+        {
+            tensor = net.Impl.GetArgTensor(new Arg(i));
+        }
+        catch (Exception)
+        {
+            continue;
+        }
+
+        if (tensor.DType != DType.F32 || tensor.Count == 0)
+            continue;
+
+        var span = tensor.AsSpan<float>();
+        int nan = 0;
+        foreach (float value in span)
+        {
+            if (float.IsNaN(value))
+                nan++;
+        }
+
+        if (nan == 0)
+            continue;
+
+        hits++;
+        if (lines.Count < 20)
+            lines.Add($"{data.Name,-60} {data.Shape}  nan {nan}/{span.Length}");
+    }
+
+    Console.WriteLine($"nan scan  : {hits} arg(s) contain NaN");
+    foreach (string line in lines)
+        Console.WriteLine("  " + line);
+}
+
+static int[]? SingleShape(CliOptions options)
+{
+    // 命名形状（name=dims）用于多输入模型，不能当单输入的形状覆盖用。
+    for (int i = 0; i < options.Shapes.Count; i++)
+    {
+        if (options.Shapes[i].Contains('='))
+            return null;
+    }
+
+    return options.Shapes.Count == 0 ? null : ParseShape(options.Shapes[^1]);
+}
+
 static ChannelNormalization ParseNormalization(string? text) => text?.ToLowerInvariant() switch
 {
     "255" or "unit" or "div255" => ChannelNormalization.Divide255,
@@ -1213,6 +1475,8 @@ static CliOptions ParseOptions(string[] args, int start)
         string arg = args[i];
         if (arg == "--input" && i + 1 < args.Length)
             options.Inputs.Add(args[++i]);
+        else if (arg == "--shape" && i + 1 < args.Length)
+            options.Shapes.Add(args[++i]);
         else if (arg == "--compare" && i + 1 < args.Length)
             options.Compare = args[++i];
         else if (arg.StartsWith("--", StringComparison.Ordinal))
@@ -1247,10 +1511,40 @@ static int[]? ParseShape(string? text)
 
 /// <summary>
 /// 读模型。给了 <c>--shape</c> 就先把输入尺寸固定下来再折叠 ——
-/// 全动态模型（PaddleOCR 的 det/rec）不给尺寸时形状链折不出常量，导入就会失败。
+/// 全动态模型（PaddleOCR 的 det/rec、SAM3 的四个子模型）不给尺寸时形状链折不出常量，导入就会失败。
+/// <para>
+/// 支持两种写法：<c>--shape 1,3,640,640</c>（单输入模型），
+/// <c>--shape fpn_feat_0=1,256,288,288 --shape ...</c>（多输入模型，可重复）。
+/// </para>
 /// </summary>
-static Net LoadModel(string path, int[]? shape)
-    => shape is { Length: > 0 } ? Net.ReadModel(path, shape) : Net.ReadModel(path);
+static Net LoadModel(string path, CliOptions? options)
+{
+    if (options is null || options.Shapes.Count == 0)
+        return Net.ReadModel(path);
+
+    var named = new Dictionary<string, int[]>(StringComparer.Ordinal);
+    int[]? single = null;
+
+    foreach (string text in options.Shapes)
+    {
+        int separator = text.IndexOf('=');
+        if (separator > 0)
+        {
+            string name = text[..separator];
+            if (ParseShape(text[(separator + 1)..]) is { Length: > 0 } shape)
+                named[name] = shape;
+        }
+        else
+        {
+            single = ParseShape(text);
+        }
+    }
+
+    if (named.Count > 0)
+        return Net.ReadModel(path, named);
+
+    return single is { Length: > 0 } ? Net.ReadModel(path, single) : Net.ReadModel(path);
+}
 
 static List<Tensor> BindInputs(Net net, List<string> inputs, int[]? shapeOverride = null)
 {
@@ -1291,8 +1585,8 @@ static Tensor LoadTensor(Net net, string name, string file, int[]? shapeOverride
 {
     var data = net.Impl.GetArgData(net.Impl.Require(name));
 
-    if (data.DType != DType.F32)
-        throw new OnnxSharpException($"input '{name}': only F32 is supported for --input (got {data.DType})");
+    if (data.DType is not (DType.F32 or DType.I64 or DType.I32 or DType.Bool or DType.U8))
+        throw new OnnxSharpException($"input '{name}': {data.DType} is not supported for --input");
 
     TensorShape shape;
 
@@ -1316,14 +1610,14 @@ static Tensor LoadTensor(Net net, string name, string file, int[]? shapeOverride
 
     long count = shape.Total();
     var bytes = File.ReadAllBytes(file);
-    long expected = count * sizeof(float);
+    long expected = count * data.DType.SizeOf();
 
     if (bytes.Length != expected)
         throw new OnnxSharpException(
-            $"input '{name}': {file} is {bytes.Length} B, expected {expected} B for {shape}");
+            $"input '{name}': {file} is {bytes.Length} B, expected {expected} B for {shape} {data.DType}");
 
-    var tensor = Tensor.Allocate(shape, DType.F32);
-    bytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(tensor.AsSpan<float>()));
+    var tensor = Tensor.Allocate(shape, data.DType);
+    bytes.CopyTo(tensor.Buffer.AsSpan(0, (int)expected));
     return tensor;
 }
 

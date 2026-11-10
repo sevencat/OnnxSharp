@@ -20,6 +20,7 @@ internal static class NormOps
     public static void Register()
     {
         LayerRegistry.Register("BatchNormalization", p => new BatchNormLayer(p));
+        LayerRegistry.Register("InstanceNormalization", p => new InstanceNormLayer(p));
         LayerRegistry.Register("Identity", p => new IdentityLayer(p));
     }
 
@@ -152,6 +153,104 @@ internal static class NormOps
 
             src.Buffer.AsSpan(src.ByteOffset, src.ByteLength)
                 .CopyTo(dst.Buffer.AsSpan(dst.ByteOffset, src.ByteLength));
+        }
+    }
+
+    // ---------------- InstanceNormalization ----------------
+
+    /// <summary>
+    /// 实例归一化（逐样本、逐通道在空间维上求均值/方差，再用 scale/bias 仿射）。
+    /// SAM3 的 <c>mask_decoder/pixel_decoder/norms.*</c> 用它，输入是 <c>[N, C, H, W]</c>，eps = 1e-6。
+    /// 与 <see cref="BatchNormLayer"/> 的区别：统计量来自<b>当前这份输入</b>，不是训练期的滑动均值。
+    /// </summary>
+    private sealed class InstanceNormLayer : Layer
+    {
+        private readonly float _epsilon;
+
+        public InstanceNormLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _epsilon = (float)parameters.GetFloat("epsilon", 1e-5);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            if (inShapes.Count < 3 || inShapes[0].Rank < 2)
+                throw new OnnxSharpException($"InstanceNormalization '{Name}': needs X/scale/B and rank >= 2");
+            outShapes.Add(inShapes[0]);
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var input = inputs[0];
+            var output = outputs[0];
+            var shape = input.Shape;
+
+            int batches = shape[0];
+            int channels = shape[1];
+            long spatial = 1;
+            for (int i = 2; i < shape.Rank; i++)
+                spatial *= shape[i];
+
+            var scale = inputs[1].AsSpan<float>();
+            var bias = inputs[2].AsSpan<float>();
+            if (scale.Length < channels || bias.Length < channels)
+                throw new OnnxSharpException(
+                    $"InstanceNormalization '{Name}': parameter length < channels ({channels})");
+
+            var src = input.AsSpan<float>();
+            var dst = output.AsSpan<float>();
+            int count = checked((int)spatial);
+
+            for (int n = 0; n < batches; n++)
+            {
+                for (int c = 0; c < channels; c++)
+                {
+                    long start = ((long)n * channels + c) * spatial;
+                    var plane = src.Slice((int)start, count);
+
+                    // 两遍：先均值再方差，比 Welford 更容易向量化，且 spatial 通常只有几万。
+                    double sum = 0;
+                    for (int i = 0; i < plane.Length; i++)
+                        sum += plane[i];
+                    float mean = (float)(sum / plane.Length);
+
+                    double square = 0;
+                    for (int i = 0; i < plane.Length; i++)
+                    {
+                        double d = plane[i] - mean;
+                        square += d * d;
+                    }
+
+                    float invStd = 1f / MathF.Sqrt((float)(square / plane.Length) + _epsilon);
+                    float a = scale[c] * invStd;
+                    float b = bias[c] - mean * a;
+
+                    var target = dst.Slice((int)start, count);
+                    int i2 = 0;
+                    if (Fma.IsSupported)
+                    {
+                        var va = Vector256.Create(a);
+                        var vb = Vector256.Create(b);
+                        for (; i2 + Vector256<float>.Count <= count; i2 += Vector256<float>.Count)
+                        {
+                            var x = Vector256.LoadUnsafe(ref plane[i2]);
+                            Vector256.StoreUnsafe(Fma.MultiplyAdd(x, va, vb), ref target[i2]);
+                        }
+                    }
+
+                    for (; i2 < count; i2++)
+                        target[i2] = plane[i2] * a + b;
+                }
+            }
         }
     }
 }

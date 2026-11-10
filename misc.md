@@ -695,6 +695,36 @@ Tile TopK Transpose Unsqueeze Where
     编解码要额外引 `Sdcb.SimdCodecs.Jpeg / Png / Bmp` 并在 `ImageHost.RegisterCodecs()` 里显式注册；
     没注册的格式调用时抛 `FeatureNotSupportedException`。产品库 `OnnxSharp` 一行都不引 —— 它只吃像素。
 
+### 6.11 SAM3 / 共享图像预处理（2026-11-10）
+
+67. **`Clip` 的 min/max 是可选输入，空串占位会变成 `Arg(0)`**。按 `inputs.Count > 2` 判断「有没有 max」，
+    会把「缺失」当成「值为 0 的标量」：`Clip(2, min=1)` 变成 `Clip(2, 1, 0) = 0`，
+    SAM3 的 `Div` 随后除零 → ∞ → `pred_logits` 全 NaN。凡是可选输入都要 `Inputs[i].Idx != 0` 兜底
+    （ShapeOps 里的 `Slice`/`Reshape` 已按这个约定修过一遍）。
+68. **`FusedEltwise` 的融合判据不能只比元素总数**。`[1,1,256]` 与 `[256]` 元素数相同但广播语义不同，
+    融合层只做线性遍历（不理解广播），放行后运行期抛 `input #1 shape [1,1,256] does not match [256]`。
+    现在要求**严格同形**，或元素数为 1（splat）。
+69. **`Flatten` 的 `axis` 允许等于 rank**（ONNX 规范是 `[-r, r]`，此时拍平成 `[total, 1]`）。
+    `OpUtil.NormalizeAxis` 只接受 `[-r, r-1]`，直接在 Flatten 里自己归一化即可。
+70. **FP16 导出转 FP32 有四个坑**：① 权重是 F16 initializer；② `ConstantOfShape` 的 `value` 是 F16 **属性**；
+    ③ 图里的 `Cast → F16` / `Cast(F16) → F32` 边界要换成 `Identity`；④ `value_info` 里还写着 F16 会让 ORT 加载失败。
+    另外 **外部权重必须一模型一文件**：`onnx.save` 是 append 写外部数据、offset 又从 0 重新算，
+    同名文件会让后转换的模型读到前一个模型的权重（我们踩过：四个 SAM3 模型共用 `weights.bin`，
+    geometry/decoder 全部输出垃圾）。
+71. **NaN 定位要「逐算子」，不要「事后扫缓冲」**。引擎的缓冲槽是共享的（生命周期着色），
+    事后遍历 Arg 看到的是「某个时刻写过 NaN 的槽」，名字对不上。正确做法：
+    `Net.ForwardAll(detectNaN: true)` 在每次 `Layer.Forward` 之后检查该算子的输出，直接报
+    「op 'xxx' (Gemm) output #0 [1,256] contains NaN at index 0」。SAM3 就是靠它一步定位到 `text_proj/Gemm`
+    的上游 `Clip`。
+72. **SAM3 的几个约定**（都是实测确认的）：框提示是**归一化 cxcywh + label=1**（label 只能是 0/1，2 越界）；
+    `pred_masks` 是 **logits**（要先 sigmoid 再 0.5 阈值）；掩码 288² 覆盖 1008 的嵌入画布，
+    源图坐标 = `mask × (1008/288) × (源尺寸/嵌入尺寸)`；框提示下 200 个 query 会在同一目标上重复命中，
+    **必须做框级 NMS**（实测同一人 79 条 → 5 条）。
+73. **图像预处理收口成 `Imaging.ImageTensor.ToChw`** 时最容易错的是「通道平面步长」：
+    `plane` 必须用**目标缓冲的高度** `destinationHeight × destinationStride`，
+    而不是「缩放区域高度」——后者在 letterbox（上下有填边）时会让三个通道互相覆盖，
+    表现为检测分数整体偏移（实测 0.7994 → 0.5725），而且不报错。A/B 用真实模型输出对比最可靠。
+
 ---
 
 ## 7. 工具脚本
@@ -988,6 +1018,7 @@ SMOKE TEST: PASS
 | 2026-11-07 | **第七轮全表复测 + 修正「已追平 OpenCV」的错误结论**：rfdetr 231.5 / 299.4 ms，对 OpenCV（191.7 / 243.1）为 **1.21× / 1.23×**，对 ORT 0.60× / 0.66×；yolo 侧 vs ORT 0.58~0.89、vs OpenCV 1.16~1.28、vs SimdYolo 1.06~1.63。上一轮记的 1.12 / 1.06 是 **OpenCV 自身发挥失常**（medium 从 304.4 变到 243.1，-20%）造成的假象。新增坑 #48（比值只在双方都落在各自历史区间时可信；跑全表前先用 `(Get-Process).CPU` 增量确认没有满载进程——本轮 `SC2_x64` 占核导致前两轮作废） |
 | 2026-11-07 | **上一轮：RF-DETR 瓶颈定位到 batched attention GEMM**（结论后被修正）。新增 §6.5 坑 #36~#39（分层编译预热、A/B 必须交替、两个已否决的内核方向、`Parallel.For` 7 µs 阈值）；`gemmbench` 加 `--batch` 并改为按时间预热；新增 `bench/make_micro_models.py` |
 | 2026-11-07 | **本轮：修正上一轮两个错误结论 + 修掉最大单点浪费**。① §3.10 重写：140 个 MatMul 里 MLP（`[257,384]×[384,1536]`）与投影都是真 MatMul，合计 **54.1 GFLOP**（前置 batch 4），in-situ 407 GFLOPS，GEMM 已到顶；② 机器上限用 `fma` 重新量：单线程 91 GFLOPS、16 线程 753 GFLOPS；③ `MatMul` 在 B 不广播时合并 `(batch, m)`（decoder q/k/v 投影是 `[300,1,256]×[256,256]`，权重曾被打包 300 遍，4.06 → 0.13 ms），rfdetr-small **356 → 270 ms（-24%）**、medium -12%；④ `ProfileAll` 加预热与每算子最小耗时（坑 #41）；⑤ 新增 `fma`、`gemmbench --threads`、逐元素带宽与链式 MLP 微模型、`bench` 的 `alloc`/`gc`/`gc pause` 诊断；⑥ 排除 GC（0.7 ms/iter）与降频（长跑不衰减）两个嫌疑，剩下的计时差指向 host 侧每 forward 重算 2064 个算子的形状并分配 113 MB；新增坑 #40（独立内核吞吐无法预测端到端） |
+| 2026-11-10 | **M8 SAM3（框提示）跑通 + 图像预处理抽象**：① 引擎补 `IsNaN` / `GreaterOrEqual` / `InstanceNormalization` / `Einsum`(bqc,bchw->bqhw) / `RoiAlign`，算子 67 → **72**；② 修三个真 bug（`Clip` 可选 min/max 占位被当 0 → SAM3 `Div` 除零 NaN、`FusedEltwise` 放行 `[1,1,256]` vs `[256]`、`Flatten` 的 `axis == rank`）；③ 新 `tools/scripts/onnx_fp16_to_f32.py`（F16 权重/属性 + Cast 边界 + value_info + 每模型独立外部权重）；④ 新门面 `src/OnnxSharp/Sam3/`（`Sam3Segmenter`：vision → geometry → decoder、按形状缓存特化图、`Sam3Nms` 框级 NMS、掩码 logits→概率、`MaskScaleX/Y`）；⑤ 新 `src/OnnxSharp/Imaging/`（`ImagePixels` / `ImageGeometry` / `AxisMap` / `ImageTensor.ToChw`），Vision(YOLO/RF-DETR)、OCR、SAM3 三处预处理全部收口，YOLO 检测结果与重构前逐位一致；⑥ 调试能力：`run --debug` 逐算子检 NaN、`--input` 支持 I64/Bool、`--shape name=dims` 多输入；⑦ CLI 新增 `sam3`（`--box/--conf/--iou/--max-items/--format/--out/--json/--debug`）；⑧ 实测：decoder 与 ORT 逐值一致，行人框提示 top-1 **0.932**、整链 30 s；⑨ 坑 #67~#73；⑩ 测试 66/69 PASS（ImagingTests 6 + Sam3Tests 4） |
 | 2026-11-10 | **M7 OCR 落地（PP-OCRv6 det/cls/rec 跑在自家引擎上）**：① 引擎新增 `OnnxFile.WithInputShapes` + `Net.ReadModel(path, 输入形状/字典)`，把全动态图（`x[N,3,H,W]`）**特化**成静态图，形状链才能在导入期折叠（`plan.md §5.6`）；② 补 `HardSigmoid` / `BatchNormalization`（推理模式）/ `Identity`，复用 `GlobalAveragePool` / `ReduceMean` / `ConvTranspose` / `AveragePool` / `Squeeze`，注册算子 42 → **67**；③ 修 `PackedConv.Multiply` 无 bias 的空指针（`Conv+BN`）；④ 新门面 `src/OnnxSharp/Ocr/PaddleOCR/`（命名空间 `OnnxSharp.Ocr.PaddleOCR`，全部 OCR 代码都在这一层）：`OcrLine` / `OcrPixelFormat` / 像素→NCHW / CTC 解码 + `PaddleOcrModel` / `PaddleOcrPipeline` / `DbPostprocess` / `PaddleOcrOptions`，检测按 32 对齐、识别按 16 分桶并按形状缓存特化图；⑤ 与 ORT 对齐：det `max|diff|` 1.4e-7、rec 7.6e-6；900×300 合成图两行全对，3200×1800 车牌 `浙A ES8381` / `浙A：:3M15X`；⑥ CLI 新增 `ocr`，图像 IO 改走 **ImageFacade + 额外引入的 `Sdcb.SimdCodecs.Jpeg/Png/Bmp`**（`ImageHost.RegisterCodecs()` 显式注册，`--out` 画框存图），`detect` 也支持 `--out`；⑦ 新增 `tools/scripts/extract_ocr_models.ps1` 与 `OcrTests`（8 用例）；⑧ 坑 #59~#66（动态图特化、无 bias 卷积、缓冲复用与 FromArray、BN 处置、DB 后处理、rec 分桶、对齐口径、格式包边界）；⑨ 语音说明进 README「库用法 6」：sherpa-onnx 模型是 int8 + `Loop/NonZero/GatherND`，不在本引擎范围内 |
 
 ---

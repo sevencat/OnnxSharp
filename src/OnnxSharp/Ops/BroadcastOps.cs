@@ -18,7 +18,9 @@ internal static class BroadcastOps
         LayerRegistry.Register("Equal", p => new CompareLayer(p, CompareKind.Equal));
         LayerRegistry.Register("Less", p => new CompareLayer(p, CompareKind.Less));
         LayerRegistry.Register("Greater", p => new CompareLayer(p, CompareKind.Greater));
+        LayerRegistry.Register("GreaterOrEqual", p => new CompareLayer(p, CompareKind.GreaterOrEqual));
         LayerRegistry.Register("And", p => new CompareLayer(p, CompareKind.And));
+        LayerRegistry.Register("IsNaN", p => new IsNaNNLayer(p));
     }
 
     internal enum CompareKind
@@ -26,7 +28,79 @@ internal static class BroadcastOps
         Equal,
         Less,
         Greater,
+        GreaterOrEqual,
         And,
+    }
+
+    // ---------------- IsNaN ----------------
+
+    /// <summary>
+    /// <c>IsNaN(x)</c>：输出 Bool。SAM3 的编码器在 softmax 之后挂了「NaN → 0」的保护
+    /// （<c>IsNaN → Where</c>），文本 / 几何 / 解码器图里一共有 40 处。
+    /// </summary>
+    private sealed class IsNaNNLayer : Layer
+    {
+        public IsNaNNLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+            => outShapes.Add(inShapes[0]);
+
+        public override void GetTypes(
+            IReadOnlyList<DType> inTypes,
+            int requiredOutputs,
+            int requiredTemps,
+            List<DType> outTypes,
+            List<DType> tempTypes)
+        {
+            outTypes.Clear();
+            for (int i = 0; i < requiredOutputs; i++)
+                outTypes.Add(DType.Bool);
+
+            tempTypes.Clear();
+            for (int i = 0; i < requiredTemps; i++)
+                tempTypes.Add(DType.F32);
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var input = inputs[0];
+            if (input.DType != DType.F32)
+                throw new OnnxSharpException($"IsNaN '{Name}': only F32 is supported (got {input.DType})");
+
+            var source = input.AsSpan<float>();
+            var target = outputs[0].AsSpan<byte>();
+
+            int i = 0;
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported)
+            {
+                Span<float> buffer = stackalloc float[System.Runtime.Intrinsics.Vector256<float>.Count];
+                for (; i + buffer.Length <= source.Length; i += buffer.Length)
+                {
+                    var v = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref source[i]);
+                    // NaN 与自身比较「无序」，OrderedNotEqualNonSignaling 正好筛出 NaN
+                    var mask = System.Runtime.Intrinsics.X86.Avx.Compare(
+                        v, v, System.Runtime.Intrinsics.X86.FloatComparisonMode.OrderedNotEqualNonSignaling);
+                    System.Runtime.Intrinsics.Vector256.StoreUnsafe(mask, ref buffer[0]);
+
+                    for (int j = 0; j < buffer.Length; j++)
+                        target[i + j] = buffer[j] != 0f ? (byte)1 : (byte)0;
+                }
+            }
+
+            for (; i < source.Length; i++)
+                target[i] = float.IsNaN(source[i]) ? (byte)1 : (byte)0;
+        }
     }
 
     // ---------------- Expand ----------------
@@ -374,6 +448,7 @@ internal static class BroadcastOps
                         CompareKind.Equal => x == y ? (byte)1 : (byte)0,
                         CompareKind.Less => x < y ? (byte)1 : (byte)0,
                         CompareKind.Greater => x > y ? (byte)1 : (byte)0,
+                        CompareKind.GreaterOrEqual => x >= y ? (byte)1 : (byte)0,
                         _ => (byte)0,
                     };
 
@@ -425,6 +500,7 @@ internal static class BroadcastOps
             CompareKind.Equal => a == b,
             CompareKind.Less => a < b,
             CompareKind.Greater => a > b,
+            CompareKind.GreaterOrEqual => a >= b,
             _ => throw new OnnxSharpException($"'{Type}': unsupported float comparison"),
         };
     }

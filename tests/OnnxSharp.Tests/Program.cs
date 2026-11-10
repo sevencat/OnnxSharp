@@ -11,7 +11,9 @@ cases.AddRange(OnnxReaderTests.Cases());
 cases.AddRange(OnnxShapeTests.Cases());
 cases.AddRange(TransposeKernelTests.Cases());
 cases.AddRange(VisionTests.Cases());
+cases.AddRange(ImagingTests.Cases());
 cases.AddRange(OcrTests.Cases());
+cases.AddRange(Sam3Tests.Cases());
 cases.AddRange(YoloGoldenTests.Cases());
 
 return Harness.RunAll(cases);

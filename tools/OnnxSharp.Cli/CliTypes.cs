@@ -8,12 +8,34 @@
 internal sealed class CliOptions
 {
     private readonly Dictionary<string, string> _values = new(StringComparer.Ordinal);
+    private readonly List<(string Key, string Value)> _entries = new();
 
     public List<string> Inputs { get; } = new();
 
+    /// <summary>
+    /// 所有 <c>--shape</c> 取值。可以是 <c>1,3,640,640</c>（单输入模型），
+    /// 也可以是 <c>name=1,256,288,288</c>（多输入模型，如 SAM3 的 decoder）。
+    /// 同一参数可重复出现，按输入名各自生效。
+    /// </summary>
+    public List<string> Shapes { get; } = new();
+
     public string? Compare { get; set; }
 
-    public void Add(string key, string value) => _values[key] = value;
+    public void Add(string key, string value)
+    {
+        _values[key] = value;
+        _entries.Add((key, value));
+    }
+
+    /// <summary>同一个开关出现多次时按顺序返回（如 SAM3 的 <c>--box</c>）。</summary>
+    public IEnumerable<string> Values(string key)
+    {
+        foreach (var entry in _entries)
+        {
+            if (string.Equals(entry.Key, key, StringComparison.Ordinal))
+                yield return entry.Value;
+        }
+    }
 
     /// <summary>是否给了某个开关（<c>--flag</c> 这种不带值的写法也算）。</summary>
     public bool Has(string key) => _values.ContainsKey(key);

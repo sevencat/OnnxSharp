@@ -283,4 +283,17 @@ public sealed class NetImpl
         Interpreter.Run(this, MainGraph);
         return MainGraph.Outputs.Select(GetArgTensor).ToList();
     }
+
+    /// <summary>
+    /// 调试版：逐算子检查输出里的 NaN，命中就抛（消息带算子名与形状）。
+    /// 代价是每个算子多扫一遍输出，只用于定位数值问题。
+    /// </summary>
+    public List<Tensor> ForwardAll(bool detectNaN)
+    {
+        if (MainGraph is null)
+            throw new OnnxSharpException("model is not loaded");
+
+        Interpreter.Run(this, MainGraph, executeLayers: true, timings: null, detectNaN: detectNaN);
+        return MainGraph.Outputs.Select(GetArgTensor).ToList();
+    }
 }

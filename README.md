@@ -66,7 +66,7 @@
 | **后端** | **只有 CPU**（FP32，AVX2 / AVX-512 + 多线程）；**没有** CUDA / TensorRT / Vulkan / OpenCL / DirectML 后端 |
 | 依赖 | 零第三方包（不引用 `Google.Protobuf`、`Microsoft.ML.OnnxRuntime`），全部手写 |
 | 目标框架 | `net8.0` / `net10.0`，AOT 友好（不用反射、不用 `dynamic`） |
-| 算子 | 67 个注册算子，覆盖 YOLO11/v8、RF-DETR 与 PP-OCRv6 的导出图（清单见 [支持算子](#支持算子)） |
+| 算子 | 72 个注册算子，覆盖 YOLO11/v8、RF-DETR 与 PP-OCRv6 的导出图（清单见 [支持算子](#支持算子)） |
 | 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链等） |
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
 | 线程 | 默认 `Environment.ProcessorCount`，可用环境变量 `ONNXSHARP_THREADS` 覆盖 |
@@ -318,6 +318,58 @@ WAV 解析（PCM 8/16/24/32 与 float32、任意声道下混）是纯托管代�
 `F:\code\SimdOnnxExt` 的 `docs/PLAN.md`「阶段 6」记录了把 sherpa 的 Paraformer 权重反量化成 fp32、
 再用引擎 kernel 重写 fbank/CIF/decoder 的路线与进度。
 
+### 库用法 7：SAM3 框提示分段（image + box → mask）
+
+```csharp
+using OnnxSharp.Sam3;
+
+var segmenter = new Sam3Segmenter(new Sam3Options
+{
+    ModelDirectory = @"models\sam3-fp32",   // vision-encoder / geometry-encoder / decoder
+    ScoreThreshold = 0.3f,
+    IouThreshold = 0.5f,                    // 200 个 query 里同目标会重复命中，必须做框级 NMS
+    MaxItems = 5,
+});
+
+var result = segmenter.Segment(pixels, width, height, [new Sam3Box(1347, 672, 1464, 1003)]);
+foreach (Sam3Item item in result.Items)
+    Console.WriteLine($"{item.Score:F3}  {item.Box}  mask {item.MaskWidth}x{item.MaskHeight}");
+```
+
+- 模型要先从官方 **FP16 导出转成 FP32**：`python tools/scripts/onnx_fp16_to_f32.py in.onnx out.onnx`
+  （脚本会改 `Cast`/`ConstantOfShape` 的 F16、修 `value_info` 的类型，并把权重写成**每个模型独立**的外部数据文件）。
+- 框提示约定：**归一化 cxcywh + label=1**（`Sam3PromptBoxFormat` 可切 `xyxy` / 模型像素）。
+- 掩码是 288² 概率，源图坐标 = `mask × result.MaskScaleX/Y`；框已经是源图像素。
+- 一次前向约 **26 s**（1008² ViT-L，FP32，16 线程），整链 30 s；纯 CPU 只适合离线批处理。
+
+### 库用法 8：共享的图像预处理（Vision / OCR / SAM3 同一套）
+
+```csharp
+using OnnxSharp.Imaging;
+
+var source = new ImagePixels(bgra, width, height, PixelFormat.Bgra32, stride);
+ImagePlacement fit = ImageGeometry.Contain(width, height, 1008, 1008, centered: false);  // 左上对齐
+
+float[] input = new float[3 * 1008 * 1008];
+ImageTensor.ToChw(source, 0, 0, width, height,
+    outWidth: fit.ResizedWidth, outHeight: fit.ResizedHeight,
+    offsetX: fit.OffsetX, offsetY: fit.OffsetY,
+    destinationHeight: 1008, destinationStride: 1008,
+    padValue: 1f,                                   // 白边（归一化后的值）
+    destination: input,
+    normalization: ChannelNormalization.Divide255);
+```
+
+`ImageTensor.ToChw` 是**唯一**的像素 → NCHW 实现：裁剪 + 双线性/最近邻 + 归一化 + 填边 + 可选 180° 旋转，
+三处调用方只是参数不同：
+
+| 调用方 | 几何 | 填边 | 归一化 |
+|---|---|---|---|
+| `ImagePreprocessor.Letterbox`（YOLO） | `ImageGeometry.Contain` 居中 | 114/255 | `/255` |
+| `ImagePreprocessor.Stretch`（RF-DETR） | `ImageGeometry.Stretch` | 无 | ImageNet |
+| `OcrImage.ToChw`（PaddleOCR） | 裁剪文本行 + 高 48 | 0 | `(v/255-0.5)/0.5` |
+| `Sam3Segmenter`（SAM3） | `Contain(centered:false)` | 1.0（白） | `/255` |
+
 ### 命令行
 
 ```powershell
@@ -334,6 +386,7 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | `profile <model.onnx> --input in.f32 [--iters N] [--top N]` | 逐算子耗时排行（找热点） |
 | `detect <model.onnx> <image> [--out marked.jpg]` | 内建预处理 + 解码，直接给出原图坐标的框（可画出标注图） |
 | `ocr <image> --det det.onnx --rec rec.onnx --dict keys.txt [--cls cls.onnx] [--out marked.jpg]` | PaddleOCR：DB 检测 → 方向分类 → CTC 识别，给出原图坐标的文本行（可画出标注图） |
+| `sam3 <image> --models <fp32 dir> --box x1,y1,x2,y2 [--box ...] [--out marked.jpg]` | SAM3 框提示分段：`--conf 0.3` / `--iou 0.5` 做框级 NMS / `--max-items 5` / `--format cxcywh\|xyxy\|px` |
 | `gemmbench` / `convbench` / `flopsbench` / `parbench` | 微基准：GEMM、卷积、FLOPS、并行扩展性 |
 
 `detect` 的常用参数：
@@ -374,20 +427,21 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 
 ### 支持算子
 
-67 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` 是图融合的产物）：
+72 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` 是图融合的产物）：
 
 | 类别 | 算子 |
 |---|---|
 | 形状/元数据 (11) | `Shape` `ConstantOfShape` `Expand` `Tile` `Unsqueeze` `Squeeze` `Reshape` `Slice` `Split` `Flatten` `Range` |
 | 搬运/类型 (4) | `Concat` `Transpose` `Cast` `Identity` |
 | 逐元素 (26) | `Add` `Sub` `Mul` `Div` `Mod` `Pow` `Max` `Min` `Abs` `Neg` `Sqrt` `Exp` `Log` `Erf` `Sin` `Cos` `Reciprocal` `Round` `Floor` `Ceil` `Sign` `Clip` `Relu` `HardSigmoid` `Sigmoid` `Tanh` |
-| 比较/逻辑 (6) | `Equal` `Less` `Greater` `And` `Not` `Where` |
+| 比较/逻辑 (8) | `Equal` `Less` `Greater` `GreaterOrEqual` `And` `Not` `Where` `IsNaN` |
 | 归约/索引 (7) | `ReduceSum` `ReduceMax` `ReduceMean` `TopK` `Gather` `GatherElements` `GatherND` |
-| 重算子 (13) | `Conv` `ConvTranspose` `MatMul` `Gemm` `MaxPool` `AveragePool` `GlobalAveragePool` `GlobalMaxPool` `Softmax` `LayerNormalization` `BatchNormalization` `Resize` `GridSample` |
+| 重算子 (16) | `Conv` `ConvTranspose` `MatMul` `Gemm` `Einsum` `RoiAlign` `MaxPool` `AveragePool` `GlobalAveragePool` `GlobalMaxPool` `Softmax` `LayerNormalization` `BatchNormalization` `InstanceNormalization` `Resize` `GridSample` |
 
 > 与目标模型的关系：YOLO11/v8 用前五类里的大部分；RF-DETR 额外要 `GridSample` / `TopK` / `GatherElements` /
 > `Reduce*` / `Sin` / `Cos` / `Where`；PP-OCRv6 额外要 `HardSigmoid` / `GlobalAveragePool` / `ReduceMean` /
-> `ConvTranspose` / `BatchNormalization` / `Identity`（后三个是本轮为 OCR 补的）。
+> `ConvTranspose` / `BatchNormalization` / `Identity`（OCR 补的）；SAM3 又补了 `IsNaN` / `GreaterOrEqual` /
+> `InstanceNormalization` / `Einsum`(bqc,bchw-&gt;bqhw) / `RoiAlign`。
 > **动态维**不属于算子问题：`Net.ReadModel(path, 输入形状)` 会把全动态图特化成静态图，否则 `Shape` 链折不出常量。
 
 ### 性能
@@ -445,6 +499,8 @@ src/OnnxSharp/
   Ocr/       可选门面（可整体删除，不影响推理）
     PaddleOCR/  OcrLine / OcrPixelFormat / 像素→NCHW / CTC 解码
                 + PaddleOcrModel / PaddleOcrPipeline / DbPostprocess / PaddleOcrOptions
+  Sam3/      可选门面：Sam3Segmenter（vision → geometry → decoder）+ Sam3Box / Sam3Item / Sam3Nms
+  Imaging/   共享图像预处理：ImagePixels / ImageGeometry / AxisMap / ImageTensor（Vision / OCR / SAM3 共用）
 tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / 微基准 + ImageFacade 图像 IO
 tools/scripts/         dump_shapes / gen_golden / extract_ocr_models.ps1
 tests/OnnxSharp.Tests/ 零依赖测试运行器（59 用例），直接 dotnet run
