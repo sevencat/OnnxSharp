@@ -146,6 +146,18 @@ public class Layer : LayerInfo
     /// <summary>上次 Finalize 时的输入类型签名（OpenCV 同时比较 shapes 与 types）。</summary>
     public readonly List<DType> LastInTypes = new();
 
+    // ---- 形状/类型推断缓存 ----
+    // 推理时每帧都会对每个算子调用 GetMemoryShapes/GetTypes；而绝大多数图（YOLO/OCR/ASR）
+    // 每帧的输入 shape 完全一样，重算纯属浪费（还会分配一堆 TensorShape/int[]）。
+    // 这里按「输入 shape + type 签名」缓存结果，命中就直接复用。
+    internal readonly List<TensorShape> CachedInShapes = new();
+    internal readonly List<DType> CachedInTypes = new();
+    internal readonly List<TensorShape> CachedOutShapes = new();
+    internal readonly List<TensorShape> CachedTempShapes = new();
+    internal readonly List<DType> CachedOutTypes = new();
+    internal readonly List<DType> CachedTempTypes = new();
+    internal bool ShapeCacheValid;
+
     /// <summary>权重预处理（打包/重排）。权重变化时会被再次调用。</summary>
     public virtual void PrepackWeights()
     {

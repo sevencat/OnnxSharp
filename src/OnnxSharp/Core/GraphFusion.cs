@@ -22,6 +22,9 @@ internal static class GraphFusion
         total += FuseSilu(net, graph);
         total += FuseActivationIntoProducer(net, graph);
         total += FuseMatMulArgMax(net, graph);
+        total += FuseQuantizedMatMul(net, graph);
+        total += FuseAttention(net, graph);
+        total += FuseLayerNorm(net, graph);
 
         // 逐元素链融合放最后：前面两步可能已经把 Sigmoid+Mul 变成单个 Silu，
         // 那样链里就少一个节点，融合结果的寄存器也更省。
@@ -399,6 +402,579 @@ internal static class GraphFusion
             drop.Add(argMaxOp);
             if (addOp is not null)
                 drop.Add(addOp);
+            fused++;
+        }
+
+        if (replacements.Count == 0)
+            return 0;
+
+        var result = new List<LayerInfo>(prog.Count);
+        foreach (var op in prog)
+        {
+            if (drop.Contains(op))
+                continue;
+
+            result.Add(replacements.TryGetValue(op, out var replacement) ? replacement : op);
+        }
+
+        graph.Reset(result);
+        return fused;
+    }
+
+    /// <summary>
+    /// <c>DQL → MatMulInteger → Cast → Mul(a_scale·w_scale) → [Add(bias)]</c> 折成一层
+    /// <c>DynamicQuantizeMatMul</c>（对齐 ORT 的同名融合）。
+    /// <para>
+    /// 前提：<c>a_scale</c> 只喂那个「组合 scale」的 <c>Mul</c>、权重/零点/偏置都是常量、
+    /// 以及链路上每个中间张量只有一个消费者。
+    /// </para>
+    /// </summary>
+    private static int FuseQuantizedMatMul(NetImpl net, Graph graph)
+    {
+        var prog = graph.Prog;
+        if (prog.Count < 5)
+            return 0;
+
+        var producerOf = new Dictionary<int, LayerInfo>();
+        var consumerOf = new Dictionary<int, LayerInfo>();
+        var uses = new Dictionary<int, int>();
+
+        foreach (var op in prog)
+        {
+            foreach (var arg in op.Outputs)
+            {
+                if (!arg.IsEmpty)
+                    producerOf[arg.Idx] = op;          // 输出 → 生产者
+            }
+
+            foreach (var arg in op.Inputs)
+            {
+                if (arg.IsEmpty)
+                    continue;
+
+                uses[arg.Idx] = uses.TryGetValue(arg.Idx, out int count) ? count + 1 : 1;
+                consumerOf.TryAdd(arg.Idx, op);        // 输入 → 消费者（第一个）
+            }
+        }
+
+        int Uses(Arg arg) => arg.IsEmpty ? 0 : uses.GetValueOrDefault(arg.Idx);
+
+        var graphOutputs = CollectOutputs(graph);
+        var replacements = new Dictionary<LayerInfo, LayerInfo>();
+        var drop = new HashSet<LayerInfo>();
+        int fused = 0;
+
+        foreach (var matmul in prog)
+        {
+            if (matmul.Type != "MatMulInteger" || matmul.Inputs.Count < 2 || matmul.Outputs.Count != 1)
+                continue;
+            if (!matmul.IsConstInput(1))
+                continue;
+
+            if (!producerOf.TryGetValue(matmul.Inputs[0].Idx, out var dql) || dql.Type != "DynamicQuantizeLinear")
+                continue;
+            if (dql.Outputs.Count < 3 || Uses(dql.Outputs[0]) != 1 || Uses(dql.Outputs[1]) != 1 || Uses(dql.Outputs[2]) != 1)
+                continue;
+
+            if (matmul.Inputs.Count > 2 && !matmul.Inputs[2].IsEmpty && matmul.Inputs[2].Idx != dql.Outputs[2].Idx)
+                continue;
+            if (matmul.Inputs.Count > 3 && !matmul.Inputs[3].IsEmpty && !matmul.IsConstInput(3))
+                continue;
+
+            // Mul(a_scale, w_scale_const) → 组合 scale
+            if (!consumerOf.TryGetValue(dql.Outputs[1].Idx, out var scaleMul)
+                || scaleMul.Type != "Mul" || scaleMul.Inputs.Count != 2 || scaleMul.Outputs.Count != 1)
+                continue;
+
+            int scaleSlot = scaleMul.IsConstInput(0) ? 0 : scaleMul.IsConstInput(1) ? 1 : -1;
+            if (scaleSlot < 0)
+                continue;
+
+            // 权重是 per-channel 量化的：w_scale 是 [n] 向量（也兼容标量）
+            var weightScale = scaleMul.Inputs[scaleSlot];
+
+            // Cast(int32 → f32)
+            if (Uses(matmul.Outputs[0]) != 1 || !consumerOf.TryGetValue(matmul.Outputs[0].Idx, out var cast)
+                || cast.Type != "Cast" || cast.Outputs.Count != 1)
+                continue;
+            if (net.GetArgData(cast.Outputs[0]).DType != DType.F32)
+                continue;
+
+            // Mul(cast_out, combined_scale)
+            if (Uses(cast.Outputs[0]) != 1 || !consumerOf.TryGetValue(cast.Outputs[0].Idx, out var mul)
+                || mul.Type != "Mul" || mul.Inputs.Count != 2 || mul.Outputs.Count != 1)
+                continue;
+            if (Uses(scaleMul.Outputs[0]) != 1)
+                continue;
+            if (mul.Inputs[0].Idx != scaleMul.Outputs[0].Idx && mul.Inputs[1].Idx != scaleMul.Outputs[0].Idx)
+                continue;
+
+            // 可选：Add(bias_const)
+            LayerInfo tail = mul;
+            int biasSlotIndex = -1;
+
+            if (Uses(mul.Outputs[0]) == 1 && consumerOf.TryGetValue(mul.Outputs[0].Idx, out var add)
+                && add.Type == "Add" && add.Inputs.Count == 2 && add.Outputs.Count == 1)
+            {
+                int slot = add.IsConstInput(0) ? 0 : add.IsConstInput(1) ? 1 : -1;
+                if (slot >= 0)
+                {
+                    tail = add;
+                    biasSlotIndex = slot;
+                }
+            }
+
+            // 只在「既不是图输出、也没人用」时才跳过（那是死节点，不值得我们建融合层）
+            if (!graphOutputs.Contains(tail.Outputs[0].Idx) && Uses(tail.Outputs[0]) == 0)
+                continue;
+
+            var parameters = new LayerParams { Type = "DynamicQuantizeMatMul", Name = matmul.Name + "/fused" };
+
+            if (LayerRegistry.Create("DynamicQuantizeMatMul", parameters) is not Layer fusedLayer)
+                continue;
+
+            fusedLayer.Inputs.Add(dql.Inputs[0]);                                   // A(f32)
+            fusedLayer.Inputs.Add(matmul.Inputs[1]);                                // W(int8/u8, const)
+            fusedLayer.Inputs.Add(matmul.Inputs.Count > 3 ? matmul.Inputs[3] : default);  // w_zero_point
+            fusedLayer.Inputs.Add(weightScale);                                     // w_scale（per-column 或标量）
+            fusedLayer.Inputs.Add(biasSlotIndex >= 0 ? tail.Inputs[biasSlotIndex] : default);
+            fusedLayer.Outputs.Add(tail.Outputs[0]);
+
+            replacements[matmul] = fusedLayer;
+            drop.Add(dql);
+            drop.Add(scaleMul);
+            drop.Add(cast);
+            drop.Add(mul);
+            if (tail != mul)
+                drop.Add(tail);
+
+            fused++;
+        }
+
+        if (replacements.Count == 0)
+            return 0;
+
+        var result = new List<LayerInfo>(prog.Count);
+        foreach (var op in prog)
+        {
+            if (drop.Contains(op))
+                continue;
+
+            result.Add(replacements.TryGetValue(op, out var replacement) ? replacement : op);
+        }
+
+        graph.Reset(result);
+        return fused;
+    }
+
+    /// <summary>
+    /// 整条 multi-head attention 折成一层 <c>FusedAttention</c>：
+    /// <code>
+    /// Qh = Transpose(Reshape(q), [0,2,1,3])      [B,H,T,D]
+    /// Kt = Transpose(Reshape(k), [0,2,3,1])      [B,H,D,T]
+    /// Vh = Transpose(Reshape(v), [0,2,1,3])      [B,H,T,D]
+    /// S  = MatMul([Mul(Qh, scale),] Kt) → [Add(·, mask)] → Softmax(-1)
+    /// O  = Reshape(Transpose(MatMul(S, Vh), [0,2,1,3]))
+    /// </code>
+    /// <para>
+    /// 两种形态：能读出 head 数（<c>Reshape</c> 目标静态）时融合层的输入是 3 维投影张量，
+    /// 连 3 个 <c>Reshape + Transpose</c> 一起折掉；读不出时（Paraformer 的 head-split 目标是
+    /// <c>Shape→Gather→Concat</c> 动态链）输入留在 head 空间，H/D 由形状给出，
+    /// 仍然折掉 scores 物化、Softmax、两次 MatMul、输出 Transpose 与 Reshape。
+    /// </para>
+    /// </summary>
+    private static int FuseAttention(NetImpl net, Graph graph)
+    {
+        var prog = graph.Prog;
+        if (prog.Count < 6)
+            return 0;
+
+        var producerOf = new Dictionary<int, LayerInfo>();
+        var consumerOf = new Dictionary<int, LayerInfo>();
+        var consumersOf = new Dictionary<int, List<LayerInfo>>();
+
+        var uses = new Dictionary<int, int>();
+
+        foreach (var op in prog)
+        {
+            foreach (var arg in op.Outputs)
+            {
+                if (!arg.IsEmpty)
+                    producerOf[arg.Idx] = op;          // 输出 → 生产者
+            }
+
+            foreach (var arg in op.Inputs)
+            {
+                if (arg.IsEmpty)
+                    continue;
+
+                uses[arg.Idx] = uses.TryGetValue(arg.Idx, out int count) ? count + 1 : 1;
+                consumerOf.TryAdd(arg.Idx, op);        // 输入 → 消费者（第一个）
+                if (!consumersOf.TryGetValue(arg.Idx, out var list))
+                    consumersOf[arg.Idx] = list = new List<LayerInfo>();
+                list.Add(op);
+
+            }
+        }
+
+        int Uses(Arg arg) => arg.IsEmpty ? 0 : uses.GetValueOrDefault(arg.Idx);
+
+        var replacements = new Dictionary<LayerInfo, LayerInfo>();
+        var drop = new HashSet<LayerInfo>();
+        int fused = 0;
+        foreach (var softmax in prog)
+        {
+            // 只认「沿最后一维」的 Softmax（属性可能写成 -1，也可能写成 rank-1）
+            if (softmax.Type != "Softmax" || softmax is not Ops.DnnOps.ISoftmaxAxis { Axis: -1 or 3 })
+                continue;
+            if (softmax.Inputs.Count != 1 || softmax.Outputs.Count != 1)
+                continue;
+
+            // O = MatMul(softmax, Vh)
+            if (Uses(softmax.Outputs[0]) != 1
+                || !consumerOf.TryGetValue(softmax.Outputs[0].Idx, out var pv)
+                || pv.Type != "MatMul" || pv.Inputs.Count != 2 || pv.Outputs.Count != 1
+                || pv.Inputs[0].Idx != softmax.Outputs[0].Idx)
+                continue;
+
+            if (!producerOf.TryGetValue(pv.Inputs[1].Idx, out var vTranspose)
+                || vTranspose is not Ops.ShapeOps.ITransposePerm { Perm: [0, 2, 1, 3] })
+                continue;
+
+            // Softmax 的输入可能是 Add(scores, mask)
+            var scoreArg = softmax.Inputs[0];
+            var maskArg = default(Arg);
+            LayerInfo? maskAdd = null;
+
+            if (producerOf.TryGetValue(scoreArg.Idx, out var addNode)
+                && addNode.Type == "Add" && addNode.Inputs.Count == 2 && addNode.Outputs.Count == 1
+                && Uses(addNode.Outputs[0]) == 1)
+            {
+                bool firstIsMatMul = producerOf.TryGetValue(addNode.Inputs[0].Idx, out var firstProducer)
+                    && firstProducer.Type == "MatMul";
+                bool secondIsMatMul = producerOf.TryGetValue(addNode.Inputs[1].Idx, out var secondProducer)
+                    && secondProducer.Type == "MatMul";
+
+                if (firstIsMatMul == secondIsMatMul)
+                    continue;
+
+                scoreArg = firstIsMatMul ? addNode.Inputs[0] : addNode.Inputs[1];
+                maskArg = firstIsMatMul ? addNode.Inputs[1] : addNode.Inputs[0];
+                maskAdd = addNode;
+            }
+
+            // S = MatMul(Qh(·scale), Kt)
+            if (!producerOf.TryGetValue(scoreArg.Idx, out var qk)
+                || qk.Type != "MatMul" || qk.Inputs.Count != 2 || qk.Outputs.Count != 1)
+                continue;
+
+            var qArg = qk.Inputs[0];
+            var ktArg = qk.Inputs[1];
+            float scale = 1f;
+            LayerInfo? qScale = null;
+
+            if (producerOf.TryGetValue(qArg.Idx, out var scaleNode)
+                && scaleNode.Type == "Mul" && scaleNode.Inputs.Count == 2 && scaleNode.Outputs.Count == 1
+                && Uses(scaleNode.Outputs[0]) == 1)
+            {
+                int scaleSlot = scaleNode.IsConstInput(0) ? 0 : scaleNode.IsConstInput(1) ? 1 : -1;
+                if (scaleSlot < 0)
+                    continue;
+
+                var scaleTensor = scaleNode.In(scaleSlot);
+                if (scaleTensor.Count != 1)
+                    continue;
+
+                scale = scaleTensor.AsSpan<float>()[0];
+                qArg = scaleNode.Inputs[1 - scaleSlot];
+                qScale = scaleNode;
+            }
+
+            if (!producerOf.TryGetValue(qArg.Idx, out var qTranspose)
+                || qTranspose is not Ops.ShapeOps.ITransposePerm { Perm: [0, 2, 1, 3] })
+                continue;
+            if (!producerOf.TryGetValue(ktArg.Idx, out var kTranspose)
+                || kTranspose is not Ops.ShapeOps.ITransposePerm { Perm: [0, 2, 3, 1] })
+                continue;
+
+            // 输出侧：Transpose([0,2,1,3]) → Reshape
+            if (Uses(pv.Outputs[0]) != 1
+                || !consumerOf.TryGetValue(pv.Outputs[0].Idx, out var oTranspose)
+                || oTranspose is not Ops.ShapeOps.ITransposePerm { Perm: [0, 2, 1, 3] })
+                continue;
+
+            if (!consumersOf.TryGetValue(oTranspose.Outputs[0].Idx, out var transposeConsumers))
+                continue;
+
+            LayerInfo? oReshape = null;
+            foreach (var consumer in transposeConsumers)
+            {
+                if (consumer.Type == "Reshape" && consumer.Outputs.Count == 1)
+                {
+                    oReshape = consumer;
+                    break;
+                }
+            }
+
+            // 没有 Reshape（只有 Shape 链）说明这不是我们要的形态
+            if (oReshape is null)
+                continue;
+
+            // Transpose 的输出只被这个 Reshape 用 → 连 Transpose+Reshape 一起折掉；
+            // 否则（动态 Reshape 的目标由 Shape(Transpose 输出) 建出来）保留它们，
+            // 融合层输出 [B,H,T,D]。
+            bool foldOutput = transposeConsumers.Count == 1;
+
+            // ---- 建融合层 ----
+            // 优先「3 维输入」形态：三个 Transpose 的输入都是 Reshape，且能静态读出 head 数
+            int heads = 0;
+            var qReshape = default(LayerInfo);
+            var kReshape = default(LayerInfo);
+            var vReshape = default(LayerInfo);
+
+            if (producerOf.TryGetValue(qTranspose.Inputs[0].Idx, out var qr)
+                && qr.Type == "Reshape" && Uses(qr.Outputs[0]) == 1
+                && producerOf.TryGetValue(kTranspose.Inputs[0].Idx, out var kr)
+                && kr.Type == "Reshape" && Uses(kr.Outputs[0]) == 1
+                && producerOf.TryGetValue(vTranspose.Inputs[0].Idx, out var vr)
+                && vr.Type == "Reshape" && Uses(vr.Outputs[0]) == 1
+                && TryGetOutputShape(net, qTranspose, out var qhShape) && qhShape.Rank == 4
+                && TryGetOutputShape(net, vTranspose, out var vhShape) && vhShape.Rank == 4
+                && qhShape.Dims[1] > 0 && qhShape.Dims[3] > 0
+                && qhShape.Dims[0] == vhShape.Dims[0] && qhShape.Dims[1] == vhShape.Dims[1]
+                && qhShape.Dims[2] == vhShape.Dims[2] && qhShape.Dims[3] == vhShape.Dims[3])
+            {
+                heads = qhShape.Dims[1];
+                qReshape = qr;
+                kReshape = kr;
+                vReshape = vr;
+            }
+
+            var parameters = new LayerParams { Type = "FusedAttention", Name = softmax.Name + "/fused" };
+            parameters.Set("scale", (double)scale);
+            if (heads > 0)
+                parameters.Set("heads", (long)heads);
+            if (!foldOutput)
+                parameters.Set("output_head_space", 1L);
+
+            if (LayerRegistry.Create("FusedAttention", parameters) is not Layer fusedLayer)
+                continue;
+
+            if (heads > 0)
+            {
+                fusedLayer.Inputs.Add(qReshape!.Inputs[0]);
+                fusedLayer.Inputs.Add(kReshape!.Inputs[0]);
+                fusedLayer.Inputs.Add(vReshape!.Inputs[0]);
+            }
+            else
+            {
+                fusedLayer.Inputs.Add(qTranspose.Outputs[0]);
+                fusedLayer.Inputs.Add(kTranspose.Outputs[0]);
+                fusedLayer.Inputs.Add(vTranspose.Outputs[0]);
+            }
+
+            fusedLayer.Inputs.Add(maskArg);
+            fusedLayer.Outputs.Add(foldOutput ? oReshape.Outputs[0] : pv.Outputs[0]);
+
+            replacements[softmax] = fusedLayer;
+
+            drop.Add(softmax);
+            drop.Add(qk);
+            drop.Add(pv);
+
+            if (foldOutput)
+            {
+                drop.Add(oTranspose);
+                drop.Add(oReshape);
+            }
+
+            if (maskAdd is not null)
+                drop.Add(maskAdd);
+            if (qScale is not null)
+                drop.Add(qScale);
+
+            if (heads > 0)
+            {
+                // 3 维形态：head-split 的 Reshape 与 Transpose 全部进融合层
+                drop.Add(qTranspose);
+                drop.Add(kTranspose);
+                drop.Add(vTranspose);
+                drop.Add(qReshape!);
+                drop.Add(kReshape!);
+                drop.Add(vReshape!);
+            }
+
+            fused++;
+        }
+
+        if (replacements.Count == 0)
+            return 0;
+
+        var result = new List<LayerInfo>(prog.Count);
+        foreach (var op in prog)
+        {
+            // 先查替换表：被替换的节点往往也在 drop 里，顺序反了融合层就丢了
+            if (replacements.TryGetValue(op, out var replacement))
+            {
+                result.Add(replacement);
+                continue;
+            }
+
+            if (drop.Contains(op))
+                continue;
+
+            result.Add(op);
+        }
+
+        graph.Reset(result);
+        return fused;
+    }
+
+    /// <summary>
+    /// 把手写的 LayerNorm 折成单个 <c>LayerNormalization</c>（思路来自 SimdOnnx 的 <c>FuseLayerNorm</c>）：
+    /// <code>
+    /// x → ReduceMean → Sub(x, mean) → Pow(2) → ReduceMean → Add(eps) → Sqrt
+    ///   → Div(Sub, Sqrt) → Mul(gamma) → Add(beta)
+    /// </code>
+    /// 一共 9 个算子、对 <c>[T, C]</c> 要走 8 遍内存；融成一层后内核只扫两遍。
+    /// <para>
+    /// 匹配的关键判据（漏一个就会算错）：每个中间张量**只有一个消费者**、
+    /// <c>gamma/beta</c> 长度等于最后一维、<c>eps</c> 是标量常量。
+    /// </para>
+    /// </summary>
+    private static int FuseLayerNorm(NetImpl net, Graph graph)
+    {
+        var prog = graph.Prog;
+        if (prog.Count < 9)
+            return 0;
+
+        var producerOf = new Dictionary<int, LayerInfo>();
+        var uses = new Dictionary<int, int>();
+        foreach (var op in prog)
+        {
+            foreach (var arg in op.Outputs)
+            {
+                if (!arg.IsEmpty)
+                    producerOf[arg.Idx] = op;          // 输出 → 生产者
+            }
+
+            foreach (var arg in op.Inputs)
+            {
+                if (arg.IsEmpty)
+                    continue;
+
+                uses[arg.Idx] = uses.TryGetValue(arg.Idx, out int count) ? count + 1 : 1;
+            }
+        }
+
+        int Uses(Arg arg) => arg.IsEmpty ? 0 : uses.GetValueOrDefault(arg.Idx);
+
+        var graphOutputs = CollectOutputs(graph);
+        var replacements = new Dictionary<LayerInfo, LayerInfo>();
+        var drop = new HashSet<LayerInfo>();
+        int fused = 0;
+
+        foreach (var tail in prog)
+        {
+            if (tail.Type != "Add" || tail.Inputs.Count != 2 || tail.Outputs.Count != 1)
+                continue;
+            if (drop.Contains(tail) || graphOutputs.Contains(tail.Outputs[0].Idx))
+                continue;
+
+            int betaSlot = tail.IsConstInput(0) ? 0 : tail.IsConstInput(1) ? 1 : -1;
+            if (betaSlot < 0)
+                continue;
+
+            var beta = tail.Inputs[betaSlot];
+            var mulArg = tail.Inputs[1 - betaSlot];
+            if (!producerOf.TryGetValue(mulArg.Idx, out var mul) || mul.Type != "Mul" || mul.Inputs.Count != 2)
+                continue;
+
+            int gammaSlot = mul.IsConstInput(0) ? 0 : mul.IsConstInput(1) ? 1 : -1;
+            if (gammaSlot < 0)
+                continue;
+
+            var gamma = mul.Inputs[gammaSlot];
+            var divArg = mul.Inputs[1 - gammaSlot];
+            if (!producerOf.TryGetValue(divArg.Idx, out var div) || div.Type != "Div" || div.Inputs.Count != 2)
+                continue;
+
+            var subArg = div.Inputs[0];
+            var sqrtArg = div.Inputs[1];
+            if (!producerOf.TryGetValue(sqrtArg.Idx, out var sqrt) || sqrt.Type != "Sqrt" || sqrt.Inputs.Count != 1)
+                continue;
+            if (!producerOf.TryGetValue(subArg.Idx, out var sub) || sub.Type != "Sub" || sub.Inputs.Count != 2)
+                continue;
+
+            var epsArg = sqrt.Inputs[0];
+            if (!producerOf.TryGetValue(epsArg.Idx, out var epsAdd) || epsAdd.Type != "Add" || epsAdd.Inputs.Count != 2)
+                continue;
+
+            int epsSlot = epsAdd.IsConstInput(0) ? 0 : epsAdd.IsConstInput(1) ? 1 : -1;
+            if (epsSlot < 0)
+                continue;
+
+            var variance = epsAdd.Inputs[1 - epsSlot];
+            if (!producerOf.TryGetValue(variance.Idx, out var varianceMean) || varianceMean.Type != "ReduceMean")
+                continue;
+
+            var powArg = varianceMean.Inputs[0];
+            if (!producerOf.TryGetValue(powArg.Idx, out var pow))
+                continue;
+
+            bool squared = (pow.Type == "Pow" && pow.Inputs.Count == 2 && pow.Inputs[0].Idx == subArg.Idx)
+                        || (pow.Type == "Mul" && pow.Inputs.Count == 2
+                            && pow.Inputs[0].Idx == subArg.Idx && pow.Inputs[1].Idx == subArg.Idx);
+            if (!squared)
+                continue;
+
+            // Sub(x, ReduceMean(x))：确认减的是同一路输入的均值
+            var x = sub.Inputs[0];
+            if (!producerOf.TryGetValue(sub.Inputs[1].Idx, out var xMean) || xMean.Type != "ReduceMean")
+                continue;
+            if (xMean.Inputs[0].Idx != x.Idx)
+                continue;
+
+            // 每个中间张量只能有一个消费者，否则删掉会破坏别的分支
+            if (Uses(mulArg) != 1 || Uses(divArg) != 1 || Uses(sqrtArg) != 1 || Uses(epsArg) != 1 ||
+                Uses(variance) != 1 || Uses(powArg) != 1 || Uses(xMean.Outputs[0]) != 1)
+                continue;
+
+            // gamma/beta 必须是「最后一维」的向量，长度对不上说明不是 LN。
+            // 裁剪过的子图常常没有 value_info，这时退化成「gamma 与 beta 等长」的自洽检查
+            // （LayerNormalization 的输出形状本来就等于输入形状，不依赖这里推出来的形状）。
+            int betaCount = (int)tail.In(betaSlot).Count;
+            int gammaCount = (int)mul.In(gammaSlot).Count;
+            if (betaCount != gammaCount || betaCount < 1)
+                continue;
+
+            if (TryGetOutputShape(net, tail, out var outputShape) && outputShape.Rank >= 1
+                && outputShape.Dims[outputShape.Rank - 1] != betaCount)
+                continue;
+
+            var epsTensor = epsAdd.In(epsSlot);
+            if (epsTensor.Count != 1)
+                continue;
+
+            var parameters = new LayerParams { Type = "LayerNormalization", Name = tail.Name + "/fused" };
+            parameters.Set("axis", -1L);
+            parameters.Set("epsilon", (double)epsTensor.AsSpan<float>()[0]);
+
+            if (LayerRegistry.Create("LayerNormalization", parameters) is not Layer fusedLayer)
+                continue;
+
+            fusedLayer.Inputs.Add(x);
+            fusedLayer.Inputs.Add(gamma);
+            fusedLayer.Inputs.Add(beta);
+            fusedLayer.Outputs.Add(tail.Outputs[0]);
+
+            replacements[tail] = fusedLayer;
+            foreach (var op in new[] { mul, div, sqrt, epsAdd, varianceMean, pow, xMean, sub })
+            {
+                if (op != tail)
+                    drop.Add(op);
+            }
+
             fused++;
         }
 

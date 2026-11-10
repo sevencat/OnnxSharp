@@ -362,7 +362,15 @@ internal static class ShapeOps
 
     // ---------------- Transpose ----------------
 
-    private sealed class TransposeLayer : Layer
+    /// <summary>
+    /// 图融合用：读取 <c>Transpose</c> 的 <c>perm</c>（未指定时为空数组，表示「反转维度」）。
+    /// </summary>
+    internal interface ITransposePerm
+    {
+        int[] Perm { get; }
+    }
+
+    private sealed class TransposeLayer : Layer, ITransposePerm
     {
         private readonly int[] _perm;
 
@@ -372,6 +380,8 @@ internal static class ShapeOps
             Name = parameters.Name;
             _perm = ToInts(parameters.GetInts("perm"));
         }
+
+        public int[] Perm => _perm;
 
         private int[] ResolvePerm(int rank)
         {

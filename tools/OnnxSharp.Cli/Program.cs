@@ -818,7 +818,20 @@ static int Asr(string[] args)
         TokensPath = tokens,
     });
 
-    var result = recognizer.TranscribeWav(wavPath);
+    int repeat = Math.Max(1, (int)options.GetInt("--repeat", 1));
+    RecognitionResult result = null!;
+
+    for (int i = 0; i < repeat; i++)
+    {
+        var watch = Stopwatch.StartNew();
+        result = recognizer.TranscribeWav(wavPath);
+        watch.Stop();
+
+        if (repeat > 1)
+            Console.WriteLine($"iter {i + 1,-2} : {watch.Elapsed.TotalMilliseconds,7:F0} ms" +
+                $"  (feat {result.FeatureMs:F0} / enc {result.EncoderMs:F0}" +
+                $" / dec {result.DecoderMs:F0}; load {result.EncoderLoadMs:F0}+{result.DecoderLoadMs:F0})");
+    }
 
     if (options.Has("--json"))
     {

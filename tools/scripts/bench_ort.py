@@ -44,7 +44,7 @@ def main(model_path: str, decoder_path: str, fixture_dir: str, iters: int) -> No
     full = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     full_ms = bench(lambda: full.run(None, {"speech": feats, "speech_lengths": lengths}), iters)
 
-    # 3) decoder 段（含它内部重跑的 encoder）：fixture 可能放在另一个目录（.tmp/sherpa）
+    # 3) decoder 段（深切版，不含 encoder）：fixture 可能放在另一个目录（.tmp/sherpa）
     def find(name: str) -> str:
         for directory in (fixture_dir, os.path.join(os.path.dirname(fixture_dir.rstrip("\\/")), "sherpa")):
             path = os.path.join(directory, name)
@@ -53,11 +53,18 @@ def main(model_path: str, decoder_path: str, fixture_dir: str, iters: int) -> No
         raise SystemExit(f"fixture {name} not found (looked in {fixture_dir})")
 
     decoder = ort.InferenceSession(decoder_path, providers=["CPUExecutionProvider"])
+    memory = np.fromfile(find("dec2_memory.f32"), dtype=np.float32)
+    enc_u8 = np.fromfile(find("dec2_enc_u8.bin"), dtype=np.uint8)
+    enc_len, dim = enc_u8.size // 320, 320
+
     feeds = {
-        "speech": np.fromfile(find("decoder_speech.f32"), dtype=np.float32).reshape(1, 96, 560),
-        "speech_lengths": np.fromfile(find("decoder_lengths.i32"), dtype=np.int32),
-        "onnx::Slice_6785": np.fromfile(find("decoder_memory.f32"), dtype=np.float32).reshape(1, -1, 320),
-        "max_label_len.28": np.fromfile(find("decoder_max_len.i64"), dtype=np.int64).reshape(()),
+        "speech_lengths": np.fromfile(find("dec2_speech_lengths.i32"), dtype=np.int32),
+        "onnx::Slice_6785": memory.reshape(1, -1, 320),
+        "max_label_len.28": np.fromfile(find("dec2_max_len.i64"), dtype=np.int64).reshape(()),
+        "token_num": np.fromfile(find("dec2_token_num.i32"), dtype=np.int32),
+        "/encoder/after_norm/Add_1_output_0_quantized": enc_u8.reshape(1, enc_len, dim),
+        "/encoder/after_norm/Add_1_output_0_scale": np.fromfile(find("dec2_enc_scale.f32"), dtype=np.float32).reshape(()),
+        "/encoder/after_norm/Add_1_output_0_zero_point": np.fromfile(find("dec2_enc_zp.u8"), dtype=np.uint8).reshape(()),
     }
     decoder_ms = bench(lambda: decoder.run(None, feeds), iters)
 

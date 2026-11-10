@@ -19,11 +19,23 @@ public sealed class ParaformerOptions
 
     public string AlphaOutput { get; init; } = "/predictor/Add_output_0";
 
+    /// <summary>encoder 的量化输出（decoder cross-attention 的 K/V），三个张量一起来。</summary>
+    public string EncoderQuantizedOutput { get; init; } = "/encoder/after_norm/Add_1_output_0_quantized";
+
+    public string EncoderScaleOutput { get; init; } = "/encoder/after_norm/Add_1_output_0_scale";
+
+    public string EncoderZeroPointOutput { get; init; } = "/encoder/after_norm/Add_1_output_0_zero_point";
+
     public string MemoryInput { get; init; } = "onnx::Slice_6785";
 
     public string MaxLabelLengthInput { get; init; } = "max_label_len.28";
 
+    public string TokenNumInput { get; init; } = "token_num";
+
     public string LogitsOutput { get; init; } = "logits";
+
+    /// <summary>图缓存条目上限（按形状特化，不同长度各占一份）。</summary>
+    public int GraphCacheSize { get; init; } = 3;
 }
 
 /// <summary>识别结果。</summary>
@@ -71,6 +83,11 @@ public sealed class ParaformerRecognizer
     private readonly TokenTable _tokens;
     private readonly ContinuousIntegrateAndFire _cif = new();
 
+    // 图按形状特化，所以按 (frames/dim) 缓存；同一实例不保证线程安全，用 _gate 串行化
+    private readonly object _gate = new();
+    private readonly Dictionary<(int Frames, int Dim), Net> _encoders = new();
+    private readonly Dictionary<(int Tokens, int EncFrames, int Dim), Net> _decoders = new();
+
     public ParaformerRecognizer(ParaformerOptions options)
     {
         _options = options;
@@ -100,15 +117,9 @@ public sealed class ParaformerRecognizer
         int frames = features.Frames;
         int dim = features.Dim;
 
-        // ---- 2) encoder：一次拿到 encoder 特征与 CIF 的 alphas
+        // ---- 2) encoder（按形状缓存）：hidden + alphas + 量化输出（decoder 的 cross-attention K/V）
         watch.Restart();
-        var encoder = Net.ReadModel(_options.EncoderPath, new Dictionary<string, int[]>
-        {
-            ["speech"] = [1, frames, dim],
-            ["speech_lengths"] = [1],
-        });
-
-        double encoderLoadMs = watch.Elapsed.TotalMilliseconds;
+        var encoder = GetEncoder(frames, dim, out double encoderLoadMs);
         watch.Restart();
 
         var speech = Tensor.Allocate(new TensorShape(1, frames, dim), DType.F32);
@@ -117,20 +128,42 @@ public sealed class ParaformerRecognizer
         var lengths = Tensor.Allocate(new TensorShape(1), DType.I32);
         lengths.AsSpan<int>()[0] = frames;
 
-        encoder.SetInput("speech", speech);
-        encoder.SetInput("speech_lengths", lengths);
+        float[] hiddenValues;
+        float[] alphaValues;
+        byte[] encQuantized;
+        float encScale;
+        byte encZeroPoint;
+        int hiddenFrames;
+        int hiddenDim;
 
-        var encoderOutputs = encoder.ForwardAll();
-        var hidden = FindOutput(encoder, encoderOutputs, _options.EncoderOutput);
-        var alphas = FindOutput(encoder, encoderOutputs, _options.AlphaOutput);
+        lock (_gate)
+        {
+            encoder.SetInput("speech", speech);
+            encoder.SetInput("speech_lengths", lengths);
+            var outputs = encoder.ForwardAll();
+
+            var hidden = FindOutput(encoder, outputs, _options.EncoderOutput);
+            var alphas = FindOutput(encoder, outputs, _options.AlphaOutput);
+            var quantized = FindOutput(encoder, outputs, _options.EncoderQuantizedOutput);
+            var scale = FindOutput(encoder, outputs, _options.EncoderScaleOutput);
+            var zeroPoint = FindOutput(encoder, outputs, _options.EncoderZeroPointOutput);
+
+            hiddenFrames = hidden.Shape.Dims[1];
+            hiddenDim = hidden.Shape.Dims[2];
+            hiddenValues = hidden.AsSpan<float>().ToArray();
+            alphaValues = alphas.AsSpan<float>().ToArray();
+            encQuantized = quantized.AsSpan<byte>().ToArray();
+            encScale = scale.AsSpan<float>()[0];
+            encZeroPoint = zeroPoint.AsSpan<byte>()[0];
+        }
+
         double encoderMs = watch.Elapsed.TotalMilliseconds;
 
         // ---- 3) CIF（C# 重写，替代图里的 Loop）
         // 注意：encoder 的输出比输入特征**多一帧**（模型在末尾补了一帧），
         // CIF 必须按 encoder 的帧数跑，否则会少触发一个 token。
-        int hiddenDim = hidden.Shape.Dims[2];
-        int encoderFrames = hidden.Shape.Dims[1];
-        var cif = _cif.Process(hidden.AsSpan<float>(), encoderFrames, hiddenDim, alphas.AsSpan<float>());
+        int encoderFrames = hiddenFrames;
+        var cif = _cif.Process(hiddenValues, encoderFrames, hiddenDim, alphaValues);
         int tokenCount = cif.TokenCount;
 
         if (tokenCount <= 0)
@@ -144,19 +177,14 @@ public sealed class ParaformerRecognizer
                 FeatureMs = featureMs,
                 EncoderMs = encoderMs,
                 DecoderMs = 0,
+                EncoderLoadMs = encoderLoadMs,
             };
         }
 
-        // ---- 4) decoder：memory = CIF 的 [1, tokenNum, D]
+        // ---- 4) decoder（深切版：图里不再重跑 encoder，K/V 由 encoder 的量化输出直接喂）
         watch.Restart();
-        var decoder = Net.ReadModel(_options.DecoderPath, new Dictionary<string, int[]>
-        {
-            ["speech"] = [1, frames, dim],
-            ["speech_lengths"] = [1],
-            [_options.MemoryInput] = [1, tokenCount, hiddenDim],
-        });
-
-        double decoderLoadMs = watch.Elapsed.TotalMilliseconds;
+        int encLength = encQuantized.Length / hiddenDim;
+        var decoder = GetDecoder(tokenCount, encLength, hiddenDim, out double decoderLoadMs);
         watch.Restart();
 
         var memory = Tensor.Allocate(new TensorShape(1, tokenCount, hiddenDim), DType.F32);
@@ -165,13 +193,32 @@ public sealed class ParaformerRecognizer
         var maxLength = Tensor.Allocate(TensorShape.Scalar, DType.I64);
         maxLength.AsSpan<long>()[0] = tokenCount;
 
-        decoder.SetInput("speech", speech);
-        decoder.SetInput("speech_lengths", lengths);
-        decoder.SetInput(_options.MemoryInput, memory);
-        decoder.SetInput(_options.MaxLabelLengthInput, maxLength);
+        var tokenNum = Tensor.Allocate(new TensorShape(1), DType.I32);
+        tokenNum.AsSpan<int>()[0] = tokenCount;
 
-        var decoderOutputs = decoder.ForwardAll();
-        var logits = FindOutput(decoder, decoderOutputs, _options.LogitsOutput);
+        var encKv = Tensor.Allocate(new TensorShape(1, encLength, hiddenDim), DType.U8);
+        Buffer.BlockCopy(encQuantized, 0, encKv.Buffer, 0, encQuantized.Length);
+
+        var encScaleTensor = Tensor.Allocate(TensorShape.Scalar, DType.F32);
+        encScaleTensor.AsSpan<float>()[0] = encScale;
+
+        var encZeroPointTensor = Tensor.Allocate(TensorShape.Scalar, DType.U8);
+        encZeroPointTensor.AsSpan<byte>()[0] = encZeroPoint;
+
+        Tensor logits;
+        lock (_gate)
+        {
+            decoder.SetInput("speech_lengths", lengths);
+            decoder.SetInput(_options.MemoryInput, memory);
+            decoder.SetInput(_options.MaxLabelLengthInput, maxLength);
+            decoder.SetInput(_options.TokenNumInput, tokenNum);
+            decoder.SetInput(_options.EncoderQuantizedOutput, encKv);
+            decoder.SetInput(_options.EncoderScaleOutput, encScaleTensor);
+            decoder.SetInput(_options.EncoderZeroPointOutput, encZeroPointTensor);
+
+            logits = FindOutput(decoder, decoder.ForwardAll(), _options.LogitsOutput);
+        }
+
         double decoderMs = watch.Elapsed.TotalMilliseconds;
 
         // ---- 5) argmax + token 解码（去 blank、折叠重复、遇 EOS 停）
@@ -190,6 +237,69 @@ public sealed class ParaformerRecognizer
             EncoderLoadMs = encoderLoadMs,
             DecoderLoadMs = decoderLoadMs,
         };
+    }
+
+    /// <summary>按 (frames, dim) 取 encoder 图；命中缓存时 <paramref name="loadMs"/> 为 0。</summary>
+    private Net GetEncoder(int frames, int dim, out double loadMs)
+    {
+        var key = (frames, dim);
+        lock (_gate)
+        {
+            if (_encoders.TryGetValue(key, out var cached))
+            {
+                loadMs = 0;
+                return cached;
+            }
+        }
+
+        var watch = Stopwatch.StartNew();
+        var net = Net.ReadModel(_options.EncoderPath, new Dictionary<string, int[]>
+        {
+            ["speech"] = [1, frames, dim],
+            ["speech_lengths"] = [1],
+        });
+        loadMs = watch.Elapsed.TotalMilliseconds;
+
+        lock (_gate)
+        {
+            if (_encoders.Count >= Math.Max(1, _options.GraphCacheSize))
+                _encoders.Clear();
+            _encoders[key] = net;
+        }
+
+        return net;
+    }
+
+    /// <summary>按 (token 数, encoder 帧数, 维度) 取 decoder 图。</summary>
+    private Net GetDecoder(int tokens, int encFrames, int dim, out double loadMs)
+    {
+        var key = (tokens, encFrames, dim);
+        lock (_gate)
+        {
+            if (_decoders.TryGetValue(key, out var cached))
+            {
+                loadMs = 0;
+                return cached;
+            }
+        }
+
+        var watch = Stopwatch.StartNew();
+        var net = Net.ReadModel(_options.DecoderPath, new Dictionary<string, int[]>
+        {
+            ["speech_lengths"] = [1],
+            [_options.MemoryInput] = [1, tokens, dim],
+            [_options.EncoderQuantizedOutput] = [1, encFrames, dim],
+        });
+        loadMs = watch.Elapsed.TotalMilliseconds;
+
+        lock (_gate)
+        {
+            if (_decoders.Count >= Math.Max(1, _options.GraphCacheSize))
+                _decoders.Clear();
+            _decoders[key] = net;
+        }
+
+        return net;
     }
 
     private static Tensor FindOutput(Net net, List<Tensor> outputs, string name)

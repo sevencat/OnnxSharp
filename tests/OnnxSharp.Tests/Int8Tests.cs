@@ -15,6 +15,7 @@ internal static class Int8Tests
         yield return new("int8: vnni and scalar paths agree bit-exactly", TierPathsAgree);
         yield return new("int8: signed weights pack and multiply", SignedWeights);
         yield return new("int8: dequant-weight gemm matches the reference", DequantGemmMatchesReference);
+        yield return new("int8: F32 substitute stays exact at k=1280", F32SubstituteExactAtLongK);
         yield return new("int8: dequant-weight gemm vs fp32 gemm throughput", DequantGemmThroughput);
         yield return new("int8: reports the selected kernel tier", TierReported);
     }
@@ -144,6 +145,63 @@ internal static class Int8Tests
                 Assert.Equal((int)expected, actual[row * n + col], $"[{row},{col}]");
             }
         }
+    }
+
+    private static void F32SubstituteExactAtLongK()
+    {
+        // 无 VNNI 时 MatMulInteger 走「int8 展开成 F32 再 GEMM」，有 VNNI 时走整数内核。
+        // 两条路必须给出同样的 int32 —— 这里用 k=1280（最长的 FFN 层）压一下：
+        // 反量化后的因子是小整数、正负相消，和远小于 2^24，所以 F32 累加应当精确。
+        const int m = 4, k = 1280, n = 32;
+        var random = new Random(2026);
+
+        var a = new byte[m * k];
+        random.NextBytes(a);
+        var b = new sbyte[k * n];
+        for (int i = 0; i < b.Length; i++)
+            b[i] = (sbyte)(random.Next(256) - 128);
+
+        const int aZero = 121;
+        var bZero = new int[n];
+        for (int column = 0; column < n; column++)
+            bZero[column] = random.Next(-20, 20);
+
+        var actual = new int[m * n];
+        Int8F32Gemm.MultiplyInteger(
+            DequantizeActivation(a, m, k, aZero),
+            DequantizeWeights(b, k, n, bZero),
+            actual, m, k, n);
+
+        int worst = 0;
+        for (int row = 0; row < m; row++)
+        {
+            for (int column = 0; column < n; column++)
+            {
+                long sum = 0;
+                for (int kk = 0; kk < k; kk++)
+                    sum += (long)(a[row * k + kk] - aZero) * (b[kk * n + column] - bZero[column]);
+
+                int diff = (int)Math.Abs(sum - actual[row * n + column]);
+                worst = Math.Max(worst, diff);
+            }
+        }
+
+        Console.WriteLine($"        int8 F32 substitute vs exact integer (k=1280): max |diff| = {worst}");
+        Assert.Equal(0, worst, "F32 substitute must reproduce the exact integer product");
+    }
+
+    private static float[] DequantizeActivation(byte[] source, int rows, int columns, int zeroPoint)
+    {
+        var result = new float[rows * columns];
+        Int8F32Gemm.WidenActivation(source, result, zeroPoint);
+        return result;
+    }
+
+    private static float[] DequantizeWeights(sbyte[] source, int rows, int columns, int[] zeroPoints)
+    {
+        var result = new float[rows * columns];
+        Int8F32Gemm.WidenWeights(source, result, rows, columns, zeroPoints);
+        return result;
     }
 
     private static void DequantGemmMatchesReference()

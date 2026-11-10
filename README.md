@@ -67,7 +67,7 @@
 | 依赖 | 零第三方包（不引用 `Google.Protobuf`、`Microsoft.ML.OnnxRuntime`），全部手写 |
 | 目标框架 | `net8.0` / `net10.0`，AOT 友好（不用反射、不用 `dynamic`） |
 | 算子 | 76 个注册算子，覆盖 YOLO11/v8、RF-DETR、PP-OCRv6 与 sherpa Paraformer 的 encoder 段导出图（清单见 [支持算子](#支持算子)） |
-| 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链等） |
+| 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链、`MatMul+ArgMax`、手写 LayerNorm→`LayerNormalization`、`DQL+MatMulInteger+Cast+Mul+Add`→`DynamicQuantizeMatMul`、整条 multi-head attention→`FusedAttention`）、按输入 shape 签名缓存形状/类型推断 |
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
 | 线程 | 默认 `Environment.ProcessorCount`，可用环境变量 `ONNXSHARP_THREADS` 覆盖 |
 | 视觉门面 | `OnnxSharp.Vision`：letterbox / stretch 预处理、YOLO 解码 + NMS、RF-DETR 解码，返回**原图坐标**的框 |
@@ -461,7 +461,7 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 
 ### 支持算子
 
-76 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` / `MatMulArgMax` 是图融合的产物）：
+76 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` / `MatMulArgMax` / `DynamicQuantizeMatMul` / `FusedAttention` 是图融合的产物）：
 
 | 类别 | 算子 |
 |---|---|
@@ -508,9 +508,11 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | + `Pow(x,2)` 改写成 `Mul`（占 12% → 0.1%） | 443 ms |
 | + 「每段一个标量」广播快路径（`EwInner` 思路） | 171 ms |
 | + 1-D `Conv` 向量化 + `DynamicQuantizeLinear` 的 min/max 向量化 | **104 ms（累计 104×）** |
-| ONNXRuntime（同一切图，MLAS int8 + VNNI） | 30.9 ms |
+| ONNXRuntime（同一切图；ORT 把 `DynamicQuantizeLinear + MatMulInteger` 融成 `DynamicQuantizeMatMul`） | 30.9 ms |
 
-即：**量化图的正确性 + 可用的吞吐都有了**，剩下的 5.5× 差距主要来自 ORT 的 VNNI 整数内核。
+即：**量化图的正确性 + 可用的吞吐都有了**。剩下的差距**不是 VNNI**（本机两台实现都没有 VNNI）——
+用 ORT 自己的 profiler 看，它把 `DQL + MatMulInteger`（以及手写 LayerNorm）都融成了单 kernel，
+少了 u8/int32 的物化与多趟内存访问；我们目前是 3~5 个独立算子 + 独立的 F32 展开。
 
 ### 语音前端（fbank → LFR → CMVN）
 
@@ -563,7 +565,7 @@ OnnxSharp.Cli features sherpa\model.int8.onnx test.wav --out feats.f32
 | PP-OCRv6 tiny（det / rec / cls） | det 与 rec 的**原始输出**与 ONNXRuntime 对齐（64² + 960² 输入：max\|diff\| 1.4e-7 / 7.6e-6）；900×300 合成图两行文字全对（`Hello OnnxSharp 123` 0.957、`第二行文字 PaddleOCR` 0.982） |
 | 单算子微模型 | GEMM / attention / 逐元素链，用于内核定点调优 |
 | sherpa Paraformer encoder + CIF（int8） | 用手写脚本把 `model.int8.onnx` 在第一个 `Loop`（CIF）前切开，5715 节点的 encoder 子图**直接跑通**（`speech[1,96,560]` → `[1,97,320]`，**104 ms/帧**；同图 ORT 30.9 ms）；`DynamicQuantizeLinear` + `MatMulInteger`(+s8 权重、per-column 零点) 与 ONNXRuntime **逐位一致**（max\|diff\| = 0）。CIF 用 `Speech/Paraformer/ContinuousIntegrateAndFire` 重写（绕开 `Loop`/`Sequence*`），与 ORT 录的 `frames`/`fires`/`frame.7`/`integrate.7` **逐位一致**，token 数 21 = ORT 21 |
-| **Paraformer 端到端（中文）** | Windows 自带的 Microsoft Huihui 合成 4.54 s 中文 wav → 76 帧特征 → 16 个 token → **「今天气真不错我们出去走一走吧」**，与 ORT 全模型参考文本**逐字一致**；整链纯 C#（fbank/LFR/CMVN + encoder + CIF + decoder + token 解码） |
+| **Paraformer 端到端（中文）** | Windows 自带的 Microsoft Huihui 合成 4.54 s 中文 wav → 76 帧特征 → 16 个 token → **「今天气真不错我们出去走一走吧」**，与 ORT 全模型参考文本**逐字一致**；整链纯 C#。**热态 81~87 ms**（feat 4~7 / encoder 62~69 / decoder 14~15），冷启动 ~1.1 s；同机 ONNXRuntime 55.6 ms（**~1.5×**） |
 
 ### 限制
 
@@ -689,7 +691,7 @@ A few conventions follow from that:
 | Dependencies | None — protobuf reader, kernels and runtime are all hand-written |
 | Targets | `net8.0` / `net10.0`, AOT-friendly (no reflection, no `dynamic`) |
 | Operators | 76 registered ops, covering YOLO11/v8, RF-DETR, PP-OCRv6 and the encoder part of sherpa Paraformer exports |
-| Graph passes | Constant folding (Shape→Gather→Concat→Reshape chains), operator fusion |
+| Graph passes | Constant folding (Shape→Gather→Concat→Reshape chains), operator fusion (Conv+SiLU, element-wise chains, `MatMul`+`ArgMax`, manual LayerNorm → `LayerNormalization`) |
 | Runtime | Static buffer pool (outputs detach), shape inference, `Parallel.For` + AVX2/AVX-512 |
 | Threads | `Environment.ProcessorCount` by default, overridable via `ONNXSHARP_THREADS` |
 | Vision | `OnnxSharp.Vision`: letterbox / stretch preprocessing, YOLO decode + NMS, RF-DETR decode |
@@ -952,9 +954,20 @@ The Paraformer encoder sub-graph measured (`speech[1,96,560]`, 97 frames):
 | + `Pow(x,2)` rewritten as `Mul` (12% → 0.1%) | 443 ms |
 | + per-run scalar broadcast fast path (`EwInner` idea) | 171 ms |
 | + vectorised 1-D `Conv` and `DynamicQuantizeLinear` min/max | **104 ms (104× overall)** |
-| ONNXRuntime (same split graph, MLAS int8 + VNNI) | 30.9 ms |
+| ONNXRuntime (same split graph) | 30.9 ms |
 
-So quantized graphs are both correct and usable; the remaining 3.4× gap is ORT's VNNI integer kernels.
+Later work, measured on the 76-frame end-to-end fixture (`profile` sum-of-min, so it is comparable across
+runs even on a loaded machine): the per-op shape/type inference cache took the encoder from 51.8 ms to
+~48 ms, `DynamicQuantizeMatMul` (the `DQL → MatMulInteger → Cast → Mul → Add` chain folded into one layer)
+brought it to 51.8 → 47.5 ms, and `FuseAttention` (40 self-attention blocks folded into one layer each,
+killing 40 `Softmax`/80 `MatMul`/the `[B,H,T,T]` scores tensors) took the last **−4 ms (−8%)**. ORT needs
+39 ms on the same encoder, so what is left is the `DynamicQuantizeMatMul` GEMMs themselves (66% of our
+time) — i.e. an int8 kernel, not more fusion.
+
+So quantized graphs are both correct and usable. The remaining gap is **not VNNI** — neither implementation
+gets VNNI on this machine. ORT's own profiler shows it fuses `DQL + MatMulInteger` (and the manual LayerNorm)
+into single kernels; we now do the same fusion (`DynamicQuantizeMatMul`), and what is left is that ORT's
+`DynamicQuantizeMatMul` also picks an int8 kernel when the CPU has one (we get the F32-GEMM substitute).
 
 ### Speech (Paraformer, pure C#)
 

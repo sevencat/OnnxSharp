@@ -44,6 +44,9 @@ internal static class Interpreter
 
         foreach (var op in graph.Prog)
         {
+            if (op is not Layer layer)
+                throw new OnnxSharpException($"op '{op.Name}' ({op.Type}) has no executor");
+
             inpMats.Clear();
             inpShapes.Clear();
             inpTypes.Clear();
@@ -60,29 +63,52 @@ internal static class Interpreter
 
             if (!op.DynamicOutputShapes())
             {
-                outShapes.Clear();
-                tempShapes.Clear();
-                op.GetMemoryShapes(inpShapes, op.Outputs.Count, outShapes, tempShapes);
+                bool cacheHit = layer.ShapeCacheValid
+                    && SameShapes(layer.CachedInShapes, inpShapes)
+                    && SameTypes(layer.CachedInTypes, inpTypes);
 
-                if (outShapes.Count != op.Outputs.Count)
-                    throw new OnnxSharpException(
-                        $"op '{op.Name}' ({op.Type}) produced {outShapes.Count} output shapes, {op.Outputs.Count} expected");
+                if (cacheHit)
+                {
+                    outs = BindAll(net, op, layer.CachedOutShapes, layer.CachedOutTypes, ref outMats);
+                    temps = net.FitTemps(layer.CachedTempShapes, layer.CachedTempTypes);
+                }
+                else
+                {
+                    outShapes.Clear();
+                    tempShapes.Clear();
+                    op.GetMemoryShapes(inpShapes, op.Outputs.Count, outShapes, tempShapes);
 
-                outTypes.Clear();
-                tempTypes.Clear();
-                op.GetTypes(inpTypes, op.Outputs.Count, tempShapes.Count, outTypes, tempTypes);
+                    if (outShapes.Count != op.Outputs.Count)
+                        throw new OnnxSharpException(
+                            $"op '{op.Name}' ({op.Type}) produced {outShapes.Count} output shapes, {op.Outputs.Count} expected");
 
-                if (outTypes.Count != op.Outputs.Count || tempTypes.Count != tempShapes.Count)
-                    throw new OnnxSharpException(
-                        $"op '{op.Name}' ({op.Type}) produced mismatched types " +
-                        $"({outTypes.Count} outputs, {tempTypes.Count} temps)");
+                    outTypes.Clear();
+                    tempTypes.Clear();
+                    op.GetTypes(inpTypes, op.Outputs.Count, tempShapes.Count, outTypes, tempTypes);
 
-                outMats.Clear();
-                for (int i = 0; i < op.Outputs.Count; i++)
-                    outMats.Add(net.BindArgTensor(op.Outputs[i], outShapes[i], outTypes[i]));
+                    if (outTypes.Count != op.Outputs.Count || tempTypes.Count != tempShapes.Count)
+                        throw new OnnxSharpException(
+                            $"op '{op.Name}' ({op.Type}) produced mismatched types " +
+                            $"({outTypes.Count} outputs, {tempTypes.Count} temps)");
 
-                temps = net.FitTemps(tempShapes, tempTypes);
-                outs = outMats;
+                    // 存成缓存副本（形状推断第二次调用会改写 outShapes 等列表）
+                    layer.CachedInShapes.Clear();
+                    layer.CachedInShapes.AddRange(inpShapes);
+                    layer.CachedInTypes.Clear();
+                    layer.CachedInTypes.AddRange(inpTypes);
+                    layer.CachedOutShapes.Clear();
+                    layer.CachedOutShapes.AddRange(outShapes);
+                    layer.CachedTempShapes.Clear();
+                    layer.CachedTempShapes.AddRange(tempShapes);
+                    layer.CachedOutTypes.Clear();
+                    layer.CachedOutTypes.AddRange(outTypes);
+                    layer.CachedTempTypes.Clear();
+                    layer.CachedTempTypes.AddRange(tempTypes);
+                    layer.ShapeCacheValid = true;
+
+                    outs = BindAll(net, op, outShapes, outTypes, ref outMats);
+                    temps = net.FitTemps(tempShapes, tempTypes);
+                }
             }
             else
             {
@@ -94,9 +120,6 @@ internal static class Interpreter
                 temps = NoTemps;
                 outs = dynamicOut;
             }
-
-            if (op is not Layer layer)
-                throw new OnnxSharpException($"op '{op.Name}' ({op.Type}) has no executor");
 
             if (!executeLayers)
             {
@@ -176,6 +199,21 @@ internal static class Interpreter
                 }
             }
         }
+    }
+
+    /// <summary>按缓存的形状/类型把输出 Arg 绑到缓冲区（复用 <paramref name="buffer"/>）。</summary>
+    private static List<Tensor> BindAll(
+        NetImpl net,
+        LayerInfo op,
+        List<TensorShape> shapes,
+        List<DType> types,
+        ref List<Tensor> buffer)
+    {
+        buffer.Clear();
+        for (int i = 0; i < op.Outputs.Count; i++)
+            buffer.Add(net.BindArgTensor(op.Outputs[i], shapes[i], types[i]));
+
+        return buffer;
     }
 
     private static bool SameShapes(List<TensorShape> a, List<TensorShape> b)

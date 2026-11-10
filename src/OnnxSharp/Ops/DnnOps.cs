@@ -1278,7 +1278,13 @@ internal static class DnnOps
 
     // ---------------- Softmax ----------------
 
-    private sealed class SoftmaxLayer : Layer
+    /// <summary>图融合用：读取 <c>Softmax</c> 的原始 <c>axis</c>（可能为负）。</summary>
+    internal interface ISoftmaxAxis
+    {
+        long Axis { get; }
+    }
+
+    private sealed class SoftmaxLayer : Layer, ISoftmaxAxis
     {
         private readonly long _axis;
 
@@ -1288,6 +1294,8 @@ internal static class DnnOps
             Name = parameters.Name;
             _axis = parameters.GetInt("axis", -1);
         }
+
+        public long Axis => _axis;
 
         public override void GetMemoryShapes(
             IReadOnlyList<TensorShape> inShapes,

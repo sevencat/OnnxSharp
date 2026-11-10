@@ -11,15 +11,32 @@ import sys
 import onnx
 from onnx import TensorProto, helper
 
+# 只保留真正要用的输出：`token_num` 由 C# 的 CIF 给出，若保留它会把 alphas/encoder 支路整个拉回来
+KEEP_OUTPUTS = ["logits"]
+
 CONTROL_OPS = {"Loop", "If", "Scan", "SequenceEmpty", "SequenceInsert", "SequenceAt",
                "SequenceConstruct", "ConcatFromSequence", "SplitToSequence", "SequenceLength"}
 
-# 提升成图输入的 loop 输出：名字 → (ONNX 类型, 形状)。max_label_len 是 int64 标量（会被当作 Slice 的 starts），
-# memory 是 [1, token_num, 320]（token_num 用符号维，运行时由 --shape 特化）。
+# 提升成图输入的张量：名字 → (ONNX 类型, 形状)。
+#   max_label_len.28 / onnx::Slice_6785 / token_num 来自 CIF 那个 Loop（由 C# 的 CIF 提供）；
+#   后面三个是 **encoder 的量化输出**（decoder 的 cross-attention K/V 用它），
+#   由 encoder 图直接吐出来，这样 decoder 图里就不用再跑一遍 encoder。
 PROMOTED = {
     "max_label_len.28": (TensorProto.INT64, []),
     "onnx::Slice_6785": (TensorProto.FLOAT, [1, "max_len", 320]),
+    "token_num": (TensorProto.INT32, [1]),
+    "/encoder/after_norm/Add_1_output_0_quantized": (TensorProto.UINT8, [1, "enc_len", 320]),
+    "/encoder/after_norm/Add_1_output_0_scale": (TensorProto.FLOAT, []),
+    "/encoder/after_norm/Add_1_output_0_zero_point": (TensorProto.UINT8, []),
 }
+
+# 这些名字不一定出现在 Loop 的输出里，但同样要提升成图输入
+EXTRA_INPUTS = [
+    "token_num",
+    "/encoder/after_norm/Add_1_output_0_quantized",
+    "/encoder/after_norm/Add_1_output_0_scale",
+    "/encoder/after_norm/Add_1_output_0_zero_point",
+]
 
 
 def main(path_in: str, path_out: str) -> None:
@@ -32,15 +49,18 @@ def main(path_in: str, path_out: str) -> None:
 
     # CIF loop 的输出 → 输入（memory / max_label_len 由 C# 提供）
     decoder_loop = loops[1]
-    promoted = [name for name in decoder_loop.output if name]
-    print(f"promoting loop outputs to inputs: {promoted}")
-
+    promoted = [name for name in decoder_loop.output if name] + EXTRA_INPUTS
+    print(f"promoting to inputs: {promoted}")
     producer = {out: node for node in graph.node for out in node.output}
-    outputs = {o.name for o in graph.output}
+    outputs = [o for o in graph.output if o.name in KEEP_OUTPUTS]
+    if not outputs:
+        raise SystemExit(f"none of {KEEP_OUTPUTS} is a graph output")
+    print(f"keeping outputs: {[o.name for o in outputs]}")
 
-    # 剪枝：从图输出反向可达，跳过控制流节点
+    # 剪枝：从图输出反向可达，跳过控制流节点与被提升的张量（后者的生产者整棵子树都可以丢掉）
+    stop = CONTROL_OPS | set(EXTRA_INPUTS)
     needed = {}
-    stack = list(outputs)
+    stack = [o.name for o in outputs]
     seen = set()
     while stack:
         name = stack.pop()
@@ -49,7 +69,7 @@ def main(path_in: str, path_out: str) -> None:
         seen.add(name)
 
         node = producer.get(name)
-        if node is None or node.op_type in CONTROL_OPS:
+        if node is None or node.op_type in CONTROL_OPS or name in EXTRA_INPUTS:
             continue
 
         needed[node.name] = node
@@ -71,7 +91,7 @@ def main(path_in: str, path_out: str) -> None:
         inputs.append(helper.make_tensor_value_info(name, dtype, dims))
 
     new_graph = helper.make_graph(
-        kept_nodes, "decoder", inputs, list(graph.output), initializers)
+        kept_nodes, "decoder", inputs, outputs, initializers)
 
     new_model = helper.make_model(new_graph, opset_imports=model.opset_import, producer_name="onnxsharp-split")
     new_model.ir_version = 10

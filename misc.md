@@ -695,6 +695,178 @@ Tile TopK Transpose Unsqueeze Where
     编解码要额外引 `Sdcb.SimdCodecs.Jpeg / Png / Bmp` 并在 `ImageHost.RegisterCodecs()` 里显式注册；
     没注册的格式调用时抛 `FeatureNotSupportedException`。产品库 `OnnxSharp` 一行都不引 —— 它只吃像素。
 
+### 6.19 `FuseAttention`：整条 multi-head attention 折成一层（2026-11-11 傍晚）
+
+**先说结论**：融合干净、数值也对（静态夹具 max|diff| = 1.8e-7，动态 encoder 与 ORT 的 diff 与融合前
+完全一致），但**收益只有 −8%（51.8 → 47.5 ms 的 encoder sum-of-min），不是预估的 20~30%**。
+原因在 profile 里一眼可见：attention 那一整段（`MatMul` 6.8 + `Softmax` 0.9 + 掩码 `Add` ~1.5 +
+`Transpose/Reshape` ~1.4）本来就只有 ~11 ms，占 84 ms 的 13%；而 **66% 的时间是
+`DynamicQuantizeMatMul` 的 GEMM 本身**，那是融合碰不到的部分（要 int8 内核才降）。
+
+#### 匹配到的结构（Paraformer SANM 自注意力）
+
+```
+Split → q,k,v [B,T,320]
+q → Reshape[B,T,H,D] → Transpose[0,2,1,3] → Mul(·, 1/√D) ─┐
+k → Reshape[B,T,H,D] → Transpose[0,2,3,1] ────────────────┼→ MatMul → Add(mask) → Softmax(-1)
+v → Mul(mask) → Transpose[0,2,1] → … → Transpose[0,2,1,3] ─┘
+                                     → MatMul(·, Vh) → Transpose[0,2,1,3] → Reshape[B,T,320]
+```
+
+- 判据：`Perm` 精确等于 `[0,2,1,3]` / `[0,2,3,1]`（`Transpose` 加了 `ITransposePerm` 内部接口读属性，
+  沿用 `ILastAxisArgMax` 的做法）、`Softmax` 的 `axis` 是 -1 或 rank-1（`ISoftmaxAxis`）、
+  每个中间张量单消费者、scale 是标量常量、mask 在 `Add` 的另一路。
+- **两种形态**（这是本次最费时间的坑）：
+  - 静态形状：`Reshape` 目标是常量 ⇒ head 数从 value_info 读得出来 ⇒ 融合层吃 3 维 `[B,T,C]`，
+    连 3 个 `Reshape+Transpose` 和输出的 `Transpose+Reshape` 一起折掉。
+  - 动态形状（Paraformer 用的这条）：`Reshape` 目标由 `Shape→Gather→Concat` 建出来，head 数读不出来；
+    而且 **输出的 `Transpose` 有 3 个消费者**（`Shape_6`、`Shape_7` 在给它算 Reshape 目标）⇒ 不能删。
+    于是融合层吃 head 空间的 `Qh[B,H,T,D]`/`Kt[B,H,D,T]`/`Vh[B,H,T,D]`（H/D 由形状给出），
+    输出 `[B,H,T,D]`，`Transpose+Reshape` 原样保留。**如果只按「单消费者」硬判，Paraformer 一块都融合不了。**
+
+#### 内核（`Ops/AttentionOps.cs`）
+
+K 先按 head 打包成 `[B,H,T,D]`（原布局是 `[B,H,D,T]`，对点积不友好），然后**按行并行**
+（`B·H·T` 个任务，`ParallelRange.For` 分块、每块租 3 个缓冲）：一行 = `scale·q`（预乘，和图上
+`Mul(Qh, 1/√D)` 的舍入一致）→ `T` 次 AVX/FMA 点积 → `+mask` → `VectorMath.SoftmaxRow`（与 `Softmax`
+算子同一份内核，结果与原来逐位一致）→ `T` 次 `axpy` 累加 `P[j]·V[j]`。全程不物化
+`[B,H,T,T]` 的 scores（每块 46k 元素）。
+
+#### 踩的坑
+
+1. **`drop` 和 `replacements` 的顺序**：我把 `softmax` 同时放进了 `drop` 和 `replacements`，而
+   `result` 循环里先判 `drop` ⇒ 融合层根本没进图。报错却出现在下游：
+   `Transpose: perm has 4 entries, rank is 0`（它的输入张量没人产出）。已改成**先查替换表**。
+2. **输出 Arg 写错**：`foldOutput = false` 时融合层要产出**输出 Transpose 的输入**（`pv` 的输出），
+   我一开始写成了 Transpose 的输出 ⇒ 同一个 rank 0 报错。
+3. **`Span`/固定指针都不能进 lambda**（CS1764）：先把 `fixed` 指针对拷成普通局部 `float*` 再捕获。
+4. 动态 `Reshape` 的 `Shape` 链（见上面「两种形态」）——这是「单消费者」判据在真实图上失效的那一条。
+
+#### 结果
+
+| 指标 | 融合前 | 融合后 |
+|---|---|---|
+| encoder `profile` sum-of-min | 51.8 ms | **44.8~47.5 ms（−8~14%）** |
+| 算子数 | 2410 | 2244 |
+| `Softmax` / `MatMul` | 40 / 81 | **0 / 1** |
+| 掩码 `Add` | 202 | 162（40 个掩码加法折进融合层） |
+| `FusedAttention` | — | 40 个，5.2 ms |
+| 剩余大头 | `DynamicQuantizeMatMul` 66% | **74.3%（33.3 ms）**——融合碰不到的部分 |
+| 端到端（`asr --repeat` 的 min） | 81 ms（enc 62） | **73~84 ms（enc 50~60）** |
+| 与 ORT 的 encoder diff | mean 8.22e-4 / max 9.25e-2 | **完全一致** |
+
+新增夹具 `tools/scripts/make_attention_model.py`（静态形状的标准 MHA + ORT 参考输出）与
+`AttentionTests`（`max|diff| = 1.8e-7`，并断言 `Softmax`/`Transpose`/`Reshape` 全被折掉），
+两条形态各有覆盖：静态形状走 `AttentionTests`，动态 head-split 走 `AsrEncoderTests`/`AsrEndToEndTests`。
+
+### 6.18 对齐 ORT 的融合 + 去掉逐算子固定开销（2026-11-11 下午）
+
+这一轮把 6.17 里「下一步该做的两件事」都做完了，**并推翻了 6.17 的一个结论**（见文末「更正」）。
+
+- **① 按输入签名缓存形状/类型推断**（`Interpreter` + `LayerInfo`）：
+  每帧每个算子都会调 `GetMemoryShapes/GetTypes`，而 ASR/YOLO 这类图每帧输入形状完全一样。
+  现在把结果按「输入 shape + type 签名」存在 `LayerInfo`（`ShapeCacheValid` / `Cached*`），
+  命中就直接 `BindAll` 复用，连 `TensorShape`/`int[]` 的分配都省掉。
+  encoder **~103 → 86 ms**（原本 layer 时间之和 67 ms、总 91 ms，那 ~24 ms 的差就是它）。
+- **② `DynamicQuantizeMatMul` 融合**（`GraphFusion.FuseQuantizedMatMul` + `Ops/QuantizedMatMulOps.cs`）：
+  把 `DQL → MatMulInteger → Cast → Mul(a_scale·w_scale) → [Add(bias)]` 折成一层。
+  A 只过两趟内存（min/max、边量化边展开成 F32，**不物化 u8**），GEMM 后在一个 epilogue 里
+  乘 `a_scale * w_scale[col]`、加 bias。encoder 上的效果：`DQL` 161→1、`Cast` 170→10、
+  `Mul` 526→125、`Add` 524→202，`MatMulInteger` 38.0 ms + `DQL` 8.0 ms → 融合层 33.9 ms。
+  数值与原链**逐位一致**（整数累加在 F32 里精确，乘加顺序照抄图里的顺序），
+  ASR 文本与 `quant: quantized graph matches onnxruntime` 用例都不变。
+  - 坑 A：权重是 **per-channel 量化**的 —— `onnx::MatMul_8982_scale` 是 `(960,)` 向量、
+    `zero_point` 也是 `(960,)`，不是标量。第一版按标量写死在参数里，epilogue 直接算错；
+    改成「scale 走图输入、长度 == N 就按列、长度 == 1 就当标量」。
+  - 坑 B：`a_scale` 只喂那个「组合 scale」的 `Mul`、组合 scale 只喂一次 —— 这两条必须查，
+    否则会拆掉别的消费者。
+- **③ 修 `producerOf`**：`FuseLayerNorm` / `FuseQuantizedMatMul` 里「生产者表」当时是用
+  `op.Inputs` 建的（那是消费者表），所以永远查不到真正的生产者；改成用 `op.Outputs` 后
+  `FuseLayerNorm` 从 **1/81** 变成 **81/81**（`ReduceMean`/`Sqrt`/`Div` 全部消失）。
+  另外它原来要求中间 `Add` 有 value_info 才能校验通道数，裁剪过的子图没有 —— 退化成
+  「`gamma` 与 `beta` 等长」的自洽检查就够了（`LayerNormalization` 的输出形状本来就等于输入形状）。
+- **顺手修的构建问题**：`Kernels/Int8Gemm.cs` 用了 `AvxVnni`（CA2252 预览 API），
+  **net8.0 目标一直编不过**（之前用 `Select-String 'error CS'` 过滤，漏掉了 `error CA2252`）；
+  加文件级 `#pragma warning disable CA2252`（本来就有运行期 `IsSupported` 守卫）。
+  `MatMulArgMaxKernel` 的 `stackalloc` 原本在循环里（CA2014），移到循环外。
+  现在 `dotnet build` 双目标 **0 错 0 警**。
+
+#### 更正（6.17 的两处错误结论）
+
+| 6.17 的说法 | 实测 |
+|---|---|
+| `FuseLayerNorm` 让 encoder 177 → 115 ms（−35%） | **当时一次都没融合成功**（`producerOf` 建错表 + value_info 条件）。那 62 ms 的落差是机器负载波动。修好后 81/81 全融合，收益约 5~8 ms |
+| 「下一步：降 per-op 固定开销，预计省 10~15 ms」 | 实测省 **~17 ms**（103 → 86），估计略保守 |
+
+#### 最终性能（同一台机、同一时段背靠背，min 值）
+
+| 阶段 | 6.17 | 现在 | ORT | 现在 vs ORT |
+|---|---|---|---|---|
+| fbank+LFR+CMVN | 8 ms | 4~7 ms | 8.3 ms | **≈1.0×** |
+| encoder 段（76 帧） | 103~115 ms | **62~86 ms** | 39 ms | 1.6~2.2× |
+| decoder 段（深切） | 21 ms | **14~21 ms** | 6.4 ms | 2.2~3.3× |
+| **整句（热态）** | **136 ms** | **81~87 ms** | **55.6 ms** | **~1.5×** |
+
+演进：559 → 182 → 136 → **81 ms**（本机同时跑着 4 个 VS Code 进程，数字取多次 `--repeat` 的 min）。
+
+### 6.17 ASR 端到端性能收尾与 LayerNorm 融合（2026-11-11 上午）
+
+- **decoder 深切**：decoder 的 cross-attention K/V 其实是 **encoder 的量化输出**
+  （`/encoder/after_norm/Add_1_output_0_{quantized,scale,zero_point}`），把这三个张量 + `token_num`
+  提升成图输入后，decoder 图 **7828 → 2076 节点**，不再重跑 encoder。ORT 验证与全模型 `logits`
+  **逐位一致**（`max|d| = 0`）。
+  - 坑：一开始只提升 loop 的输出，图仍是 7827 节点 —— 因为 **`token_num` 也是 decoder 的输入**
+    （它给 `make_pad_mask` 用），保留 `token_num` 输出会把 alphas/encoder 支路整棵拉回来。
+- **图缓存**：`ParaformerRecognizer` 按 `(frames, dim)` / `(tokens, encFrames, dim)` 缓存 `Net`
+  （形状特化发生在 `ReadModel`，所以不同长度必须各存一份），并用一把锁串行化 `SetInput+ForwardAll`。
+  冷启动 1.7 s → 995 ms，热态不再重载。
+- **`FuseLayerNorm`（学 SimdOnnx）**：手写 LayerNorm（9 个算子：
+  `ReduceMean/Sub/Pow/ReduceMean/Add/Sqrt/Div/Mul/Add`）折成单层 `LayerNormalization`。
+  ASR 文本不变。
+  - ⚠️ **更正（见 §6.18）**：这一轮它其实**一次都没融合成功**（`producerOf` 用 `Inputs` 建表），
+    当时记的「encoder 177 → 115 ms（−35%）」是机器负载波动；修好后 81/81 全融合，收益约 5~8 ms。
+  - 匹配要点：每个中间张量单消费者、`gamma/beta` 长度 == 最后一维、`eps` 是标量常量、
+    `Div(Sub, Sqrt)` 的方向、以及 `Pow(x,2)` 与 `Mul(x,x)` 两种平方写法都要认。
+- **int8 两条路径一致性**：新增用例在 `k = 1280`（最长 FFN 层）上验证
+  「F32 展开替代」与精确整数乘 **max|diff| = 0** —— 这样 VNNI 机器切到整数内核时结果不变。
+
+#### SimdOnnx 的 14 个融合 pass vs 我们（2026-11-11 调研）
+
+| SimdOnnx | 我们的状态 | 备注 |
+|---|---|---|
+| `FuseLayerNorm` | ✅ 已实现（§6.18 修好后 81/81 全融合） | 收益约 5~8 ms（6.17 记的 −35% 已更正） |
+| `FuseBiasAdd`（Conv/MatMul + Add(bias) 折进权重） | ❌ 未做 | 我们的卷积已带 bias；MatMul+Add 可考虑并入 `MatMulArgMax` 或 `Gemm` |
+| `FuseAttention`（QKV→softmax→输出整链） | ❌ 未做 | 收益最大但工作量也最大（我们的 encoder 有 52 个 Softmax/106 个 MatMul） |
+| `FuseGelu` / `FuseGatedAct`（SwiGLU） | ❌ 未做 | ASR 模型里没有；LLM 才用得上 |
+| `FuseConvResidual` / `FuseResizeAdd` / `FuseChannelGate` / `FuseScaledTanh` / `FuseSpaceToDepth` / `FuseConvTBias` | ❌ 未做 | 都是 CV 专用模式，我们的 YOLO/RF-DETR 里暂未出现 |
+| `FuseMemory`（Conv→MaxPool 共享缓冲） | ❌ 未做 | 我们有缓冲池，收益不如他们明显 |
+| 死节点消除 / 零拷贝视图 | ❌ 未做显式 pass | 我们靠导入期可达性 + 常量折叠覆盖一部分 |
+
+#### 最终性能（同一台机、同一时段背靠背）
+
+| 阶段 | OnnxSharp | ORT | 倍数 |
+|---|---|---|---|
+| fbank+LFR+CMVN | 8 ms | 8.3 ms | **1.0×** |
+| encoder 段（76 帧） | 103~115 ms | 39 ms | 2.6~3.0× |
+| decoder 段（深切） | 21 ms | 6.4 ms | 3.3× |
+| **整句（热态）** | **136 ms** | **55.6 ms** | **2.4×** |
+| 冷启动（含 JIT + 两次图加载） | 995 ms | ~56 ms + session 加载 | — |
+
+剩下的差距**不是 VNNI**（这一条之前写错了：ORT 在同一台机上也没有 VNNI）。
+用 ORT 自己的 profiler（`tools/scripts/bench_ort_profile.py`）看到的真实原因是：
+
+| ORT 的做法 | 我们的现状 |
+|---|---|
+| `DynamicQuantizeLinear + MatMulInteger` 融成单 kernel **`DynamicQuantizeMatMul`**（210 次/run，18.5 ms）：A 边量化边参与 GEMM，**不物化 u8 激活、不产出 int32 张量、scale/bias 在 epilogue 里做** | `DQL`（写 u8）→ `MatMulInteger`（读 u8、展开成 F32、GEMM、写 int32）→ `Cast`（int32→f32）→ `Mul(scale)` → `Add(bias)`，5 个算子 5 趟内存 |
+| 手写 LayerNorm 融合（`LayerNormalization` 131 次/run） | 我们这一轮也加了（`FuseLayerNorm`），但当时没真正生效，§6.18 修好后 81/81 |
+| 图编译后的执行计划，per-node 开销接近 0 | 每个算子每次调用都要重算 `GetMemoryShapes/GetTypes`、重新绑定缓冲 |
+
+我们的 encoder 分解（`profile`，10 次迭代的 min）：总计 **91 ms**，
+其中 `MatMulInteger` 38.4 ms（57%）、`DynamicQuantizeLinear` 8.0 ms（11.8%）、`MatMul` 7.0 ms、
+`Add` 5.5 ms，而 **layer 时间之和只有 67 ms** —— 剩下 ~24 ms 是逐算子固定开销。
+
+所以下一步该做的是「像 ORT 一样融合 + 降 per-op 开销」，而不是等 VNNI 机器。
+
 ### 6.16 端到端语音识别打通（M9-07/08/09，2026-11-11 早晨）
 
 - **decoder 段**：`tools/scripts/split_decoder.py` 去掉两个 `Loop`/`Sequence*`、剪掉不可达节点、把 loop 的输出
@@ -1222,6 +1394,8 @@ SMOKE TEST: PASS
 | 2026-11-07 | **本轮：修正上一轮两个错误结论 + 修掉最大单点浪费**。① §3.10 重写：140 个 MatMul 里 MLP（`[257,384]×[384,1536]`）与投影都是真 MatMul，合计 **54.1 GFLOP**（前置 batch 4），in-situ 407 GFLOPS，GEMM 已到顶；② 机器上限用 `fma` 重新量：单线程 91 GFLOPS、16 线程 753 GFLOPS；③ `MatMul` 在 B 不广播时合并 `(batch, m)`（decoder q/k/v 投影是 `[300,1,256]×[256,256]`，权重曾被打包 300 遍，4.06 → 0.13 ms），rfdetr-small **356 → 270 ms（-24%）**、medium -12%；④ `ProfileAll` 加预热与每算子最小耗时（坑 #41）；⑤ 新增 `fma`、`gemmbench --threads`、逐元素带宽与链式 MLP 微模型、`bench` 的 `alloc`/`gc`/`gc pause` 诊断；⑥ 排除 GC（0.7 ms/iter）与降频（长跑不衰减）两个嫌疑，剩下的计时差指向 host 侧每 forward 重算 2064 个算子的形状并分配 113 MB；新增坑 #40（独立内核吞吐无法预测端到端） |
 | 2026-11-10 | **M8 SAM3（框提示）跑通 + 图像预处理抽象**：① 引擎补 `IsNaN` / `GreaterOrEqual` / `InstanceNormalization` / `Einsum`(bqc,bchw->bqhw) / `RoiAlign`，算子 67 → **72**；② 修三个真 bug（`Clip` 可选 min/max 占位被当 0 → SAM3 `Div` 除零 NaN、`FusedEltwise` 放行 `[1,1,256]` vs `[256]`、`Flatten` 的 `axis == rank`）；③ 新 `tools/scripts/onnx_fp16_to_f32.py`（F16 权重/属性 + Cast 边界 + value_info + 每模型独立外部权重）；④ 新门面 `src/OnnxSharp/Sam3/`（`Sam3Segmenter`：vision → geometry → decoder、按形状缓存特化图、`Sam3Nms` 框级 NMS、掩码 logits→概率、`MaskScaleX/Y`）；⑤ 新 `src/OnnxSharp/Imaging/`（`ImagePixels` / `ImageGeometry` / `AxisMap` / `ImageTensor.ToChw`），Vision(YOLO/RF-DETR)、OCR、SAM3 三处预处理全部收口，YOLO 检测结果与重构前逐位一致；⑥ 调试能力：`run --debug` 逐算子检 NaN、`--input` 支持 I64/Bool、`--shape name=dims` 多输入；⑦ CLI 新增 `sam3`（`--box/--conf/--iou/--max-items/--format/--out/--json/--debug`）；⑧ 实测：decoder 与 ORT 逐值一致，行人框提示 top-1 **0.932**、整链 30 s；⑨ 坑 #67~#73；⑩ 测试 66/69 PASS（ImagingTests 6 + Sam3Tests 4） |
 | 2026-11-10 | **M7 OCR 落地（PP-OCRv6 det/cls/rec 跑在自家引擎上）**：① 引擎新增 `OnnxFile.WithInputShapes` + `Net.ReadModel(path, 输入形状/字典)`，把全动态图（`x[N,3,H,W]`）**特化**成静态图，形状链才能在导入期折叠（`plan.md §5.6`）；② 补 `HardSigmoid` / `BatchNormalization`（推理模式）/ `Identity`，复用 `GlobalAveragePool` / `ReduceMean` / `ConvTranspose` / `AveragePool` / `Squeeze`，注册算子 42 → **67**；③ 修 `PackedConv.Multiply` 无 bias 的空指针（`Conv+BN`）；④ 新门面 `src/OnnxSharp/Ocr/PaddleOCR/`（命名空间 `OnnxSharp.Ocr.PaddleOCR`，全部 OCR 代码都在这一层）：`OcrLine` / `OcrPixelFormat` / 像素→NCHW / CTC 解码 + `PaddleOcrModel` / `PaddleOcrPipeline` / `DbPostprocess` / `PaddleOcrOptions`，检测按 32 对齐、识别按 16 分桶并按形状缓存特化图；⑤ 与 ORT 对齐：det `max|diff|` 1.4e-7、rec 7.6e-6；900×300 合成图两行全对，3200×1800 车牌 `浙A ES8381` / `浙A：:3M15X`；⑥ CLI 新增 `ocr`，图像 IO 改走 **ImageFacade + 额外引入的 `Sdcb.SimdCodecs.Jpeg/Png/Bmp`**（`ImageHost.RegisterCodecs()` 显式注册，`--out` 画框存图），`detect` 也支持 `--out`；⑦ 新增 `tools/scripts/extract_ocr_models.ps1` 与 `OcrTests`（8 用例）；⑧ 坑 #59~#66（动态图特化、无 bias 卷积、缓冲复用与 FromArray、BN 处置、DB 后处理、rec 分桶、对齐口径、格式包边界）；⑨ 语音说明进 README「库用法 6」：sherpa-onnx 模型是 int8 + `Loop/NonZero/GatherND`，不在本引擎范围内 |
+| 2026-11-11 | **`FuseAttention`：整条 MHA 折成一层**（详见 §6.19）：新增 `Ops/AttentionOps.cs`（`FusedAttention`：K 打包 `[B,H,T,D]` → 按行并行做 `scale·q·kᵀ(+mask) → softmax → ·V`，不物化 `[B,H,T,T]`）+ `GraphFusion.FuseAttention`；`Transpose`/`Softmax` 各加一个内部接口（`ITransposePerm`/`ISoftmaxAxis`）供匹配读属性。两种形态：静态形状连 `Reshape+Transpose` 一起折，动态 head-split（Paraformer，输出的 Transpose 还被 `Shape` 链用着）留在 head 空间。encoder 40 块全融合（`Softmax` 40→0、`MatMul` 81→1、掩码 `Add` 202→162、算子 2410→2244），`profile` sum-of-min **51.8 → 44.8~47.5 ms（−8~14%）**、端到端 min **81 → 73~84 ms**；新增静态夹具 `make_attention_model.py` + `AttentionTests`（max\|diff\|=1.8e-7），95/98 测试全绿。**如实记一笔**：收益远低于预估的 20~30%，因为 attention 本来只占 13%，66% 是 `DynamicQuantizeMatMul` 的 GEMM |
+| 2026-11-11 | **ASR 性能对齐：两个融合 + 去 per-op 开销**（详见 §6.18）：① `Interpreter`/`LayerInfo` 按「输入 shape+type 签名」缓存 `GetMemoryShapes/GetTypes`（encoder ~103 → 86 ms）；② 新 `FuseQuantizedMatMul` + `Ops/QuantizedMatMulOps.cs`：`DQL→MatMulInteger→Cast→Mul→[Add]` 折成 `DynamicQuantizeMatMul`，A 边走量化边展开、scale/bias 走 epilogue（融合层 33.9 ms 取代 `MatMulInteger` 38.0 + `DQL` 8.0 ms）；权重是 **per-channel** 量化（scale/zp 都是 `(960,)` 向量），不能当标量；③ **修 `producerOf` 建表错误**（`Inputs` → `Outputs`），`FuseLayerNorm` 从 1/81 变 **81/81**，并更正 §6.17 的「−35%」实为负载波动；④ 修 net8.0 编不过的 CA2252（VNNI 预览 API）与 CA2014（循环内 `stackalloc`），双目标 0 错 0 警。结果：encoder 69~86 ms、整句热态 **136 → 87 ms**（vs ORT 55.6 ms，**2.4× → 1.56×**），ASR 文本与 94/97 测试不变 |
 
 ---
 

@@ -374,6 +374,8 @@ public static class MatMulArgMaxKernel
 
         if (Avx.IsSupported)
         {
+            Span<float> lanes = stackalloc float[Lanes];
+
             for (; j + Lanes <= jEnd; j += Lanes)
             {
                 var accumulator = hasBias ? Vector256.Load(bias + j) : Vector256<float>.Zero;
@@ -383,7 +385,6 @@ public static class MatMulArgMaxKernel
                         accumulator,
                         Avx.Multiply(Vector256.Create(aRow[kk]), Vector256.Load(b + (long)kk * n + j)));
 
-                Span<float> lanes = stackalloc float[Lanes];
                 accumulator.CopyTo(lanes);
 
                 for (int lane = 0; lane < Lanes; lane++)

@@ -2,6 +2,9 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
+// AvxVnni 在 .NET 里仍标注为「预览」API（CA2252）；这里一律靠运行期 IsSupported 守卫，属有意使用。
+#pragma warning disable CA2252
+
 namespace OnnxSharp.Kernels;
 
 /// <summary>int8 GEMM 的指令集档位（运行时探测）。</summary>

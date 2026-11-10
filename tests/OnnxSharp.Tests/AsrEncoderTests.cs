@@ -49,9 +49,13 @@ internal static class AsrEncoderTests
         net.SetInput("speech_lengths", lengths);
 
         var outputs = net.ForwardAll();
-        Assert.Equal(4, outputs.Count, "output count");
 
-        var frame = outputs[2].AsSpan<float>();
+        // 按名字找 encoder 特征（encoder.onnx 的输出个数会随切图参数变化：
+        // 现在还会吐出 decoder cross-attention 需要的量化 K/V 三个张量）
+        int index = net.OutputNames.ToList().IndexOf("/predictor/Concat_5_output_0");
+        Assert.True(index >= 0, "encoder output not found");
+
+        var frame = outputs[index].AsSpan<float>();
         var golden = ReadGolden(Path.Combine(directory, "golden__predictor_Concat_5_output_0.f32"));
         Assert.Equal(golden.Length, frame.Length, "encoder output length");
 
