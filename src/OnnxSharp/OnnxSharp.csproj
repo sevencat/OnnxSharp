@@ -12,7 +12,7 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>Sevencat.OnnxSharp</PackageId>
-    <Version>0.0.1</Version>
+    <Version>0.0.2</Version>
     <Authors>Sevencat</Authors>
     <PackageIcon>icon.png</PackageIcon>
     <Description>Pure C# ONNX inference engine — CPU only (FP32), no CUDA / Vulkan / OpenCL / DirectML backends, zero third-party dependencies. Runs YOLO11 / YOLOv8 / RF-DETR exports, with an optional image-to-detections facade. The code is written by AI coding agents; requirements, reference material and review come from the maintainer.</Description>

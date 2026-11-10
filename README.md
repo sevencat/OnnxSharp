@@ -5,6 +5,7 @@
 <h1 align="center">OnnxSharp</h1>
 
 <p align="center">
+  <a href="https://github.com/sevencat/OnnxSharp"><img src="https://img.shields.io/github/stars/sevencat/OnnxSharp?color=181717&logo=github&logoColor=white" alt="GitHub"></a>
   <a href="https://www.nuget.org/packages/Sevencat.OnnxSharp"><img src="https://img.shields.io/nuget/v/Sevencat.OnnxSharp?color=004880" alt="NuGet version"></a>
   <a href="https://www.nuget.org/packages/Sevencat.OnnxSharp"><img src="https://img.shields.io/nuget/dt/Sevencat.OnnxSharp?color=004880" alt="NuGet downloads"></a>
   <img src="https://img.shields.io/badge/backend-CPU%20only-2ea043" alt="CPU only">
@@ -80,7 +81,7 @@
 
 ### 安装
 
-NuGet：[`Sevencat.OnnxSharp`](https://www.nuget.org/packages/Sevencat.OnnxSharp) —— 包名带前缀，命名空间仍是 `OnnxSharp`。
+**仓库**：[github.com/sevencat/OnnxSharp](https://github.com/sevencat/OnnxSharp) ｜ **NuGet**：[`Sevencat.OnnxSharp`](https://www.nuget.org/packages/Sevencat.OnnxSharp) —— 包名带前缀，命名空间仍是 `OnnxSharp`。
 
 ```powershell
 dotnet add package Sevencat.OnnxSharp
@@ -717,7 +718,7 @@ A few conventions follow from that:
 
 ### Install
 
-NuGet: [`Sevencat.OnnxSharp`](https://www.nuget.org/packages/Sevencat.OnnxSharp) — the package carries the prefix, the namespace stays `OnnxSharp`.
+**Repo**: [github.com/sevencat/OnnxSharp](https://github.com/sevencat/OnnxSharp) | **NuGet**: [`Sevencat.OnnxSharp`](https://www.nuget.org/packages/Sevencat.OnnxSharp) — the package carries the prefix, the namespace stays `OnnxSharp`.
 
 ```powershell
 dotnet add package Sevencat.OnnxSharp
@@ -1088,3 +1089,13 @@ This engine was not invented from scratch — it re-implements, in a different s
 - **The performance baseline**: every optimisation round targeted "no slower than OpenCV 5 dnn on this machine", which is exactly what `upstream.lock` pins down. The scripts under `bench/` and the results in [bench.md](bench.md) are measured against it.
 
 > OnnxSharp is an independent implementation and contains **no** source code from those projects; every alignment figure and timing above comes from exercising their public interfaces.
+
+---
+
+<p align="center">
+  <a href="https://github.com/sevencat/OnnxSharp">GitHub 仓库</a> ｜
+  <a href="https://www.nuget.org/packages/Sevencat.OnnxSharp">NuGet 包</a> ｜
+  <a href="https://github.com/sevencat/OnnxSharp/issues">Issues</a> ｜
+  <a href="https://github.com/sevencat/OnnxSharp/blob/master/bench.md">基准数据</a>
+</p>
+
