@@ -695,6 +695,27 @@ Tile TopK Transpose Unsqueeze Where
     编解码要额外引 `Sdcb.SimdCodecs.Jpeg / Png / Bmp` 并在 `ImageHost.RegisterCodecs()` 里显式注册；
     没注册的格式调用时抛 `FeatureNotSupportedException`。产品库 `OnnxSharp` 一行都不引 —— 它只吃像素。
 
+### 6.12 int8 量化算子与 ASR encoder 段（2026-11-10 晚）
+
+这一轮的目标是「把 Paraformer 的 encoder 段跑起来」，过程中把「int8 加速」的假设全部证伪了，
+顺手补了三个运行期形状的 escape hatch。
+
+- **新增算子**：`DynamicQuantizeLinear`（per-tensor min/max → scale/zp）、`MatMulInteger`
+  （u8/i8 输入，零点标量或 per-column）、`Pad`（constant / edge / reflect，支持负 pads = 裁剪）+
+  **1-D `Conv`**（FSMN 记忆块，输入 `[N,C,T]`）。算子数 72 → 75。
+- **与 ORT 的一致性**：`tools/scripts/make_quant_model.py` 生成两组微模型（u8 权重 + 标量 zp、
+  s8 权重 + per-column zp），`run --compare` 的 `max|diff| = 0.000E+000`；
+  这个用例固化成回归 `quant: quantized graph matches onnxruntime`。
+- **ASR encoder 段**：`tools/scripts/split_before_control_flow.py`（7881 → 5715 节点）+
+  `sherpa_encoder_probe.py`（ORT 金标准）+ `probe_tensors.py`（逐层二分）。
+  `speech[1,96,560] → /predictor/Concat_5_output_0 [1,97,320]`，10.8 s/帧；
+  与 ORT 主输出 mean|diff| 8e-4（中间层 1e-6~3.6e-5，CIF 放大），padded 帧完全一致。
+- **被证伪的三个假设**：① int8 权重 + F32 计算（0.10×，见坑 #76）；② 权重带宽是瓶颈（FP32 也只有
+  73 GFLOPS，见 #77）；③ VNNI 可用（本机 Zen4 的 `AvxVnni.IsSupported = False`）。
+  结论：**量化图的正确性已具备，速度交给 M10-02c（小 GEMM 效率）**。
+- **测试**：新增 `QuantOpsTests`（3 例，含 ORT 端到端对拍）与 `PadConv1DTests`（4 例），
+  全量 **80/83 passed, 3 skipped**。
+
 ### 6.11 SAM3 / 共享图像预处理（2026-11-10）
 
 67. **`Clip` 的 min/max 是可选输入，空串占位会变成 `Arg(0)`**。按 `inputs.Count > 2` 判断「有没有 max」，
@@ -724,6 +745,53 @@ Tile TopK Transpose Unsqueeze Where
     `plane` 必须用**目标缓冲的高度** `destinationHeight × destinationStride`，
     而不是「缩放区域高度」——后者在 letterbox（上下有填边）时会让三个通道互相覆盖，
     表现为检测分数整体偏移（实测 0.7994 → 0.5725），而且不报错。A/B 用真实模型输出对比最可靠。
+74. **`.NET` 里没有 `Avx512Vnni`，只有 Intel 专属的 `AvxVnni`**（2026-11-10 用编译验证，不是查文档）：
+    在 .NET 10.0.101 里写 `Avx512Vnni.IsSupported` 直接 `CS0103: 名称不存在`，
+    `System.Runtime.Intrinsics.dll` 的字节里也搜不到该字符串；而 `AvxVnni` 存在、本机（Zen4）`IsSupported=False`。
+    原因：`AvxVnni` 暴露的是 Intel 专属的 **AVX-VNNI（256 位 VEX 编码，12 代酷睿起）**；
+    Zen4/Zen5 与 Ice Lake/SPR 只有 **AVX512-VNNI**，.NET 没有包装 → **VNNI 快路径只在 Intel 12 代+ 生效**。
+    可用的替代是 `Avx512BW.MultiplyAddAdjacent`（512 位 `vpmaddubsw`，实测 `3×5×4=60` 语义正确）。
+75. **非 VNNI 机器上「安全的 int8 计算」打不过 FP32**。按每 32/64 个 MAC 的指令数算：
+    `vpdpbusd` 1 条（4×）、`vpmaddubsw`+`vpmaddwd` 单趟 2 条（2×，但 i16 会饱和：255×128×2 > 32767）、
+    7 位拆分版 ~8 条（**0.5×，比 FP32 慢**）。所以 Zen4 / 老 Xeon 上的正确路线是
+    **「int8 权重存储 + F32 计算」**（按列块在 scratch 里反量化，DRAM 流量降 ~4×），而不是 int8 MAC。
+    另外：`[kb][col][4]` 这种为 `vpdpbusd` 设计的打包布局**同样适配 `vpmaddubsw`+`vpmaddwd`**
+    （16 个 i16 lane 正好是 8 列 × 4 个 k），两套内核可以共用一份打包。
+76. **上一条（#75）的「int8 权重 + F32 计算」实测是错的，别照做**。真按列块反量化再调 `GemmKernel`：
+    `96×320×1280` = **10.88 ms vs FP32 1.07 ms（0.10×）**，两次都是 7 GFLOPS。
+    慢的不是 `vpmovzxbw` 解包（per call 也就 40 万次），而是**把「小 GEMM 的固定开销（B 面板打包 +
+    `Parallel.For` 调度）」乘上了列块数**（1280/64 = 20 次调用）。教训：测「带宽优化」之前先确认
+    **不是固定开销主导**。代码留在 `Kernels/Int8DequantGemm.cs` 作反例与回归基准。
+77. **ASR 形状的 FP32 GEMM 只有 73 GFLOPS**（机器峰值 400+，yolo 的 640² 形状能到 300+）。
+    `m≈96` 时 `GemmKernel` 的行块（m/40）与 `Parallel.For` 固定开销占了主导。想快就得改这里，
+    而不是换数据类型 —— 这条把「int8 加速」的讨论直接改了结论（plan.md 里新增 M10-02c）。
+78. **运行期形状只有一条路：`DynamicOutputShapes()` + 在 `Forward` 里 `outputs[i].Fit(...)`**。
+    Paraformer 的 `Range(0, ReduceMax(speech_lengths))`、`Reshape(Shape→Gather→Concat)`、
+    `ConstantOfShape(pads)` 都属于「形状要跑了才知道」，`GetMemoryShapes` 里 `RequireConstInput`
+    必然抛「needs constant folding」。让这三个算子按「输入是否常量」二选一：
+    常量走静态推断 + 常量折叠，运行时走动态形状，互不影响（`ConstFolder` 也按同一判据跳过）。
+79. **sherpa 的 ONNX 导出不是拓扑序**（`check_model` 报 `Nodes in a graph must be topologically sorted`）。
+    ORT 容忍，我们的 importer 不容忍（生产者必须先定义）—— 切图工具里必须自己 Kahn 排序一遍。
+    连带后果：`onnx.utils.extract_model` 不可用（它第一步就 `check_model`），只能手写
+    「反向 BFS + 拓扑排序 + 补 `value_info`」。
+80. **onnx 1.23 默认写 IR version 14，本机 ORT 只认到 13**（`Unsupported model IR version: 14`）。
+    脚本里显式 `model.ir_version = 10`。
+81. **切图时不能把 `Sequence*` 产出的值当边界**。CIF 的 `Loop` 有 6 个输入，其中 2 个是
+    `SequenceEmpty`（循环携带的空序列）：它们既不能作为子图输出（引擎不支持序列），
+    也不该进 BFS（否则白带一堆序列算子）。判据：`producer.op_type in {SequenceEmpty, SequenceInsert, ...}` 就跳过。
+82. **`Pad` 的负 pads 是「裁剪」，不是「填负数」**。常量模式先整块填常数再按行拷贝时，
+    必须按 `[0, outDim)` 夹紧首尾轴：`[3,3]` + `pads=[-1,0,0,0]` 在旧实现里会把 `coords+pads = -1`
+    写成越界地址（现在有 `pad: negative pads crop` 单测挡着）。末轴的起始/结束也要夹紧，
+    否则会整段拷到输出外面。
+83. **`OpUtil.ReadInts` 原来不认 U8 / I8**，而量化算子的 `zero_point` 恰好就是 uint8
+    （`cannot read integers from U8 tensor`）。凡是「读量化参数」的路径都要能读 u8/i8 标量。
+84. **量化图的对拍要看「逐层」而不是最终输出**。Paraformer encoder 的中间张量差 1e-6~3.6e-5，
+    但 CIF 的 frame-count（`cif_output/MatMul` → `floor`）是混沌放大器，最终主输出
+    mean|diff| 8e-4、max 8.7e-2，padded 帧却完全一致。
+    `tools/scripts/probe_tensors.py` 把任意中间张量追加成 graph output，ORT / 引擎各跑一次，
+    直接给「哪个张量开始变坏」；盯着最终输出瞎猜会浪费一整天。
+
+
 
 ---
 

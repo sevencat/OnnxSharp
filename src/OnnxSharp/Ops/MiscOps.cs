@@ -157,6 +157,12 @@ internal static class MiscOps
             List<TensorShape> tempShapes)
             => outShapes.Add(new TensorShape(OpUtil.ReadInts(OpUtil.RequireConstInput(this, 0))));
 
+        /// <summary>
+        /// 形状来自运行时（Paraformer 的 CIF 用它造零初始状态）时由 <see cref="Forward"/> 自己 Fit；
+        /// 常量形状仍然走静态推断 + 常量折叠。
+        /// </summary>
+        public override bool DynamicOutputShapes() => !IsConstInput(0);
+
         public override void GetTypes(
             IReadOnlyList<DType> inTypes,
             int requiredOutputs,
@@ -179,6 +185,9 @@ internal static class MiscOps
             IReadOnlyList<Tensor> temps)
         {
             var output = outputs[0];
+
+            if (DynamicOutputShapes())
+                output.Fit(new TensorShape(OpUtil.ReadInts(inputs[0])), OutputDType);
 
             switch (output.DType)
             {
@@ -220,21 +229,33 @@ internal static class MiscOps
         {
             DType.F32 => t.AsSpan<float>()[0],
             DType.I64 => t.AsSpan<long>()[0],
+            DType.I32 => t.AsSpan<int>()[0],
             _ => throw new OnnxSharpException($"Range '{name}': unsupported {what} dtype {t.DType}"),
         };
 
-        private long Count()
-        {
-            double start = ReadScalar(OpUtil.RequireConstInput(this, 0), "start", Name);
-            double limit = ReadScalar(OpUtil.RequireConstInput(this, 1), "limit", Name);
-            double delta = ReadScalar(OpUtil.RequireConstInput(this, 2), "delta", Name);
+        /// <summary>
+        /// 常量输入的 Range（位置编码）走静态形状 + 常量折叠；只有 <c>limit</c> 来自运行时
+        /// （Paraformer 的 <c>make_pad_mask</c>：<c>Range(0, ReduceMax(speech_lengths))</c>）
+        /// 时才转成动态输出形状，由 <see cref="Forward"/> 自己 Fit。
+        /// </summary>
+        public override bool DynamicOutputShapes()
+            => !IsConstInput(0) || !IsConstInput(1) || !IsConstInput(2);
 
+        private static long CountOf(double start, double limit, double delta, string name)
+        {
             if (delta == 0)
-                throw new OnnxSharpException($"Range '{Name}': delta must not be zero");
+                throw new OnnxSharpException($"Range '{name}': delta must not be zero");
 
             double n = Math.Ceiling((limit - start) / delta);
             return n <= 0 ? 0 : (long)n;
         }
+
+        private long Count()
+            => CountOf(
+                ReadScalar(OpUtil.RequireConstInput(this, 0), "start", Name),
+                ReadScalar(OpUtil.RequireConstInput(this, 1), "limit", Name),
+                ReadScalar(OpUtil.RequireConstInput(this, 2), "delta", Name),
+                Name);
 
         public override void GetMemoryShapes(
             IReadOnlyList<TensorShape> inShapes,
@@ -267,7 +288,14 @@ internal static class MiscOps
             var output = outputs[0];
 
             double start = ReadScalar(inputs[0], "start", Name);
+            double limit = ReadScalar(inputs[1], "limit", Name);
             double delta = ReadScalar(inputs[2], "delta", Name);
+
+            if (DynamicOutputShapes())
+            {
+                int length = (int)CountOf(start, limit, delta, Name);
+                output.Fit(new TensorShape(new[] { length }), inputs[0].DType);
+            }
 
             if (output.DType == DType.I64)
             {

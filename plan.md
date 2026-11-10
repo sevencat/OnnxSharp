@@ -7,7 +7,7 @@
 > 已完成：引擎内核（共享缓冲槽 + temp 池 + 动态形状）、ONNX 全链路导入、72 个注册算子、yolo11n / rfdetr-small / rfdetr-medium / PP-OCRv6（det/rec/cls）/ SAM3（vision+geometry+decoder）端到端对齐
 > 校验：`dotnet build` 0 警告 0 错误；`tests` 56/59 PASS（3 个用例需本地模型，缺失则 SKIP）
 > **性能数字只看 `bench.md`**（本节 §9 只留目标与口径，不再重复实测表）
-> 下一步：M4 收尾 —— GEMM 二维 cache blocking（16 线程只跑出 8 核的 45%）
+> 下一步：M9-01 ASR 基线取证（ORT/sherpa 跑同一 wav 落 fixture）；M4 收尾 —— GEMM 二维 cache blocking
 > 最后更新：2026-11-10
 
 ---
@@ -469,6 +469,183 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 - [ ] 文本提示：需要纯托管 BPE tokenizer（`tokenizer.json`），当前只支持框提示
 - [ ] vision 特征复用：现在每次 `Segment` 都重跑 vision（26 s），拆出 `EncodeImage` 可省 80%+ 时间
 - [ ] int8 / FP16 计算：见 `misc.md §6.11`（Zen4 无 AVX512-FP16，FP16 计算是负收益）
+
+### M9 — 纯托管 ASR（sherpa 的 Paraformer int8）— **计划中（2026-11-10 立项）**
+
+> 目标：**不依赖 ONNX Runtime / sherpa 原生库**，用本引擎跑 `F:\ai\sherpa\model.int8.onnx`
+> （Paraformer，中文），输入 16 kHz WAV → 输出文字，与 sherpa-onnx **逐字一致**。
+
+**模型实测（立项依据）**
+
+| 项 | 值 |
+|---|---|
+| 图 | opset 14，**7881 节点**，1197 权重（753 F32 + **444 U8**） |
+| 输入 | `speech` F32 `[B, T, 560]`（**80 维 fbank × LFR 7**）、`speech_lengths` I32 `[B]` |
+| 输出 | `logits` F32 `[B, T', 8359]`、`token_num` I32 |
+| int8 | `MatMulInteger` ×222 + `DynamicQuantizeLinear` ×211 |
+| 控制流 | `Loop` ×2（CIF 80 节点 / 取词 106 节点，含 `If`/`NonZero`/`ScatterND`/`SequenceInsert`）、`SequenceEmpty`/`ConcatFromSequence` ×2 |
+| 其它缺口 | `Pad`(53，全 constant)、`LogSoftmax`(1)；`GatherND`/`Range`/`Pow`/`Sqrt`/`ReduceMean`/`GreaterOrEqual` 已有 |
+
+**路线选择：B′（推荐）—— int8 保留 + 只切控制流（CIF 手写）**
+
+> 为什么不反量化：ASR 是「短序列 + 大权重」的负载，**权重带宽**是第一约束。实测该模型
+> int8 权重 82 MB、反量化后 260 MB（3.2×）；再加上 Zen4 的 VNNI（`vpdpbusd` 一条指令 64 个 int8 MAC，
+> 是 AVX2 FP32 FMA 的 8 倍、AVX-512 FP32 的 4 倍），int8 是这条路线的**性能前提**，不能丢。
+
+| 路线 | 做法 | 工作量 | 结论 |
+|---|---|---|---|
+| **B′** | **保留 int8 图**：引擎实现 `DynamicQuantizeLinear` + `MatMulInteger`（VNNI 内核，AVX2 回退）；只把两个 `Loop` 那一段（CIF/取词）切出来**用 C# 重写** | **3~4 周** | ✅ 推荐：既留 int8 的性能，又避开 `Loop/If/Sequence` |
+| A | 离线反量化成 F32 再跑 | 2~3 周 | 链路最容易验证，但性能只有 sherpa 的 1/3~1/10；**只作为 B′ 的第一步（跑通用），不作为终态** |
+| C | 引擎实现通用 `Loop`/`If`/`Sequence`，图原样跑 | 4~6 周，易错 | ❌ 为一个模型写控制流执行器，收益低 |
+
+> **实施顺序**：先用 A 的最小子集（M9-03'）把「encoder → CIF → decoder → 文本」整链跑通（正确性基线），
+> 再原地换上 B′ 的 int8 内核（同样输入、同样输出对拍）——两者产物完全等价，可以 A/B 切换，
+> 这样「性能」和「正确性」两个风险不会绑在一起。
+
+
+**任务与验收**
+
+| ID | 任务 | 估时 | 验收 |
+|---|---|---|---|
+| M9-01 | **基线取证**：ORT 跑 int8 图 + sherpa 跑同一 wav，落 `tests/Fixtures/asr/` | 0.5 天 | **部分完成**：`tools/scripts/sherpa_encoder_probe.py` 已能录 encoder 段的输入/金标准；正式 fixture（含 fbank、logits、文本、sha256）仍缺 |
+| M9-02 | **fbank 前端（纯 C#）**：25 ms/10 ms、povey 窗、preemph 0.97、nfft 512、mel 80、20~8000 Hz、log、**LFR(7,6)**、CMVN | 2~4 天 | 与 kaldi-native-fbank 逐值 `max|diff| < 1e-5`；`speech` 与 ORT 输入对齐 |
+| M9-03 | **（先跑通用）int8 → F32 图改写**（`tools/scripts/onnx_int8_to_f32.py`）：U8 权重按 `(W-zp)*scale` 还原、`MatMulInteger→MatMul`、清掉配套 `DynamicQuantizeLinear` | 1~2 天 | 改写后 ORT 输出与原模型一致（`max|diff| < 1e-3`）；**只用于打通链路与做基线，不作终态** |
+| M9-04 | **补小算子**：`Pad`(constant) ✅、`LogSoftmax`（未做） | 1~2 天 | **完成一半**：`Pad` 三种 mode + 负 pads 已实现并有单测；顺带补了 1-D `Conv`（FSMN）与 `Range`/`Reshape`/`ConstantOfShape` 的**运行期形状** |
+| M9-05 | **图切分**：`tools/scripts/split_before_control_flow.py` —— 在第一个 `Loop`/`If`/`Scan` 前切开，自动拓扑排序（sherpa 的导出不是拓扑序），跳过 `Sequence*` 边界值，可显式追加输出张量 | 0.5~1 天 | ✅ `model.int8.onnx` 7881 → 5715 节点，encoder 段被引擎直接加载并跑通 |
+| M9-06 | **CIF 用 C# 重写**：`cif_conv1d` + integrate-and-excite（alpha 累加、阈值 1.0、取整、remainder）→ acoustic embeddings | 2~4 天 | token 数与 ORT 相同；embeddings `max|diff| < 1e-4` |
+| M9-07 | **decoder 跑通**：`logits_length = token_num` 特化（必要时按 8 的倍数分桶） | 1~2 天 | logits 与 ORT `max|diff| < 1e-3` |
+| M9-08 | **token 解码**：argmax + `tokens.txt` 去词/去重 + 标点 | 1 天 | 文本与 sherpa 逐字一致 |
+| M9-09 | **门面 + CLI**：`src/OnnxSharp/Speech/ParaformerRecognizer`（`WavReader` + 上述链路），CLI `asr <wav> --models <dir> [--json]` | 2 天 | 一条命令出文本；`tts-zh.wav` 端到端 < 3 s（FP32/16 线程） |
+| M9-10 | **回归 + 文档**：fixture 对拍用例（缺模型 SKIP）、README「库用法 9」、坑清单 | 1~2 天 | `dotnet run --project tests` 全绿；文档含复现命令 |
+| M9-11 | **int8 GEMM 内核**：U8 权重预打包 + `vpdpbusd`(AVX512-VNNI) 主路径 + `vpmaddubsw`/`vpmaddwd`(AVX2) 回退；A 的 zero-point 用「行和 × zp」校正，避免逐元素减 | 4~6 天 | 同形状单算子吞吐 ≥ **3×** 现有 FP32 内核；与 ORT `MatMulInteger` 输出 `max|diff| ≤ 1`（int32 累加应逐位一致） |
+| M9-12 | **两个 int8 算子 + 融合**：`DynamicQuantizeLinear`（per-tensor min/max → scale/zp → u8）、`MatMulInteger`（u8×u8 + zp → i32）；再把 `DQL → MatMulInteger` 融合成一层（省一次 u8 写回和一遍 min/max 扫描） | 3~4 天 | encoder 段与 ORT int8 逐值对齐（`max|diff| < 1e-3`）；融合后不再物化 u8 激活 |
+| M9-13 | **性能门槛与三边 A/B**：同一 wav 跑「FP32 通道 / int8 通道 / sherpa」 | 1~2 天 | **VNNI 机器**：≤ 3× sherpa（ORT 的 MLAS 用到 512 位 VNNI，我们只有 256 位）；**无 VNNI**：int8 通道 ≤ FP32 通道 × 0.7；达不到先调 packing 粒度与并行 |
+
+**风险与对策**
+
+| # | 风险 | 对策 |
+|---|---|---|
+| R1 | 反量化折算错（per-channel scale、zero-point） | M9-03 逐张量与 ORT 对拍，先比最大/均值和逐元素 |
+| R2 | CIF 细节（alpha 累加、remainder、ceil、阈值）难对齐 | 把 Loop body 的 80 个节点逐条翻译；先对齐 token 数再对齐 embeddings |
+| R3 | decoder 动态长度 | 特化 `logits_length`（必要时按桶缓存，复用 OCR 的「按形状缓存特化图」经验） |
+| R4 | 前端 fbank 与 sherpa 差 1e-5 级以上 | 先对齐分帧/窗/preemph/CMVN 四个中间量，再对最终特征 |
+| R5 | 性能只有 sherpa 的 1/3~1/10（FP32 通道） | 这是预期结果，**所以终态走 int8**（M9-11/12/13）；FP32 只用于打通链路 |
+| R6 | int8 内核正确性（zero-point、per-tensor scale、饱和） | 先写标量参考 + 单算子对拍，再上 SIMD；ORT 的 `MatMulInteger` 当 oracle（int32 累加应逐位一致） |
+| R7 | AVX2 回退路径慢（无 VNNI 的机器） | 只承诺 VNNI 机器快；AVX2 走 `vpmaddubsw`，目标 ≥1.5× FP32 |
+| R8 | `DQL→MatMulInteger` 融合 pass 破坏图 | 仅在「DQL 只有一个消费者，且 scale/zp 只服务该 MatMulInteger」时融合，并留开关可关 |
+
+**总验收**：`asr` 对 3 段中文音频（含 `tts-zh.wav`）输出与 sherpa 逐字一致；
+端到端 ≤ **2× sherpa**（同一台机器、16 线程），且 FP32 通道与 int8 通道输出文本一致。
+
+### M10 — 原生 int8 量化推理（引擎能力）— **计划中（2026-11-10 立项）**
+
+> 目标：引擎**原生**执行量化 ONNX（不需要离线反量化），把 int8 变成和 FP32 并列的一等公民。
+> 第一个消费者是 M9 的 Paraformer（`MatMulInteger` ×222 + `DynamicQuantizeLinear` ×211），
+> 但能力本身是通用的：量化 YOLO/MobileNet、QDQ 导出、QLinearConv 都应该能直接跑。
+
+**为什么要做（实测依据）**
+
+| 事实 | 数字 |
+|---|---|
+| 量化模型的权重带宽 | int8 **82 MB** vs 反量化后 **260 MB**（ASR 是权重带宽受限的负载） |
+| Zen4 指令吞吐 | `vpdpbusd` 一条 **64 个 int8 MAC**；AVX2 FP32 FMA 8 个、AVX-512 FP32 16 个 |
+| 现状 | 引擎只有 F32/F16(存)/I32/I64/Bool 的**搬运**能力，没有 int8 计算；量化模型导入时直接报 `MatMulInteger` 未实现 |
+
+**范围（分两批）**
+
+| 批次 | 内容 | 说明 |
+|---|---|---|
+| 第一批（本里程碑） | `MatMulInteger`、`DynamicQuantizeLinear`、`QLinearMatMul`、`ConvInteger`、`QLinearConv`、`QuantizeLinear`、`DequantizeLinear`（支持 per-tensor / per-axis） | 覆盖 ORT 旧式量化（QOperator）与 QDQ 两种主流导出 |
+| 第二批（后续） | `QLinearAdd`/`QLinearMul`/`QLinearGlobalAveragePool`/`QLinearSigmoid`…、QDQ 折叠成 FP32 的「精度等价」通道 | 按实际模型需求加，不预先实现 |
+
+**任务与验收**
+
+| ID | 任务 | 估时 | 验收 |
+|---|---|---|---|
+| M10-01 | **int8 类型与工具**：`Tensor` 上 `Span<sbyte>/Span<byte>/Span<int>` 访问、饱和转换（f32↔u8 带 zp/scale）、量化参数常量读取（`OpUtil.QuantParams`） | 0.5~1 天 | 单元测试：饱和边界、zp 偏移、per-axis 取值 |
+| M10-02 | **int8 GEMM 主路径（VNNI）**：权重 U8/S8 预打包（列块）、`vpdpbusd`（`AvxVnni`，256 位；512 位向量拆两次）累加、A 的 zero-point 用「行和 × zp」校正、epilogue per-column 反量化 | 3~4 天 | 与 ORT `MatMulInteger` **int32 逐位一致**；VNNI 机器吞吐 ≥ **2×** 现有 FP32 GEMM |
+| M10-02b | **（已实测，结论：不可行）int8 权重 + F32 计算**：权重保持 u8，按列块 `k×64` 用 `vpmovzxbw` 解包成 F32 再调 GEMM。**实测 ASR 形状反而慢 5~10×**（`96×320×1280`：10.88 ms vs FP32 1.07 ms），原因是逐列块重复打包 + 小 GEMM 固定开销，而不是解包本身 | 2~3 天（已完成，结论否定） | ~~≥1.5×~~ 实测 0.10~0.19×；代码保留在 `Kernels/Int8DequantGemm.cs`，等 M10-02c 的「融合解包进微内核」再评估 |
+| M10-02c | **小 GEMM 效率（新发现的主线）**：ASR 形状下 FP32 GEMM 只有 **73 GFLOPS**（机器峰值 400+），瓶颈是 row-block 打包与 `Parallel.For` 固定开销。按形状自适应（m≤128 时用细粒度列切分 / 合并 batch 维 / 免打包路径） | 2~3 天 | `96×320×1280` ≥ **150 GFLOPS**；ASR encoder 端到端 ≥1.5× |
+
+> **AVX-512 子集取舍（2026-11-10 本机实测：F/BW/CD/DQ/VBMI 全 True，VNNI False）**
+>
+> | 子集 | 给什么 | 我们要不要 | 用在哪 |
+> |---|---|---|---|
+> | `Avx512F` | 512 位地基、`vpbroadcastd`（广播激活 dword）、掩码、`vpermd` | **要** | 所有 512 位内核的地基 |
+> | `Avx512BW` | `vpmaddubsw` / `vpmaddwd`（`MultiplyAddAdjacent`，实测 3×5×4=60）、`vpmovzxbw`（`ConvertToVector512Int16`）、字节掩码 | **要（核心）** | int8 GEMM 的全部原语 + u8→i16→f32 解包 + 尾巴掩码 |
+> | `Avx512Vbmi` | `vpermb` / `vpermi2b`（`PermuteVar64x8`，实测可用） | 可选 | int8 权重重排、NHWC↔NCHW 字节 deinterleave（都是加载期一次性） |
+> | `Avx512DQ` | `vpmullq` 等 64 位整数运算 | 暂不需要 | 只对 int64 索引算子的边角有用 |
+> | `Avx512CD` | `vpconflictd`（`DetectConflicts`） | 暂不需要 | `ScatterND`/去重/NMS 这类索引算子；与 GEMM 无关 |
+> | ~~`Avx512Vnni`~~ | `vpdpbusd`（1 条指令 4× 吞吐） | **.NET 没有** | 只有在别处用汇编/native 时才拿得到 |
+| M10-03 | **`MatMulInteger`** 算子（u8×u8 / s8×s8、`a_zero_point` / `b_zero_point` 标量或 per-column） | 1 天 | ✅ 已实现（`Ops/QuantOps.cs`）；对拍 ORT `max|diff| = 0`（u8 与 s8+per-column 两组微模型） |
+| M10-04 | **`QLinearMatMul` / `ConvInteger` / `QLinearConv`**：int8 卷积走 im2col + int8 GEMM，int32 bias，输出按 `y_scale/y_zero_point` 重量化 | 2~3 天 | 对拍 ORT，`max|diff| ≤ 1`（u8 输出） |
+| M10-05 | **`QuantizeLinear` / `DequantizeLinear`**（opset 10/13/19 的 axis 语义） | 1~2 天 | 与 ORT 逐值一致；per-axis 覆盖 |
+| M10-06 | **`DynamicQuantizeLinear`**（per-tensor min/max → scale/zp） | 0.5 天 | ✅ 已实现；与 ORT 的 scale/zp/量化值逐位一致 |
+| M10-07 | **图级优化**：① `DQL → MatMulInteger` 融合成一层（省一次 u8 物化 + 一遍 min/max 扫描）；② QDQ 对（`QuantizeLinear→DequantizeLinear` 相邻且无中间消费者）直接消掉；③ 量化参数常量预提取 | 2~3 天 | 融合后 ASR encoder 少 ~200 次全量扫描；数值不变 |
+| M10-08 | **对拍与回归**：单算子 oracle（ORT）+ 端到端量化模型（ASR Paraformer、一个量化 YOLO） | 2~3 天 | **部分完成**：`quant: quantized graph matches onnxruntime` 覆盖 DQL+MatMulInteger+Cast+Mul（bit-exact）；ASR encoder 段有 `probe_tensors.py` 逐层对拍（中间层 1e-6~3.6e-5，主输出 mean 8e-4）；量化 YOLO 未测 |
+| M10-09 | **性能基准**：CLI `int8bench`（GEMM/Conv 形状扫参）+ `bench.md` 增补 | 1~2 天 | 表格含 VNNI/AVX2 两档，标注 CPU 能力 |
+| M10-10 | **文档**：README「原生 int8」一节、`misc.md` 踩坑（zp 校正、饱和、per-axis） | 1 天 | 含复现命令与精度/性能对照 |
+
+**合计：约 3~4 周**（M10-02/02b 是主项；M10-03~06 可以并行）。
+
+**内核分档（运行时探测，`Int8KernelTier`）**
+
+> ⚠️ **实测约束（2026-11-10，本机 Ryzen 7 8845HS / Zen4，.NET 10.0.101）**：
+> ① `System.Runtime.Intrinsics.X86` **没有 `Avx512Vnni`**（写一行就 `CS0103`；ref 程序集字节里也搜不到）；
+> ② `AvxVnni`（Intel 专属 AVX-VNNI，256 位）在本机 **`False`**，但它对应的 512 位 `Avx512BW.MultiplyAddAdjacent`
+> **可用**（实测 `3×5×4 = 60` 语义正确）。
+>
+> **指令级结论**（每 32/64 个 MAC 需要的指令数）：
+>
+> | 路径 | 指令 | 每指令 MAC | vs FP32 |
+> |---|---|---|---|
+> | `vpdpbusd`（VNNI，Intel 12 代+） | 1 | 32 / 64 | **4×** |
+> | `vpmaddubsw`+`vpmaddwd` 单趟 | 2 | 32 / 64 | 2×，但 **i16 会饱和**（255×128×2 &gt; 32767） |
+> | 同上 + 7 位拆分（安全） | ~8 | 32 / 64 | **0.5×**（比 FP32 慢） |
+> | 标量 | 1/元素 | ~1 | 0.1× |
+>
+> 因此：**能安全跑的 int8 内核在 Zen4 / 老 Xeon 上拿不到加速**；
+> 主路径改成 **M10-02b「int8 权重存储 + F32 计算」**（任何 CPU 都有带宽收益），
+> VNNI 路径（`vpdpbusd`）留给 Intel 12 代+。
+
+| 档位 | 触发条件（.NET 8/10 都有对应 intrinsic） | 实现 | 目标倍率（vs 我们的 FP32 GEMM） | 典型 CPU |
+|---|---|---|---|---|
+| `Vnni256` | `AvxVnni.IsSupported`（**仅 Intel 12 代+**） | `vpdpbusd` ymm | **2~3×**（≈2× vs AVX-512 FP32、≈4× vs AVX2 FP32） | Alder Lake / Raptor Lake / Meteor Lake 等客户端 |
+| `Avx512Bw` | `Avx512BW.IsSupported`（有 512 位但无 VNNI） | `vpmaddubsw`+`vpmaddwd` zmm（**7 位拆分，防饱和**） | **2~4×** | Skylake-SP / Cascade Lake / **Zen4 / Zen5** |
+| `Avx2` | `Avx2.IsSupported` | `vpmaddubsw`+`vpmaddwd` ymm（同上） | **1.5~2×** | Haswell~Coffee Lake、Zen1~Zen3 |
+| `Neon` | ARM64 `AdvSimd` | `vmull`/`vpaddl`（无 `sdot` 时等价实现） | 1.5~2× | Apple M / 骁龙 / 鲲鹏 |
+| `Scalar` | 其它 | 纯标量（同时作为测试 oracle） | ~1×（**不劣化**：权重小 3×，带宽仍是收益） | 任意 |
+
+> **没有 VNNI 不等于白做**：ASR/LLM 这类负载首先是权重带宽受限，int8 权重 82 MB vs FP32 260 MB，
+> 即使算力只有 1.5×，端到端通常仍能拿到 1.5~2.5×；只有在「算力受限 + 无任何 int8 SIMD」的机器上才可能打平。
+> 这类机器可以直接切回 M9-03 的 FP32 反量化通道（保留开关）。
+
+**关键设计决定**
+
+1. **只量化「量化算子」**：int8 计算只发生在 `MatMulInteger`/`QLinearConv` 等内部，其余算子继续 F32/I32 ——
+   不做全局「整图 int8」执行器（那是另一套图编译器的工作量）。
+2. **zero-point 走权重预减**：`sum((a-za)(b-zb)) = sum(a·b') - za·sum(b')`，`b' = b - zb` 在打包时一次算好；
+   这样主循环只剩 `vpdpbusd` + int32 累加，A 侧不需要逐元素减。
+3. **epilogue 反量化**：int32 累加 → `* (a_scale*b_scale)` → `+ bias` → 可选重量化，全部在寄存器块内完成，
+   不物化中间 F32 大张量。
+4. **打包缓存**：与现有 `PackedConv` 一样按权重张量实例缓存，权重只打包一次（量化模型权重常驻内存也小）。
+5. **AVX2 回退必须正确**：`vpmaddubsw` 会饱和（15 位），需要成对处理 + `vpmaddwd` 扩展到 int32；
+   这是最容易写错的地方，标量参考实现要保留并参与测试。
+
+**风险**
+
+| # | 风险 | 对策 |
+|---|---|---|
+| R1 | `vpdpbusd` 的 u8×s8 语义与权重符号（权重保留 s8 还是 u8）搞错 | 统一成「A=u8、B=s8（已减 zp）」；标量参考 + ORT 逐位对拍 |
+| R2 | `vpmaddubsw` 饱和导致 AVX2 路径结果错 | 成对操作（`maddubs` 后立即 `maddwd`），并用随机 ±127 边界数据测 |
+| R3 | per-axis scale 的 epilogue 写错（列序 vs 行序） | 单独用例：per-column 与 per-tensor 结果在 scale 全相同时必须一致 |
+| R4 | 融合 pass 改坏图 | 融合有开关；融合前后 ASR/YOLO 输出逐值对比 |
+| R5 | 无 VNNI 的机器收益低（老 Xeon / AVX2 平台） | 分档内核（`Avx512Bw` / `Avx2` / `Neon` / 标量）+ 权重小 3× 的带宽红利；仍不达标就切回 FP32 反量化通道 |
+| R6 | 能力探测与实现不一致（探测到但路径写错）导致 `IllegalInstruction` | 每档都用**同一组随机数据**与标量参考逐位比对；探测结果在 `int8bench --info` 打印并进测试断言 |
+| R7 | ARM 无 `sdot` 时只用 `vmull/vpaddl`，收益有限 | 先用等价实现保正确；`AdvSimd` 的 dot-product intrinsic 可用时再切快路径 |
+
+**对 M9 的影响**：M9-11/12/13 直接复用 M10-01~07，只保留「ASR 特有」的 CIF/前端/解码任务。
+建议顺序：**先做 M10-01/02/03/06（一周）**，M9 的 encoder 段就能跑；再补 M10-04/05/07 收尾通用性。
 
 ---
 

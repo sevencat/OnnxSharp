@@ -22,6 +22,7 @@ internal static class ShapeOps
         LayerRegistry.Register("Split", p => new SplitLayer(p));
         LayerRegistry.Register("Transpose", p => new TransposeLayer(p));
         LayerRegistry.Register("Slice", p => new SliceLayer(p));
+        LayerRegistry.Register("Pad", p => new PadLayer(p));
     }
 
     internal static int[] ToInts(long[]? values)
@@ -116,11 +117,23 @@ internal static class ShapeOps
             return result;
         }
 
+        /// <summary>
+        /// 目标形状来自运行时（Paraformer 的 <c>Reshape(Shape→Gather→Concat)</c>）时，
+        /// 交给 <see cref="Forward"/> 自己算形状并 Fit；常量形状仍然静态推断 + 常量折叠。
+        /// </summary>
+        public override bool DynamicOutputShapes()
+            => Inputs.Count > 1 && Inputs[1].Idx != 0 && !IsConstInput(1);
+
         public override void Forward(
             IReadOnlyList<Tensor> inputs,
             IReadOnlyList<Tensor> outputs,
             IReadOnlyList<Tensor> temps)
-            => OpUtil.CopyBytes(inputs[0], 0, outputs[0], 0, inputs[0].Count);
+        {
+            if (DynamicOutputShapes())
+                outputs[0].Fit(Resolve(inputs[0].Shape, OpUtil.ReadInts(inputs[1])), inputs[0].DType);
+
+            OpUtil.CopyBytes(inputs[0], 0, outputs[0], 0, inputs[0].Count);
+        }
     }
 
     // ---------------- Flatten ----------------
@@ -586,4 +599,282 @@ internal static class ShapeOps
             }
         }
     }
+    // ---------------- Pad ----------------
+
+    /// <summary>
+    /// Pad：opset ≥ 11 用输入 <c>pads</c> / <c>constant_value</c> / <c>axes</c>，更早用属性。
+    /// 支持 constant / edge / reflect；<c>pads</c> 允许为负数（相当于裁剪）。
+    /// <para>Paraformer 的 <c>pad_fn</c> 用它把注意力的 K/V 补齐到固定长度。</para>
+    /// </summary>
+    private sealed class PadLayer : Layer
+    {
+        private readonly string _mode;
+        private readonly int[] _padsAttr;
+        private readonly double _valueAttr;
+
+        public PadLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _mode = parameters.GetString("mode", "constant");
+            _padsAttr = ToInts(parameters.GetInts("pads"));
+            _valueAttr = parameters.GetFloat("value", 0.0);
+        }
+
+        private static bool HasInput(IReadOnlyList<Arg> inputs, int index)
+            => index < inputs.Count && inputs[index].Idx != 0;
+
+        /// <summary>返回长度 <c>2*rank</c> 的 pads（前 rank 个是 begin，后 rank 个是 end）。</summary>
+        private int[] ResolvePads(int rank)
+        {
+            int[] pads = HasInput(Inputs, 1) ? OpUtil.ReadInts(OpUtil.RequireConstInput(this, 1)) : _padsAttr;
+
+            if (pads.Length == 0 || pads.Length % 2 != 0)
+                throw new OnnxSharpException($"Pad '{Name}': invalid pads ({pads.Length} values)");
+
+            int count = pads.Length / 2;
+            int[]? axes = HasInput(Inputs, 3) ? OpUtil.ReadInts(OpUtil.RequireConstInput(this, 3)) : null;
+
+            var result = new int[2 * rank];
+            if (axes is null)
+            {
+                if (count != rank)
+                    throw new OnnxSharpException($"Pad '{Name}': pads has {count} axes, input rank is {rank}");
+
+                for (int i = 0; i < rank; i++)
+                {
+                    result[i] = pads[i];
+                    result[rank + i] = pads[count + i];
+                }
+
+                return result;
+            }
+
+            if (axes.Length != count)
+                throw new OnnxSharpException($"Pad '{Name}': axes({axes.Length}) / pads({count}) mismatch");
+
+            for (int i = 0; i < count; i++)
+            {
+                int axis = OpUtil.NormalizeAxis(axes[i], rank, $"Pad '{Name}'");
+                result[axis] = pads[i];
+                result[rank + axis] = pads[count + i];
+            }
+
+            return result;
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+        {
+            var input = inShapes[0];
+            var pads = ResolvePads(input.Rank);
+            var dims = input.ToArray();
+
+            for (int axis = 0; axis < dims.Length; axis++)
+            {
+                dims[axis] += pads[axis] + pads[dims.Length + axis];
+                if (dims[axis] < 0)
+                    throw new OnnxSharpException($"Pad '{Name}': axis {axis} becomes negative ({dims[axis]})");
+            }
+
+            outShapes.Add(new TensorShape(dims));
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var input = inputs[0];
+            var output = outputs[0];
+            int rank = input.Shape.Rank;
+            var inDims = input.Shape.ToArray();
+            var outDims = output.Shape.ToArray();
+            var pads = ResolvePads(rank);
+            int elementSize = input.DType.SizeOf();
+
+            var source = input.Buffer.AsSpan(input.ByteOffset, input.ByteLength);
+            var target = output.Buffer.AsSpan(output.ByteOffset, output.ByteLength);
+
+            if (_mode == "constant")
+            {
+                Fill(target, elementSize, ReadConstantValue(inputs));
+                CopyStraight(source, target, inDims, outDims, pads, elementSize);
+            }
+            else
+            {
+                CopyReplicated(source, target, inDims, outDims, pads, elementSize, _mode == "reflect");
+            }
+        }
+
+        private double ReadConstantValue(IReadOnlyList<Tensor> inputs)
+        {
+            if (!HasInput(Inputs, 2))
+                return _valueAttr;
+
+            var tensor = inputs[2];
+            return tensor.DType switch
+            {
+                DType.F32 => tensor.AsSpan<float>()[0],
+                DType.I32 => tensor.AsSpan<int>()[0],
+                DType.I64 => tensor.AsSpan<long>()[0],
+                DType.I8 => tensor.AsSpan<sbyte>()[0],
+                DType.U8 => tensor.AsSpan<byte>()[0],
+                _ => _valueAttr,
+            };
+        }
+
+        /// <summary>constant 模式：整块填常数后，把输入按「行」拷进内区（每行内部仍连续）。</summary>
+        private static void CopyStraight(
+            ReadOnlySpan<byte> source,
+            Span<byte> target,
+            int[] inDims,
+            int[] outDims,
+            int[] pads,
+            int elementSize)
+        {
+            int rank = inDims.Length;
+            var inStrides = OpUtil.Strides(inDims);
+            var outStrides = OpUtil.Strides(outDims);
+
+            int last = rank - 1;
+            int runElements = inDims[last];
+            if (runElements <= 0)
+                return;
+
+            int runBytes = runElements * elementSize;
+            var coords = new int[Math.Max(rank - 1, 1)];
+
+            // 负 pads 相当于裁剪：首/末轴都要按输出范围夹紧，否则会越界写
+            int lastPad = pads[last];
+            int outLast = outDims[last];
+            int runStart = Math.Max(0, -lastPad);
+            int runEnd = Math.Min(runElements, outLast - lastPad);
+            if (runEnd <= runStart)
+                return;
+
+            int validElements = runEnd - runStart;
+            int sourceStart = runStart;
+            int destinationStart = runStart + lastPad;
+
+            long rows = 1;
+            for (int axis = 0; axis < last; axis++)
+                rows *= inDims[axis];
+
+            for (long row = 0; row < rows; row++)
+            {
+                long sourceOffset = sourceStart;
+                long targetOffset = destinationStart;
+                bool inside = true;
+
+                for (int axis = 0; axis < last; axis++)
+                {
+                    int outputIndex = coords[axis] + pads[axis];
+                    if ((uint)outputIndex >= (uint)outDims[axis])
+                    {
+                        inside = false;
+                        break;
+                    }
+
+                    sourceOffset += (long)coords[axis] * inStrides[axis];
+                    targetOffset += (long)outputIndex * outStrides[axis];
+                }
+
+                if (inside)
+                {
+                    source.Slice((int)sourceOffset * elementSize, validElements * elementSize)
+                          .CopyTo(target.Slice((int)targetOffset * elementSize));
+                }
+
+                for (int axis = last - 1; axis >= 0; axis--)
+                {
+                    if (++coords[axis] < inDims[axis])
+                        break;
+                    coords[axis] = 0;
+                }
+            }
+        }
+        /// <summary>edge / reflect：逐元素按轴回映。</summary>
+        private static void CopyReplicated(
+            ReadOnlySpan<byte> source,
+            Span<byte> target,
+            int[] inDims,
+            int[] outDims,
+            int[] pads,
+            int elementSize,
+            bool reflect)
+        {
+            int rank = inDims.Length;
+            var inStrides = OpUtil.Strides(inDims);
+            var coords = new int[rank];
+
+            long total = 1;
+            for (int axis = 0; axis < rank; axis++)
+                total *= outDims[axis];
+
+            for (long index = 0; index < total; index++)
+            {
+                long sourceOffset = 0;
+                for (int axis = 0; axis < rank; axis++)
+                    sourceOffset += (long)MapIndex(coords[axis] - pads[axis], inDims[axis], reflect) * inStrides[axis];
+
+                int from = (int)sourceOffset * elementSize;
+                int to = (int)index * elementSize;
+                source.Slice(from, elementSize).CopyTo(target.Slice(to, elementSize));
+
+                for (int axis = rank - 1; axis >= 0; axis--)
+                {
+                    if (++coords[axis] < outDims[axis])
+                        break;
+                    coords[axis] = 0;
+                }
+            }
+        }
+
+        private static int MapIndex(int index, int dim, bool reflect)
+        {
+            if (dim <= 1)
+                return 0;
+            if (!reflect)
+                return Math.Clamp(index, 0, dim - 1);
+
+            while (index < 0 || index >= dim)
+                index = index < 0 ? -index : 2 * dim - 2 - index;
+            return index;
+        }
+
+        private static void Fill(Span<byte> target, int elementSize, double value)
+        {
+            Span<byte> pattern = stackalloc byte[8];
+            switch (elementSize)
+            {
+                case 1: pattern[0] = (byte)(long)value; break;
+                case 2: BitConverter.TryWriteBytes(pattern, (Half)(float)value); break;
+                case 4: BitConverter.TryWriteBytes(pattern, (float)value); break;
+                default: BitConverter.TryWriteBytes(pattern, (long)value); break;
+            }
+
+            var block = new byte[64];
+            for (int i = 0; i + elementSize <= block.Length; i += elementSize)
+                pattern[..elementSize].CopyTo(block.AsSpan(i));
+
+            int written = 0;
+            while (written + block.Length <= target.Length)
+            {
+                block.CopyTo(target[written..]);
+                written += block.Length;
+            }
+
+            while (written + elementSize <= target.Length)
+            {
+                pattern[..elementSize].CopyTo(target[written..]);
+                written += elementSize;
+            }
+        }
+
+    }
 }
+

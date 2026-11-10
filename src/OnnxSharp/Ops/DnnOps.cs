@@ -111,6 +111,12 @@ internal static class DnnOps
             var weight = inShapes[1];   // [M, C/group, kH, kW]
             int spatial = input.Rank - 2;
 
+            if (input.Rank == 3)
+            {
+                outShapes.Add(Conv1DShape(input, weight));
+                return;
+            }
+
             if (weight.Rank != input.Rank)
                 throw new OnnxSharpException($"Conv '{Name}': weight rank {weight.Rank} != input rank {input.Rank}");
 
@@ -141,6 +147,85 @@ internal static class DnnOps
             }
 
             outShapes.Add(new TensorShape(dims));
+        }
+
+        /// <summary>
+        /// 1-D 卷积（<c>[N,C,T]</c> × <c>[M,C/group,K]</c>）：FSMN 记忆块用它做时间轴卷积。
+        /// 朴素实现就够（单节点约 60 万次乘加），2-D 主路径完全不受影响。
+        /// </summary>
+        private TensorShape Conv1DShape(TensorShape input, TensorShape weight)
+        {
+            if (weight.Rank != 3)
+                throw new OnnxSharpException($"Conv '{Name}': 1-D input needs a 3-D weight, got {weight}");
+
+            int channels = input.Dims[1];
+            if (_group <= 0 || channels % _group != 0)
+                throw new OnnxSharpException($"Conv '{Name}': channels {channels} not divisible by group {_group}");
+
+            var (kernel, stride, dilation, padBegin, padEnd) = Resolve1D(input.Dims[2], weight.Dims[2]);
+            int length = SpatialOut(input.Dims[2], kernel, stride, dilation, padBegin, padEnd, false);
+            return new TensorShape(new[] { input.Dims[0], weight.Dims[0], length });
+        }
+
+        private (int Kernel, int Stride, int Dilation, int PadBegin, int PadEnd) Resolve1D(int length, int weightKernel)
+        {
+            int kernel = _kernelShape.Length > 0 ? _kernelShape[0] : weightKernel;
+            int stride = _strides.Length > 0 ? _strides[0] : 1;
+            int dilation = _dilations.Length > 0 ? _dilations[0] : 1;
+            int padBegin = _pads.Length > 0 ? _pads[0] : 0;
+            int padEnd = _pads.Length > 1 ? _pads[1] : padBegin;
+
+            if (_autoPad is "SAME_UPPER" or "SAME_LOWER" or "VALID")
+                (padBegin, padEnd) = AutoPad(_autoPad, length, kernel, stride, dilation, -1);
+
+            return (kernel, stride, dilation, padBegin, padEnd);
+        }
+
+        private void Forward1D(Tensor input, Tensor weight, Tensor? bias, Tensor output)
+        {
+            int batch = input.Shape.Dims[0];
+            int inChannels = input.Shape.Dims[1];
+            int inLength = input.Shape.Dims[2];
+            int outChannels = output.Shape.Dims[1];
+            int outLength = output.Shape.Dims[2];
+
+            var (kernel, stride, dilation, padBegin, _) = Resolve1D(inLength, weight.Shape.Dims[2]);
+            int channelsPerGroup = inChannels / _group;
+            int outPerGroup = outChannels / _group;
+
+            var source = input.AsSpan<float>();
+            var weights = weight.AsSpan<float>();
+            var target = output.AsSpan<float>();
+            var biasSpan = bias is null ? default : bias.AsSpan<float>();
+
+            for (int n = 0; n < batch; n++)
+            {
+                for (int m = 0; m < outChannels; m++)
+                {
+                    int inBase = m / outPerGroup * channelsPerGroup;
+
+                    for (int t = 0; t < outLength; t++)
+                    {
+                        float sum = bias is null ? 0f : biasSpan[m];
+
+                        for (int j = 0; j < channelsPerGroup; j++)
+                        {
+                            long inRow = ((long)n * inChannels + inBase + j) * inLength;
+                            long weightRow = ((long)m * channelsPerGroup + j) * kernel;
+
+                            for (int k = 0; k < kernel; k++)
+                            {
+                                int position = t * stride - padBegin + k * dilation;
+                                if ((uint)position >= (uint)inLength)
+                                    continue;
+                                sum += source[(int)(inRow + position)] * weights[(int)(weightRow + k)];
+                            }
+                        }
+
+                        target[(int)(((long)n * outChannels + m) * outLength + t)] = sum;
+                    }
+                }
+            }
         }
 
         /// <summary>解析 stride / dilation / pads（含 auto_pad），与 <see cref="GetMemoryShapes"/> 同源。</summary>
@@ -184,12 +269,20 @@ internal static class DnnOps
             var weight = inputs[1];
             var output = outputs[0];
 
+            Tensor? bias = Inputs.Count > 2 && Inputs[2].Idx != 0 && inputs[2].Count > 0 ? inputs[2] : null;
+
+            if (input.Shape.Rank == 3)
+            {
+                Forward1D(input, weight, bias, output);
+                if (FusedActivation is { } fused1D)
+                    TensorOps.ElementWiseUnary(fused1D, output, output);
+                return;
+            }
+
             if (input.Shape.Rank != 4)
                 throw new OnnxSharpException($"Conv '{Name}': only 2D convolution (NCHW) is implemented");
 
             Resolve(input.Shape, out var strides, out var dilations, out var pads);
-
-            Tensor? bias = Inputs.Count > 2 && Inputs[2].Idx != 0 && inputs[2].Count > 0 ? inputs[2] : null;
 
             // 3×3 / s1 / pad1 优先走 Winograd F(2,3)（乘法量只有 4/9），
             // 其次走面板式直接卷积（不物化整幅 im2col），都不适用再回退 im2col

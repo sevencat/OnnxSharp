@@ -30,6 +30,19 @@ internal static class OpUtil
         {
             tensor.AsSpan<int>().CopyTo(result);
         }
+        else if (tensor.DType == DType.U8 || tensor.DType == DType.Bool)
+        {
+            // 量化算子的 zero point 与量化数据类型一致（常见是 uint8）
+            var span = tensor.AsSpan<byte>();
+            for (int i = 0; i < count; i++)
+                result[i] = span[i];
+        }
+        else if (tensor.DType == DType.I8)
+        {
+            var span = tensor.AsSpan<sbyte>();
+            for (int i = 0; i < count; i++)
+                result[i] = span[i];
+        }
         else if (tensor.DType == DType.F32)
         {
             var span = tensor.AsSpan<float>();

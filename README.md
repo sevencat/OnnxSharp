@@ -66,7 +66,7 @@
 | **后端** | **只有 CPU**（FP32，AVX2 / AVX-512 + 多线程）；**没有** CUDA / TensorRT / Vulkan / OpenCL / DirectML 后端 |
 | 依赖 | 零第三方包（不引用 `Google.Protobuf`、`Microsoft.ML.OnnxRuntime`），全部手写 |
 | 目标框架 | `net8.0` / `net10.0`，AOT 友好（不用反射、不用 `dynamic`） |
-| 算子 | 72 个注册算子，覆盖 YOLO11/v8、RF-DETR 与 PP-OCRv6 的导出图（清单见 [支持算子](#支持算子)） |
+| 算子 | 75 个注册算子，覆盖 YOLO11/v8、RF-DETR、PP-OCRv6 与 sherpa Paraformer 的 encoder 段导出图（清单见 [支持算子](#支持算子)） |
 | 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链等） |
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
 | 线程 | 默认 `Environment.ProcessorCount`，可用环境变量 `ONNXSHARP_THREADS` 覆盖 |
@@ -427,22 +427,41 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 
 ### 支持算子
 
-72 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` 是图融合的产物）：
+75 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` 是图融合的产物）：
 
 | 类别 | 算子 |
 |---|---|
-| 形状/元数据 (11) | `Shape` `ConstantOfShape` `Expand` `Tile` `Unsqueeze` `Squeeze` `Reshape` `Slice` `Split` `Flatten` `Range` |
+| 形状/元数据 (12) | `Shape` `ConstantOfShape` `Expand` `Tile` `Unsqueeze` `Squeeze` `Reshape` `Slice` `Split` `Flatten` `Range` `Pad` |
 | 搬运/类型 (4) | `Concat` `Transpose` `Cast` `Identity` |
 | 逐元素 (26) | `Add` `Sub` `Mul` `Div` `Mod` `Pow` `Max` `Min` `Abs` `Neg` `Sqrt` `Exp` `Log` `Erf` `Sin` `Cos` `Reciprocal` `Round` `Floor` `Ceil` `Sign` `Clip` `Relu` `HardSigmoid` `Sigmoid` `Tanh` |
 | 比较/逻辑 (8) | `Equal` `Less` `Greater` `GreaterOrEqual` `And` `Not` `Where` `IsNaN` |
 | 归约/索引 (7) | `ReduceSum` `ReduceMax` `ReduceMean` `TopK` `Gather` `GatherElements` `GatherND` |
+| 量化 (2) | `DynamicQuantizeLinear` `MatMulInteger` |
 | 重算子 (16) | `Conv` `ConvTranspose` `MatMul` `Gemm` `Einsum` `RoiAlign` `MaxPool` `AveragePool` `GlobalAveragePool` `GlobalMaxPool` `Softmax` `LayerNormalization` `BatchNormalization` `InstanceNormalization` `Resize` `GridSample` |
 
 > 与目标模型的关系：YOLO11/v8 用前五类里的大部分；RF-DETR 额外要 `GridSample` / `TopK` / `GatherElements` /
 > `Reduce*` / `Sin` / `Cos` / `Where`；PP-OCRv6 额外要 `HardSigmoid` / `GlobalAveragePool` / `ReduceMean` /
 > `ConvTranspose` / `BatchNormalization` / `Identity`（OCR 补的）；SAM3 又补了 `IsNaN` / `GreaterOrEqual` /
-> `InstanceNormalization` / `Einsum`(bqc,bchw-&gt;bqhw) / `RoiAlign`。
+> `InstanceNormalization` / `Einsum`(bqc,bchw-&gt;bqhw) / `RoiAlign`；sherpa Paraformer 的 encoder 段又补了
+> `DynamicQuantizeLinear` / `MatMulInteger` / `Pad` 和 **1-D `Conv`**（FSMN 记忆块，输入 `[N,C,T]`）。
 > **动态维**不属于算子问题：`Net.ReadModel(path, 输入形状)` 会把全动态图特化成静态图，否则 `Shape` 链折不出常量。
+
+### 量化推理（int8）
+
+支持 ORT 旧式量化（QOperator）的两个核心算子：`DynamicQuantizeLinear` 与 `MatMulInteger`
+（u8 / i8 输入、标量或 per-column 零点），与 ONNXRuntime **逐位一致**（回归用例
+`quant: quantized graph matches onnxruntime` 用 `tools/scripts/make_quant_model.py` 生成模型 + ORT 金标准）。
+
+「int8 权重常驻 + int8 MAC」这条加速路径三条设想都实测过，结论都是否定的：
+
+| 设想 | 实测 | 结论 |
+|---|---|---|
+| int8 权重 + F32 计算（`vpmovzxbw` 解包后走现有 FMA 内核），把权重带宽降到 1/4 | `96×320×1280`：int8 权重 10.88 ms vs FP32 1.07 ms（**0.10×**） | 否定。按列块反量化等于把小 GEMM 的打包/调度开销重复了 20 次 |
+| 瓶颈是权重带宽 | 同形状 FP32 GEMM 只有 **73 GFLOPS**（机器峰值 400+） | 否定。瓶颈是**小矩阵 GEMM 效率**（ASR 的 m≈96），不是带宽 |
+| VNNI（`vpdpbusd`，理论 4× 整数吞吐） | Zen4 + .NET 10：`AvxVnni.IsSupported = False`，且没有 `Avx512Vnni` 类型 | 待验。需要 Intel 12 代+ 的机器 |
+
+所以现阶段量化图的正确性已经有了，速度靠「把 FP32 GEMM 在小 m 形状上做快」而不是靠 int8 指令
+（见 [plan.md](plan.md) 的 M10-02c）。
 
 ### 性能
 
@@ -468,11 +487,13 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | rfdetr-small / rfdetr-medium | 跑通并纳入基准；解码结果与官方 `rfdetr.export._runtime.decode_detections` 逐框一致（41/41 框，坐标 0.00 px） |
 | PP-OCRv6 tiny（det / rec / cls） | det 与 rec 的**原始输出**与 ONNXRuntime 对齐（64² + 960² 输入：max\|diff\| 1.4e-7 / 7.6e-6）；900×300 合成图两行文字全对（`Hello OnnxSharp 123` 0.957、`第二行文字 PaddleOCR` 0.982） |
 | 单算子微模型 | GEMM / attention / 逐元素链，用于内核定点调优 |
+| sherpa Paraformer encoder 段（int8） | 用手写脚本把 `model.int8.onnx` 在第一个 `Loop`（CIF）前切开，5715 节点的 encoder 子图**直接跑通**（`speech[1,96,560]` → `[1,97,320]`）；`DynamicQuantizeLinear` + `MatMulInteger`(+s8 权重、per-column 零点) 与 ONNXRuntime **逐位一致**（max\|diff\| = 0） |
 
 ### 限制
 
 - **只做 CPU**，没有 CUDA / DirectML / OpenVINO 等执行后端。
-- **计算主体是 FP32**；`Cast` 与整数张量只服务于索引/形状路径，未实现 INT8 量化（QDQ）反量化。
+- **计算主体是 FP32**，但支持 ORT 旧式量化（QOperator）的 `DynamicQuantizeLinear` + `MatMulInteger`
+  （含 s8 权重与 per-column 零点）；`QuantizeLinear` / `DequantizeLinear` / `QLinearConv`（QDQ 格式）未实现。
 - 动态维只做「最小可用」：全动态图（如 PaddleOCR）要用 `Net.ReadModel(path, 输入形状)` **特化**成静态图，
   每个尺寸一份图；纯运行期动态形状（同一份图换尺寸）不支持。
 - 不针对 WASM / IL2CPP，未验 NativeAOT（但代码保持 AOT 友好）。
@@ -481,8 +502,10 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 - `OnnxSharp.Ocr.PaddleOCR` 只覆盖 **PP-OCRv6 系列**（DB 检测 + CTC 识别 + 文本行方向分类）；表格识别、
   版面分析、SAST 等其它 OCR 结构未实现。检测后处理是**轴对齐框**（不做 pyclipper 的多边形外扩），
   竖排 / 大角度倾斜文本能框住但框是正的。
-- **不做语音识别**：sherpa-onnx 的模型带 `Loop` / `NonZero` / int8 权重，超出本引擎的静态 FP32 图模型，
-  需要 ASR 请直接用 sherpa-onnx（见 [库用法 6](#库用法-6语音识别sherpa-onnx不在引擎里)）。
+- **语音识别只做到 encoder 段**：`Loop`（CIF）/ `NonZero` / `Sequence*` 这类控制流未实现，整张
+  `model.int8.onnx` 不能直接导入。用 `tools/scripts/split_before_control_flow.py` 切掉控制流后的
+  encoder 子图可以跑（与 ORT 主输出 mean\|diff\| 8e-4，逐层 1e-6~3.6e-5，CIF 会把小误差放大）。
+  需要完整 ASR 请直接用 sherpa-onnx（见 [库用法 6](#库用法-6语音识别sherpa-onnx不在引擎里)）。
 
 ### 目录结构
 
@@ -490,9 +513,9 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 src/OnnxSharp/
   Core/      Net / NetImpl / Graph / Arg / 解释器 / 内存池 / 融合 / 常量折叠
   Onnx/      手写 protobuf reader、ONNX importer
-  Tensors/   Tensor / TensorShape / DType / GEMM / Transpose 内核
-  Ops/       算子的实现（含 NormOps：BatchNormalization / Identity）
-  Kernels/   直接卷积、打包卷积、Winograd、MaxPool
+  Tensors/   Tensor / TensorShape / DType / GEMM / Transpose 内核 / Quantization（int8 饱和转换）
+  Ops/       算子的实现（含 NormOps：BatchNormalization / Identity；QuantOps：DynamicQuantizeLinear / MatMulInteger）
+  Kernels/   直接卷积、打包卷积、Winograd、MaxPool、Int8Gemm（VNNI + 标量 oracle）、Int8DequantGemm
   Threading/ 并行工具（ONNXSHARP_THREADS）
   Vision/    可选门面：ImagePreprocessor / YoloDetector / YoloDecoder
              / RfDetrDetector / RfDetrDecoder / Detection（可整体删除，不影响推理）
@@ -501,9 +524,11 @@ src/OnnxSharp/
                 + PaddleOcrModel / PaddleOcrPipeline / DbPostprocess / PaddleOcrOptions
   Sam3/      可选门面：Sam3Segmenter（vision → geometry → decoder）+ Sam3Box / Sam3Item / Sam3Nms
   Imaging/   共享图像预处理：ImagePixels / ImageGeometry / AxisMap / ImageTensor（Vision / OCR / SAM3 共用）
-tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / 微基准 + ImageFacade 图像 IO
-tools/scripts/         dump_shapes / gen_golden / extract_ocr_models.ps1
-tests/OnnxSharp.Tests/ 零依赖测试运行器（59 用例），直接 dotnet run
+tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / sam3 / 微基准 + ImageFacade 图像 IO
+tools/scripts/         dump_shapes / gen_golden / extract_ocr_models.ps1 / onnx_fp16_to_f32
+                       / make_quant_model / split_before_control_flow / sherpa_encoder_probe
+                       / probe_tensors / inspect_loop / compare_outputs
+tests/OnnxSharp.Tests/ 零依赖测试运行器（80 用例），直接 dotnet run
 bench/                四引擎 × 6 模型的对照脚本与产物
 ```
 
@@ -581,7 +606,7 @@ A few conventions follow from that:
 | **Backend** | **CPU only** (FP32, AVX2 / AVX-512 + threads); **no** CUDA / TensorRT / Vulkan / OpenCL / DirectML backend |
 | Dependencies | None — protobuf reader, kernels and runtime are all hand-written |
 | Targets | `net8.0` / `net10.0`, AOT-friendly (no reflection, no `dynamic`) |
-| Operators | 67 registered ops, covering YOLO11/v8, RF-DETR and PP-OCRv6 exports |
+| Operators | 75 registered ops, covering YOLO11/v8, RF-DETR, PP-OCRv6 and the encoder part of sherpa Paraformer exports |
 | Graph passes | Constant folding (Shape→Gather→Concat→Reshape chains), operator fusion |
 | Runtime | Static buffer pool (outputs detach), shape inference, `Parallel.For` + AVX2/AVX-512 |
 | Threads | `Environment.ProcessorCount` by default, overridable via `ONNXSHARP_THREADS` |
@@ -815,6 +840,23 @@ Key `detect` flags: `--family auto|yolo|rfdetr`, `--conf`, `--iou` (YOLO), `--ma
 
 > Timing note: `--iters` defaults to 1, i.e. real first-frame latency including JIT. For steady-state numbers use `--iters 40` — .NET tiered compilation promotes hot methods only after ~30 calls, otherwise results are 1.5–2× too slow.
 
+### Quantized inference (int8)
+
+The two core QOperator ops are supported — `DynamicQuantizeLinear` and `MatMulInteger` (u8/i8 inputs,
+scalar or per-column zero points) — and they match ONNXRuntime **bit-exactly** (regression test
+`quant: quantized graph matches onnxruntime`, model + golden generated by `tools/scripts/make_quant_model.py`).
+
+Three ideas for an "int8 weights + int8 MAC" fast path were measured; all of them lost:
+
+| Idea | Measurement | Verdict |
+|---|---|---|
+| Keep int8 weights, dequantise per column block with `vpmovzxbw` and reuse the FMA kernel (4× less weight traffic) | `96×320×1280`: 10.88 ms vs 1.07 ms FP32 (**0.10×**) | No — per-block re-packing multiplies the fixed cost of a small GEMM by 20 |
+| Weight bandwidth is the bottleneck | The same FP32 GEMM reaches only **73 GFLOPS** (machine peak 400+) | No — the bottleneck is small-matrix GEMM efficiency (ASR's m≈96) |
+| VNNI (`vpdpbusd`, 4× integer throughput) | Zen4 + .NET 10: `AvxVnni.IsSupported = False`, and there is no `Avx512Vnni` type | Unverified — needs an Intel 12th-gen+ machine |
+
+So correctness for quantized graphs is in place; speed has to come from making FP32 GEMM fast at small `m`
+(see M10-02c in [plan.md](plan.md)), not from int8 instructions.
+
 ### Performance
 
 Forward pass only, batch=1, FP32, 16 threads, median of 40 frames (Ryzen 7 8845HS, Windows, .NET 10):
@@ -838,11 +880,16 @@ Forward pass only, batch=1, FP32, 16 threads, median of 40 frames (Ryzen 7 8845H
 | yolov8n / yolo11s / yolov8s | Runs; included in benchmarks |
 | rfdetr-small / rfdetr-medium | Runs; decoding matches official `rfdetr.export._runtime.decode.decode_detections` (41/41 boxes, 0.00 px) |
 | Micro models | Single-operator graphs for kernel-level tuning |
+| sherpa Paraformer encoder (int8) | The 5715-node encoder sub-graph (split before the first `Loop`) runs end-to-end (`speech[1,96,560]` → `[1,97,320]`); `DynamicQuantizeLinear` + `MatMulInteger` (s8 weights, per-column zero points) match ONNXRuntime **bit-exactly** (max\|diff\| = 0) |
 
 ### Limitations
 
 - **CPU only** — no CUDA / DirectML / OpenVINO backends.
-- **FP32 compute**; integer/bool tensors only serve index and shape paths. INT8 quantized (QDQ) graphs are not supported.
+- **FP32 compute**, with support for the legacy QOperator pair `DynamicQuantizeLinear` + `MatMulInteger`
+  (u8/i8 inputs, scalar or per-column zero points); `QuantizeLinear` / `DequantizeLinear` / `QLinearConv` (QDQ) are not implemented.
+- **ASR stops at the encoder**: `Loop` (CIF) / `NonZero` / `Sequence*` are not implemented, so `model.int8.onnx`
+  cannot be imported as a whole. `tools/scripts/split_before_control_flow.py` cuts the encoder out and that
+  runs (mean\|diff\| 8e-4 vs ORT on the main output). For full ASR use sherpa-onnx itself.
 - Dynamic dimensions are minimally supported (batch=1 focus); dynamic H/W needs `TargetWidth/TargetHeight`.
 - WASM / IL2CPP are not targeted; NativeAOT is not validated (code stays AOT-friendly).
 - **No image decoding in the library**; bring your own pixels. The CLI decodes JPEG/PNG/BMP through ImageFacade and can draw/save the result.
@@ -851,10 +898,10 @@ Forward pass only, batch=1, FP32, 16 threads, median of 40 frames (Ryzen 7 8845H
 ### Layout
 
 ```
-src/OnnxSharp/   Core (graph/runtime) · Onnx (protobuf reader) · Tensors · Ops · Kernels
-                 Threading · Vision (optional facade: image in, boxes out)
-tools/OnnxSharp.Cli/   info / run / bench / profile / detect / micro-benchmarks
-tests/OnnxSharp.Tests/ zero-dependency test runner (51 cases)
+src/OnnxSharp/   Core (graph/runtime) · Onnx (protobuf reader) · Tensors (incl. Quantization) · Ops (incl. QuantOps) · Kernels (incl. Int8Gemm)
+                 Threading · Vision / Ocr / Sam3 (optional facades) · Imaging (shared preprocessing)
+tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / sam3 / micro-benchmarks
+tests/OnnxSharp.Tests/ zero-dependency test runner (80 cases)
 bench/                 four-engine × six-model comparison scripts
 ```
 
