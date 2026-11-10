@@ -164,7 +164,10 @@ internal static class QLinearConvOps
 
             Dequantize(x, inputFloat, xScale, xZeroPoint);
 
-            if (!PackedConv.TryConv(
+            if (!DepthwiseConv.TryConv(
+                    inputFloat, weights, bias, outputFloat,
+                    _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1])
+                && !PackedConv.TryConv(
                     inputFloat, weights, bias, outputFloat,
                     _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1])
                 && !Winograd.TryConv3x3(

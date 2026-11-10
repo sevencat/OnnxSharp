@@ -390,6 +390,17 @@ internal static class DnnOps
 
             Resolve(input.Shape, out var strides, out var dilations, out var pads);
 
+            // depthwise（每组 1 个输出通道）先走专用直接卷积：GEMM 类实现在这种形状上会退化成
+            // 「K×spatial 的 im2col」，MobileNet 系（YuNet）的 26 个 depthwise 全靠这条路径。
+            if (Kernels.DepthwiseConv.TryConv(
+                    input, weight, bias, output,
+                    _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1]))
+            {
+                if (FusedActivation is { } depthwiseActivation)
+                    TensorOps.ElementWiseUnary(depthwiseActivation, output, output);
+                return;
+            }
+
             // 3×3 / s1 / pad1 优先走 Winograd F(2,3)（乘法量只有 4/9），
             // 其次走面板式直接卷积（不物化整幅 im2col），都不适用再回退 im2col
             if (!Kernels.Winograd.TryConv3x3(
