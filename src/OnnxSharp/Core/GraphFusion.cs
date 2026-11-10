@@ -22,15 +22,28 @@ internal static class GraphFusion
         total += FuseSilu(net, graph);
         total += FuseActivationIntoProducer(net, graph);
         total += FuseMatMulArgMax(net, graph);
-        total += FuseQuantizedMatMul(net, graph);
-        total += FuseAttention(net, graph);
-        total += FuseLayerNorm(net, graph);
+        if (!Disabled("dqmm"))
+            total += FuseQuantizedMatMul(net, graph);
+        if (!Disabled("attention"))
+            total += FuseAttention(net, graph);
+        if (!Disabled("layernorm"))
+            total += FuseLayerNorm(net, graph);
 
         // 逐元素链融合放最后：前面两步可能已经把 Sigmoid+Mul 变成单个 Silu，
         // 那样链里就少一个节点，融合结果的寄存器也更省。
         total += FuseElementWiseChains(net, graph);
 
         return total;
+    }
+
+    /// <summary>
+    /// 单项融合的开关（<c>ONNXSHARP_NO_FUSE=attention,dqmm</c> 可临时关掉）。
+    /// 本机负载抖动很大，性能结论只能靠**交替 A/B** 得到 —— 这个开关就是为此留的。
+    /// </summary>
+    private static bool Disabled(string name)
+    {
+        string? skip = Environment.GetEnvironmentVariable("ONNXSHARP_NO_FUSE");
+        return skip is not null && skip.Contains(name, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>可以进融合链的逐元素算子（都是同形状、无广播的 F32 运算）。</summary>

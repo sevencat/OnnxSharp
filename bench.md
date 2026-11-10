@@ -316,3 +316,27 @@ min（无干扰下限）：
    - 本轮开跑前发现 `SC2_x64` 满载占核，前两轮全表**作废**（已删除，不进仓库）：
      同一份代码 ORT 的 yolov8s median 跑出 243 / 194，OpenCV 的 rfdetr-small 跑出 222 / 275。
      **跑全表前先看 `(Get-Process).CPU` 增量**，否则整轮数据只能当噪声。
+
+## 2026-11-11 夜：bench 顺序偏置修正 + yolo11n 复测 + YuNet
+
+**先修方法学**：`run_all.py` 原来是「同一个引擎连跑 N 轮再换下一个」。本机是功耗受限的 APU，
+排在前面的引擎总能吃到更高的 boost 档 —— 实测同一份代码、同一个会话：我们 38.2 / 36.7 基本不变，
+而 ORT 从历史基线 41 变成 **107**、OpenCV 从 28.6 变成 **138**、SimdYolo 从 34.6 变成 **68**（median）。
+现在改成**每轮把引擎顺序轮转一格**，再取各引擎自己的最好值。
+
+修正后 yolo11n（iters=40 / warmup=5 / threads=16 / rounds=4，每轮轮转）：
+
+| 引擎 | median | min |
+|---|---:|---:|
+| onnxsharp | 30.0 | 28.0 |
+| onnxruntime-cpu | 21.1 | 19.9 |
+| opencv-dnn | 24.3 | 23.1 |
+| simdyolo | 18.1 | 15.9 |
+
+⇒ **修正一条旧结论**：以前写的「OnnxSharp 稳定快于 ONNXRuntime CPU」是 **median 口径 + 顺序偏置**
+共同造成的假象（ORT 的 median 对后台负载特别敏感，min 才是它的真实算力）。按 **min** 看，
+ORT 比我们快 ~1.4×、SimdYolo 快 ~1.8×、OpenCV 快 ~1.2×。
+yolov8n / yolov8s 本轮被后台负载污染（我们 236 ms、ORT 126 ms），**不采信**，等空闲时重跑。
+
+**YuNet（新增模型，单引擎数字）**：`bench --iters 40 --warmup 10 --threads 16`，
+`yunet.onnx`（0.22 MB，91 个执行算子，640×640）：**median 19.0 ms / min 15.8 ms**。本轮没有跨引擎对照。

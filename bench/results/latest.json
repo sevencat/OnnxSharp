@@ -2,149 +2,31 @@
   "iters": 40,
   "warmup": 5,
   "threads": 16,
-  "rounds": 2,
+  "rounds": 3,
   "results": [
     {
-      "model": "yolo11n",
-      "runtime": "onnxsharp",
-      "median_ms": 36.7,
-      "min_ms": 33.3
-    },
-    {
-      "model": "yolo11n",
-      "runtime": "onnxruntime-cpu",
-      "median_ms": 41.18,
-      "min_ms": 27.79
-    },
-    {
-      "model": "yolo11n",
-      "runtime": "opencv-dnn",
-      "median_ms": 28.57,
-      "min_ms": 27.31
-    },
-    {
-      "model": "yolo11n",
-      "runtime": "simdyolo",
-      "median_ms": 34.65,
-      "min_ms": 31.21
-    },
-    {
       "model": "yolov8n",
       "runtime": "onnxsharp",
-      "median_ms": 35.8,
-      "min_ms": 33.4
+      "median_ms": 31.8,
+      "min_ms": 30.1
     },
     {
       "model": "yolov8n",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 57.5,
-      "min_ms": 35.81
+      "median_ms": 25.64,
+      "min_ms": 22.83
     },
     {
       "model": "yolov8n",
       "runtime": "opencv-dnn",
-      "median_ms": 30.85,
-      "min_ms": 29.0
+      "median_ms": 71.39,
+      "min_ms": 31.83
     },
     {
       "model": "yolov8n",
       "runtime": "simdyolo",
-      "median_ms": 27.6,
-      "min_ms": 24.37
-    },
-    {
-      "model": "yolov8s",
-      "runtime": "onnxsharp",
-      "median_ms": 92.4,
-      "min_ms": 88.0
-    },
-    {
-      "model": "yolov8s",
-      "runtime": "onnxruntime-cpu",
-      "median_ms": 158.5,
-      "min_ms": 92.94
-    },
-    {
-      "model": "yolov8s",
-      "runtime": "opencv-dnn",
-      "median_ms": 77.35,
-      "min_ms": 74.91
-    },
-    {
-      "model": "yolov8s",
-      "runtime": "simdyolo",
-      "median_ms": 56.67,
-      "min_ms": 53.22
-    },
-    {
-      "model": "yolo11s",
-      "runtime": "onnxsharp",
-      "median_ms": 85.1,
-      "min_ms": 81.6
-    },
-    {
-      "model": "yolo11s",
-      "runtime": "onnxruntime-cpu",
-      "median_ms": 111.22,
-      "min_ms": 64.41
-    },
-    {
-      "model": "yolo11s",
-      "runtime": "opencv-dnn",
-      "median_ms": 73.13,
-      "min_ms": 71.18
-    },
-    {
-      "model": "yolo11s",
-      "runtime": "simdyolo",
-      "median_ms": 58.65,
-      "min_ms": 55.32
-    },
-    {
-      "model": "rfdetr-small",
-      "runtime": "onnxsharp",
-      "median_ms": 231.5,
-      "min_ms": 219.8
-    },
-    {
-      "model": "rfdetr-small",
-      "runtime": "onnxruntime-cpu",
-      "median_ms": 382.7,
-      "min_ms": 300.42
-    },
-    {
-      "model": "rfdetr-small",
-      "runtime": "opencv-dnn",
-      "median_ms": 191.7,
-      "min_ms": 187.27
-    },
-    {
-      "model": "rfdetr-small",
-      "runtime": "simdyolo",
-      "error": "RuntimeError:    at Program.<Main>$(String[] args) in F:\\code\\SimdYolo\\src\\SimdYolo.Cli\\Program.cs:line 39"
-    },
-    {
-      "model": "rfdetr-medium",
-      "runtime": "onnxsharp",
-      "median_ms": 299.4,
-      "min_ms": 287.0
-    },
-    {
-      "model": "rfdetr-medium",
-      "runtime": "onnxruntime-cpu",
-      "median_ms": 454.96,
-      "min_ms": 297.52
-    },
-    {
-      "model": "rfdetr-medium",
-      "runtime": "opencv-dnn",
-      "median_ms": 243.08,
-      "min_ms": 237.02
-    },
-    {
-      "model": "rfdetr-medium",
-      "runtime": "simdyolo",
-      "error": "RuntimeError:    at Program.<Main>$(String[] args) in F:\\code\\SimdYolo\\src\\SimdYolo.Cli\\Program.cs:line 39"
+      "median_ms": 100.15,
+      "min_ms": 19.98
     }
   ]
 }

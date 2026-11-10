@@ -695,6 +695,74 @@ Tile TopK Transpose Unsqueeze Where
     编解码要额外引 `Sdcb.SimdCodecs.Jpeg / Png / Bmp` 并在 `ImageHost.RegisterCodecs()` 里显式注册；
     没注册的格式调用时抛 `FeatureNotSupportedException`。产品库 `OnnxSharp` 一行都不引 —— 它只吃像素。
 
+### 6.21 YuNet 人脸检测（2026-11-11 夜）
+
+模型 `yunet.onnx`（0.22 MB）：106 节点 / 8 种算子（Conv 53、Relu 15、Transpose 12、Reshape 12、
+Sigmoid 6、MaxPool 4、Resize 2、Add 2），静态输入 `[1,3,640,640]`，12 个输出头
+（cls/obj/bbox/kps × stride 8/16/32）—— **算子全在已支持范围内，引擎一行没改**。
+
+新增 `Vision/YuNetDetector`（门面）+ `Vision/YuNetDecoder`（解码/NMS）+ `Vision/FaceDetection.cs`
+（`Face` / `FaceLandmarks` 结果类型）+ CLI `face` 子命令 + `YuNetTests`（3 条用例）。
+
+- **对拍口径**：`cv2.FaceDetectorYN` 做 oracle，同一个 640×640 输入下
+  **框差 0.00 px、5 点关键点差 3e-5 px、分数差 5e-7**。
+- 稳态性能（640×640，16 线程，30 次迭代）：**median 19.0 ms / min 15.8 ms**。
+- lena 512×512：1 张脸 score 0.9135，坐标换回原图后 = `[209.3, 181.5, 142.2 × 206.0]`。
+
+#### 三个坑
+
+1. **`cv2.FaceDetectorYN` 不 resize，它按 32 的倍数 pad 后按原分辨率跑**（`face_detect.cpp`：
+   `padWithDivisor` → `blobFromImage(pad_image)`）。而我们的模型是静态 640×640。一开始我拿
+   「resize 到 640 的结果」去比「cv2 在 512 上跑的结果」，凭空多出 6 px 框差 / 8 px 关键点差，
+   差点去改一个本来就正确的解码公式。**正确做法：两边喂同一个 640×640 输入再比。**
+2. **`ImagePreprocessor` 的张量恒为 RGB**，它的 `bgr` 参数描述的是**源像素**顺序；YuNet 要 BGR
+   （OpenCV `blobFromImage` 不做 swapRB）。直接传 `bgr: true` 得到的张量是 RGB，实测
+   `mean|d| = 49.7 / max|d| = 156`（红蓝通道互换的典型量级），框就整体偏 6 px。
+   现在门面里显式 `bgr: !bgr` 并写了注释，还补了一条 `preprocessing matches the reference blob`
+   用例把这一步钉住（现在 max|d| = 0）。
+3. **解码公式只能抄 `face_detect.cpp`，不能按 SSD prior 猜**：YuNet 是
+   `cx = (col + bbox[0]) * stride`、`w = exp(bbox[2]) * stride`（**格子下标、没有 +0.5**，
+   也没有 variances），score 是 `sqrt(cls·obj)`。按 SSD 的 `(j+0.5+dx·var)·stride` 去猜，
+   关键点会系统性偏半个格子。
+
+#### 不支持的部分
+
+`yunet_int8.onnx` 是 **QDQ** 图（`QuantizeLinear` / `DequantizeLinear`），这两个算子还没实现
+（`plan.md` M10-04/05），所以 int8 版现在直接报 `op type 'QuantizeLinear' is not implemented yet`。
+
+### 6.20 性能复核：交替 A/B（含两条撤回，2026-11-11 夜）
+
+本机（8845HS APU）单次测量的抖动极大 —— 同一份代码、同一条命令的 median 从 79 到 110 ms 都出现过
+（§6.19 那组「r1→r3 一路升高」就是典型的负载/睿频爬坡）。而 §6.18/§6.19 里有几处结论是
+「拿今天的数字比昨天的数字」得出的，**那是无效对比**。所以这次给代码加了两把运行期开关（不用重编）：
+
+- `ONNXSHARP_NO_FUSE=attention,dqmm,layernorm`（可以是任意子集）
+- `ONNXSHARP_NO_SHAPECACHE=1`
+
+然后用「交替 A/B × 5~6 轮、取各自最好值」重新量（`profile` 的 sum-of-min 口径，76 帧 encoder）：
+
+| 项目 | 关掉 | 打开 | 效果 |
+|---|---|---|---|
+| **全部四项** | 66.5 / 67.0 | **43.8 / 44.5** | **−33%（−22.5 ms）** |
+| └ `DynamicQuantizeMatMul` 融合 | 59.5 | 45.4 | **−14.1 ms（−23.7%）** |
+| └ `FuseAttention` | 52.0 | 44.6 | **−7.4 ms（−13.4%）** |
+| └ `FuseLayerNorm` | 44.4 | 43.7 | −0.7 ms（−1.6%） |
+| └ 形状/类型推断缓存 | 66.9 | 67.0 | **0（噪声内）** |
+
+端到端（`asr --repeat 10` 的 min）：**101 ms → 84 ms（−17%）**。
+
+**两条撤回**：
+
+1. §6.18 写「形状缓存省 ~17 ms（encoder 103 → 86）」—— 那是拿 `bench` 的 median 比历史数字，
+   **不是 A/B**。实测：在 3858 算子的原图、以及融合后 2244 算子的图上，缓存都**省不到 0.1 ms**，
+   `bench` 的 `alloc` 也几乎不变（42.7 vs 42.4 MB/iter）。它值的是「行为稳定、没有额外分配」，
+   不该再算进性能表。（这也说明这张图每个算子的形状推断本来就很便宜 —— 每算子 ~25 ns 级别。）
+2. §6.18 猜 `FuseLayerNorm`「收益约 5~8 ms」—— A/B 实测 **0.7 ms**。81 个 LN 每帧一共才 0.7 ms，
+   `LayerNormalization` 内核本身已经很快；手写 9 个算子那版主要输在「算子个数」，时间本来就不多。
+
+**方法学**：往后的性能结论一律以「交替 A/B + 各自最好值」为准；两把开关保留在代码里
+（`GraphFusion.Disabled` / `Interpreter.DisableShapeCache`），下次再遇到争议可以直接复跑。
+
 ### 6.19 `FuseAttention`：整条 multi-head attention 折成一层（2026-11-11 傍晚）
 
 **先说结论**：融合干净、数值也对（静态夹具 max|diff| = 1.8e-7，动态 encoder 与 ORT 的 diff 与融合前

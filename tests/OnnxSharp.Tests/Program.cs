@@ -18,6 +18,7 @@ cases.AddRange(PadConv1DTests.Cases());
 cases.AddRange(ElementwiseBroadcastTests.Cases());
 cases.AddRange(MatMulArgMaxTests.Cases());
 cases.AddRange(AttentionTests.Cases());
+cases.AddRange(YuNetTests.Cases());
 cases.AddRange(CifTests.Cases());
 cases.AddRange(FbankTests.Cases());
 cases.AddRange(AsrEndToEndTests.Cases());

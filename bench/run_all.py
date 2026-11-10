@@ -128,24 +128,33 @@ def main():
 
     table = {}
     for model in models:
-        for runtime in runtimes:
-            key = (model["name"], runtime)
-            if not os.path.exists(model["path"]):
-                table[key] = {"error": "model not found"}
-                continue
-            best = None
-            errors = []
-            for _ in range(max(1, args.rounds)):
+        if not os.path.exists(model["path"]):
+            for runtime in runtimes:
+                table[(model["name"], runtime)] = {"error": "model not found"}
+            continue
+
+        # ⚠️ 顺序偏置：本机是功耗受限的 APU，同一次会话里「排在前面的引擎」总能拿到更高的
+        # boost 档，实测能让 ORT/OpenCV 的数字差 2~3 倍（我们自己的引擎反而稳定）。
+        # 所以轮次必须**交替**：每轮把引擎顺序轮转一格，再取各引擎自己的最好值。
+        samples = {runtime: [] for runtime in runtimes}
+        errors = {runtime: [] for runtime in runtimes}
+
+        for rnd in range(max(1, args.rounds)):
+            shift = rnd % len(runtimes)
+            rotated = runtimes[shift:] + runtimes[:shift]
+            for runtime in rotated:
                 try:
-                    median, minimum = COLLECTORS[runtime](model, args.iters, args.warmup, args.threads)
+                    samples[runtime].append(COLLECTORS[runtime](model, args.iters, args.warmup, args.threads))
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{type(exc).__name__}: {exc}")
-                    continue
-                if best is None or median < best[0]:
-                    best = (median, minimum)
-            table[key] = ({"median_ms": round(best[0], 2), "min_ms": round(best[1], 2)}
-                          if best else {"error": errors[-1] if errors else "failed"})
-            print(f"{model['name']:<14}{runtime:<18}{table[key]}", flush=True)
+                    errors[runtime].append(f"{type(exc).__name__}: {exc}")
+
+        for runtime in runtimes:
+            got = samples[runtime]
+            table[(model["name"], runtime)] = (
+                {"median_ms": round(min(got, key=lambda v: v[0])[0], 2),
+                 "min_ms": round(min(v[1] for v in got), 2)}
+                if got else {"error": errors[runtime][-1] if errors[runtime] else "failed"})
+            print(f"{model['name']:<14}{runtime:<18}{table[(model['name'], runtime)]}", flush=True)
 
     os.makedirs(RESULTS, exist_ok=True)
     payload = {

@@ -566,6 +566,13 @@ OnnxSharp.Cli features sherpa\model.int8.onnx test.wav --out feats.f32
 | 单算子微模型 | GEMM / attention / 逐元素链，用于内核定点调优 |
 | sherpa Paraformer encoder + CIF（int8） | 用手写脚本把 `model.int8.onnx` 在第一个 `Loop`（CIF）前切开，5715 节点的 encoder 子图**直接跑通**（`speech[1,96,560]` → `[1,97,320]`，**104 ms/帧**；同图 ORT 30.9 ms）；`DynamicQuantizeLinear` + `MatMulInteger`(+s8 权重、per-column 零点) 与 ONNXRuntime **逐位一致**（max\|diff\| = 0）。CIF 用 `Speech/Paraformer/ContinuousIntegrateAndFire` 重写（绕开 `Loop`/`Sequence*`），与 ORT 录的 `frames`/`fires`/`frame.7`/`integrate.7` **逐位一致**，token 数 21 = ORT 21 |
 | **Paraformer 端到端（中文）** | Windows 自带的 Microsoft Huihui 合成 4.54 s 中文 wav → 76 帧特征 → 16 个 token → **「今天气真不错我们出去走一走吧」**，与 ORT 全模型参考文本**逐字一致**；整链纯 C#。**热态 81~87 ms**（feat 4~7 / encoder 62~69 / decoder 14~15），冷启动 ~1.1 s；同机 ONNXRuntime 55.6 ms（**~1.5×**） |
+| **YuNet（人脸检测，fp32）** | 官方 `face_detection_yunet` 静态导出（`[1,3,640,640]`，106 节点 / 8 种算子）。**端到端与 OpenCV `cv2.FaceDetectorYN` 逐值对齐**：同一个 640×640 输入下框差 **0.00 px**、5 点关键点差 **3e-5 px**、分数差 5e-7（`YuNetTests`）；512×512 lena 检出 1 张脸 score 0.9135，坐标换回原图空间；预处理是「整图拉伸 + BGR + 0..255 原值」。`face` 子命令可直接出框 / JSON / 画框图；16 线程稳态 **19.0 ms 中位 / 15.8 ms 最小**（640×640） |
+| YuNet int8（`yunet_int8.onnx`） | ❌ 暂不支持：它走 QDQ（`QuantizeLinear` / `DequantizeLinear`），这两个算子还没实现（`plan.md` M10-04/05） |
+| SAM3（vision / geometry / text 编码器 + decoder） | 框提示分段跑通，decoder 与 ONNXRuntime **逐值一致**；行人框提示 top-1 **0.932** |
+
+> 跨引擎性能对照（OnnxSharp / ONNXRuntime CPU / OpenCV 5 dnn / SimdYolo）见 [bench.md](bench.md)。
+> 同类引擎 **Sdcb.SimdOnnx 目前跑不了 YOLO**：它的 `Softmax` 只支持最后一维，而 YOLO 的 DFL 是
+> `axis=1`，`GraphCompiler.EmitSoftmax` 会直接抛 `NotSupportedException`（yolo11n / v8n / v8s / 11s 都撞）。
 
 ### 限制
 
@@ -956,13 +963,14 @@ The Paraformer encoder sub-graph measured (`speech[1,96,560]`, 97 frames):
 | + vectorised 1-D `Conv` and `DynamicQuantizeLinear` min/max | **104 ms (104× overall)** |
 | ONNXRuntime (same split graph) | 30.9 ms |
 
-Later work, measured on the 76-frame end-to-end fixture (`profile` sum-of-min, so it is comparable across
-runs even on a loaded machine): the per-op shape/type inference cache took the encoder from 51.8 ms to
-~48 ms, `DynamicQuantizeMatMul` (the `DQL → MatMulInteger → Cast → Mul → Add` chain folded into one layer)
-brought it to 51.8 → 47.5 ms, and `FuseAttention` (40 self-attention blocks folded into one layer each,
-killing 40 `Softmax`/80 `MatMul`/the `[B,H,T,T]` scores tensors) took the last **−4 ms (−8%)**. ORT needs
-39 ms on the same encoder, so what is left is the `DynamicQuantizeMatMul` GEMMs themselves (66% of our
-time) — i.e. an int8 kernel, not more fusion.
+Later work, measured with **alternating A/B** on the 76-frame end-to-end fixture (`profile` sum-of-min,
+each switch toggled through `ONNXSHARP_NO_FUSE` / `ONNXSHARP_NO_SHAPECACHE`, best of 5–6 runs):
+encoder **66.5 → 43.8 ms (−33%)**, of which `DynamicQuantizeMatMul` (the `DQL → MatMulInteger → Cast →
+Mul → Add` chain folded into one layer) is −14.1 ms, `FuseAttention` (40 self-attention blocks folded into
+one layer each, killing 40 `Softmax`/80 `MatMul`/the `[B,H,T,T]` scores tensors) is −7.4 ms, and
+`FuseLayerNorm` is −0.7 ms. The per-op shape/type inference cache measures **0** on this graph — it keeps
+allocation flat but does not speed anything up. ORT needs 39 ms on the same encoder, so what is left is the
+`DynamicQuantizeMatMul` GEMMs themselves (~74% of our time) — i.e. an int8 kernel, not more fusion.
 
 So quantized graphs are both correct and usable. The remaining gap is **not VNNI** — neither implementation
 gets VNNI on this machine. ORT's own profiler shows it fuses `DQL + MatMulInteger` (and the manual LayerNorm)
@@ -1011,6 +1019,13 @@ Forward pass only, batch=1, FP32, 16 threads, median of 40 frames (Ryzen 7 8845H
 | rfdetr-small / rfdetr-medium | Runs; decoding matches official `rfdetr.export._runtime.decode.decode_detections` (41/41 boxes, 0.00 px) |
 | Micro models | Single-operator graphs for kernel-level tuning |
 | sherpa Paraformer encoder (int8) | The 5715-node encoder sub-graph (split before the first `Loop`) runs end-to-end (`speech[1,96,560]` → `[1,97,320]`) in **104 ms** (ORT: 30.9 ms); `DynamicQuantizeLinear` + `MatMulInteger` (s8 weights, per-column zero points) match ONNXRuntime **bit-exactly** (max\|diff\| = 0) |
+| **YuNet (face detection, fp32)** | The official static `face_detection_yunet` export (`[1,3,640,640]`, 106 nodes, 8 op types). **Matches OpenCV `cv2.FaceDetectorYN` value-by-value** on the same 640×640 input: box **0.00 px**, 5 landmarks **3e-5 px**, score 5e-7 (`YuNetTests`). Detects 1 face (score 0.9135) on 512×512 lena, with coordinates mapped back to the original image; preprocessing is "stretch + BGR + raw 0..255". `face` CLI prints boxes / JSON / a marked image; **19.0 ms median / 15.8 ms min** at 640×640 on 16 threads |
+| YuNet int8 (`yunet_int8.onnx`) | ❌ not supported yet: it is a QDQ graph (`QuantizeLinear` / `DequantizeLinear`), which the engine does not implement (`plan.md` M10-04/05) |
+| SAM3 (vision / geometry / text encoders + decoder) | Box-prompted segmentation runs; decoder matches ONNXRuntime **value-by-value**; pedestrian box prompt top-1 **0.932** |
+
+> Cross-engine numbers (OnnxSharp / ONNXRuntime CPU / OpenCV 5 dnn / SimdYolo) live in [bench.md](bench.md).
+> **Sdcb.SimdOnnx cannot run YOLO** today: its `Softmax` only supports the last axis and YOLO's DFL uses
+> `axis=1`, so `GraphCompiler.EmitSoftmax` throws `NotSupportedException` (yolo11n / v8n / v8s / 11s alike).
 
 ### Limitations
 

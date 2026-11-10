@@ -32,6 +32,7 @@ return args[0].ToLowerInvariant() switch
     "bench" => Bench(args),
     "profile" => Profile(args),
     "detect" => Detect(args),
+    "face" => Face(args),
     "features" => Features(args),
     "asr" => Asr(args),
     "ocr" => Ocr(args),
@@ -68,6 +69,9 @@ static int Usage()
     Console.WriteLine("                                      # 输入已预处理好的 F32，跳过 letterbox");
     Console.WriteLine("  OnnxSharp.Cli ocr <image> --det det.onnx --rec rec.onnx --dict keys.txt [--out marked.jpg]");
     Console.WriteLine("                     [--cls cls.onnx] [--limit 960] [--box 0.6] [--unclip 1.6] [--json]");
+    Console.WriteLine("  OnnxSharp.Cli face <yunet.onnx> <image> [--conf 0.6] [--iou 0.3] [--topk 5000]");
+    Console.WriteLine("                     [--max-faces N] [--json out.json] [--out marked.jpg]");
+    Console.WriteLine("                                      # YuNet 人脸检测：框 + 5 点关键点，坐标是原图像素");
     Console.WriteLine("                                      # PaddleOCR：DB 检测 → 方向分类 → CTC 识别");
     Console.WriteLine("  （<image> 由 ImageFacade 解码：JPEG / PNG / BMP / PPM 都可以）");
     Console.WriteLine("  OnnxSharp.Cli sam3 <image> --models <fp32 dir> --box x1,y1,x2,y2 [--box ...]");
@@ -1128,8 +1132,94 @@ static int Detect(string[] args)
     return 0;
 }
 
-// ---------------- 画框 / 保存（ImageFacade） ----------------
+// ---------------- 人脸检测：YuNet ----------------
 
+static int Face(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("usage: face <yunet.onnx> <image> [--conf 0.6] [--iou 0.3] [--topk 5000]");
+        Console.Error.WriteLine("                   [--max-faces N] [--json out.json] [--out marked.jpg]");
+        return 2;
+    }
+
+    string modelPath = args[1];
+    string imagePath = args[2];
+    var options = ParseOptions(args, 3);
+
+    var detectorOptions = new FaceDetectorOptions
+    {
+        ScoreThreshold = options.GetFloat("--conf", 0.6f),
+        IouThreshold = options.GetFloat("--iou", 0.3f),
+        TopK = options.GetInt("--topk", 5000),
+        MaxFaces = options.GetInt("--max-faces", int.MaxValue),
+    };
+
+    using CliImage image = CliImage.Load(imagePath);
+    var detector = new YuNetDetector(Net.ReadModel(modelPath), detectorOptions);
+
+    var watch = Stopwatch.StartNew();
+    // CliImage.Pixels 是紧凑 RGB24（行跨度 = width*3）→ bgr: false
+    IReadOnlyList<Face> faces = detector.Detect(image.Pixels, image.Width, image.Height, bgr: false);
+    watch.Stop();
+
+    Console.WriteLine($"image     : {imagePath}  {image.Width}x{image.Height} -> net {detector.InputWidth}x{detector.InputHeight}");
+    Console.WriteLine($"faces     : {faces.Count}  ({watch.Elapsed.TotalMilliseconds:F1} ms 含预处理+推理+解码, conf>={detectorOptions.ScoreThreshold})");
+
+    foreach (Face face in faces)
+    {
+        FaceLandmarks m = face.Landmarks;
+        Console.WriteLine(
+            $"  score {face.Score:F4}  box [{face.X:F1}, {face.Y:F1}, {face.Width:F1} x {face.Height:F1}]");
+        Console.WriteLine(
+            $"    re({m.RightEye.X:F1},{m.RightEye.Y:F1}) le({m.LeftEye.X:F1},{m.LeftEye.Y:F1}) " +
+            $"nt({m.Nose.X:F1},{m.Nose.Y:F1}) rm({m.RightMouth.X:F1},{m.RightMouth.Y:F1}) " +
+            $"lm({m.LeftMouth.X:F1},{m.LeftMouth.Y:F1})");
+    }
+
+    string? jsonPath = options.GetString("--json");
+    if (jsonPath is not null)
+    {
+        var payload = new
+        {
+            image = new { width = image.Width, height = image.Height },
+            input = new { width = detector.InputWidth, height = detector.InputHeight },
+            count = faces.Count,
+            faces = faces.Select(face => new
+            {
+                score = Math.Round(face.Score, 6),
+                box = new[] { face.X, face.Y, face.Width, face.Height }.Select(v => Math.Round(v, 3)),
+                landmarks = new[] { face.Landmarks.RightEye, face.Landmarks.LeftEye, face.Landmarks.Nose, face.Landmarks.RightMouth, face.Landmarks.LeftMouth }
+                    .Select(p => new[] { Math.Round(p.X, 3), Math.Round(p.Y, 3) }),
+            }),
+        };
+
+        File.WriteAllText(
+            jsonPath,
+            JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    string? outPath = options.GetString("--out");
+    if (outPath is not null)
+    {
+        var drawn = new FacadeDetection[faces.Count];
+        for (int i = 0; i < drawn.Length; i++)
+        {
+            Face face = faces[i];
+            drawn[i] = new FacadeDetection(
+                new RectF(face.X, face.Y, face.Width, face.Height),
+                $"face {face.Score:F2}",
+                face.Score);
+        }
+
+        ImageFacade.Pipeline.DetectionDrawing.DrawDetections(image.Image, drawn, LabelStyle(image.Width, image.Height));
+        image.Image.Save(outPath, new SaveOptions { Quality = 92 });
+    }
+
+    return 0;
+}
+
+// ---------------- 画框 / 保存（ImageFacade） ----------------
 /// <summary>把检测框画到源图上并另存（ImageFacade 自绘 + 内置中文字体，纯托管）。</summary>
 static void SaveDetections(CliImage image, IReadOnlyList<Detection> detections, string[]? labels, string path)
 {

@@ -12,6 +12,13 @@ internal static class Interpreter
     private static readonly IReadOnlyList<Tensor> NoTemps = Array.Empty<Tensor>();
 
     /// <summary>
+    /// 关掉「按输入签名缓存形状/类型推断」（<c>ONNXSHARP_NO_SHAPECACHE=1</c>）。
+    /// 只用于 A/B 度量：本机负载抖动很大，性能结论必须靠交替测量。
+    /// </summary>
+    private static readonly bool DisableShapeCache =
+        Environment.GetEnvironmentVariable("ONNXSHARP_NO_SHAPECACHE") is { Length: > 0 };
+
+    /// <summary>
     /// 执行整张图。<paramref name="executeLayers"/> = false 时只做形状/类型推断与缓冲绑定，
     /// 不调用 <see cref="Layer.Forward"/>（供 `dump-graph` 与形状对齐测试使用）。
     /// <para>
@@ -63,7 +70,8 @@ internal static class Interpreter
 
             if (!op.DynamicOutputShapes())
             {
-                bool cacheHit = layer.ShapeCacheValid
+                bool cacheHit = !DisableShapeCache
+                    && layer.ShapeCacheValid
                     && SameShapes(layer.CachedInShapes, inpShapes)
                     && SameTypes(layer.CachedInTypes, inpTypes);
 
