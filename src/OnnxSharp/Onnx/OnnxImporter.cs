@@ -45,7 +45,8 @@ internal static class OnnxImporter
                 continue;
             }
 
-            if (node.Domain.Length != 0 && node.Domain != "ai.onnx" && node.Domain != "ai.onnx.ml")
+            if (node.Domain.Length != 0 && node.Domain != "ai.onnx" && node.Domain != "ai.onnx.ml"
+                && node.Domain != "com.microsoft")
                 throw new OnnxSharpException(
                     $"node '{node.Name}' ({node.OpType}) uses unsupported domain '{node.Domain}'");
 

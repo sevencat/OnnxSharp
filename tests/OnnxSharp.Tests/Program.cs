@@ -20,6 +20,7 @@ cases.AddRange(ElementwiseBroadcastTests.Cases());
 cases.AddRange(MatMulArgMaxTests.Cases());
 cases.AddRange(AttentionTests.Cases());
 cases.AddRange(YuNetTests.Cases());
+cases.AddRange(YuNetInt8Tests.Cases());
 cases.AddRange(CifTests.Cases());
 cases.AddRange(FbankTests.Cases());
 cases.AddRange(AsrEndToEndTests.Cases());

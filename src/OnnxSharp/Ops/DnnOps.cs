@@ -876,6 +876,33 @@ internal static class DnnOps
             int dH = dilations[0], dW = dilations[1];
             int pT = pads[0], pL = pads[1];
 
+            // 量化张量的池化：同一 scale/zp 下 max 单调，所以可以直接对整数取 max（ORT 同做法）
+            if (input.DType is DType.U8 or DType.I8)
+            {
+                bool signed = input.DType == DType.I8;
+
+                ParallelRange.For(batches * channels, (begin, end) =>
+                {
+                    if (signed)
+                    {
+                        var sbytes = input.AsSpan<sbyte>();
+                        var dbytes = output.AsSpan<sbyte>();
+                        for (int t = begin; t < end; t++)
+                            PoolQuantized(sbytes, dbytes, t, inH, inW, outH, outW, kH, kW, sH, sW, dH, dW, pT, pL);
+                    }
+                    else
+                    {
+                        var sbytes = input.AsSpan<byte>();
+                        var dbytes = output.AsSpan<byte>();
+                        for (int t = begin; t < end; t++)
+                            PoolQuantizedBytes(sbytes, dbytes, t, inH, inW, outH, outW, kH, kW, sH, sW, dH, dW, pT, pL);
+                    }
+                });
+
+                return;
+            }
+
+
             // 按 (batch, channel) 并行：SPPF 的三个 5×5 池化原来是整段串行，
             // 内层还要对每个 tap 做一次边界判断。
             ParallelRange.For(batches * channels, (begin, end) =>
@@ -953,6 +980,163 @@ internal static class DnnOps
                 }
             });
         }
+
+        /// <summary>
+        /// 量化张量的池化（u8，一次比 32 个输出）：直接比整数，不做反量化 ——
+        /// 同一 scale/zp 下 <c>max</c> 与「反量化后取 max」等价。
+        /// </summary>
+        private static void PoolQuantizedBytes(
+            ReadOnlySpan<byte> source,
+            Span<byte> target,
+            int t,
+            int inH,
+            int inW,
+            int outH,
+            int outW,
+            int kH,
+            int kW,
+            int sH,
+            int sW,
+            int dH,
+            int dW,
+            int pT,
+            int pL)
+        {
+            long inBase = (long)t * inH * inW;
+            long outBase = (long)t * outH * outW;
+
+            // 与 F32 路径同一套判据：sW = 1、dW = 1 且窗口整块落在输入内 → 32 个输出一起算
+            bool vectorizable = dW == 1 && sW == 1;
+            int vStart = vectorizable ? Math.Max(0, pL) : 0;
+            int vLimit = vectorizable
+                ? Math.Min(outW, inW - kW - (Vector256<byte>.Count - 1) + pL)
+                : 0;
+
+            for (int oy = 0; oy < outH; oy++)
+            {
+                int y0 = oy * sH - pT;
+
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    if (vectorizable && ox >= vStart && ox + Vector256<byte>.Count <= vLimit)
+                    {
+                        int vx = ox - pL;
+                        var acc = Vector256<byte>.Zero;
+
+                        for (int ky = 0; ky < kH; ky++)
+                        {
+                            int y = y0 + ky * dH;
+                            if ((uint)y >= (uint)inH)
+                                continue;
+
+                            long rowBase = inBase + (long)y * inW + vx;
+                            for (int kx = 0; kx < kW; kx++)
+                            {
+                                var value = Vector256.LoadUnsafe(
+                                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source[(int)(rowBase + kx)..]));
+                                acc = Vector256.Max(acc, value);
+                            }
+                        }
+
+                        acc.StoreUnsafe(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(
+                            target[(int)(outBase + (long)oy * outW + ox)..]));
+                        ox += Vector256<byte>.Count - 1;
+                        continue;
+                    }
+
+                    int x0 = ox * sW - pL;
+                    byte best = 0;
+                    bool any = false;
+
+                    for (int ky = 0; ky < kH; ky++)
+                    {
+                        int y = y0 + ky * dH;
+                        if ((uint)y >= (uint)inH)
+                            continue;
+
+                        long rowBase = inBase + (long)y * inW;
+                        for (int kx = 0; kx < kW; kx++)
+                        {
+                            int x = x0 + kx * dW;
+                            if ((uint)x >= (uint)inW)
+                                continue;
+
+                            byte value = source[(int)(rowBase + x)];
+                            if (!any || value > best)
+                            {
+                                best = value;
+                                any = true;
+                            }
+                        }
+                    }
+
+                    target[(int)(outBase + (long)oy * outW + ox)] = best;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 量化张量的一次池化（<c>u8</c>/<c>i8</c> 通用）：直接比整数，不做反量化 ——
+        /// 同一 scale/zp 下 <c>max</c> 与「反量化后取 max」等价。
+        /// </summary>
+        private static void PoolQuantized<T>(
+            ReadOnlySpan<T> source,
+            Span<T> target,
+            int t,
+            int inH,
+            int inW,
+            int outH,
+            int outW,
+            int kH,
+            int kW,
+            int sH,
+            int sW,
+            int dH,
+            int dW,
+            int pT,
+            int pL)
+            where T : IComparable<T>
+        {
+            long inBase = (long)t * inH * inW;
+            long outBase = (long)t * outH * outW;
+
+            for (int oy = 0; oy < outH; oy++)
+            {
+                int y0 = oy * sH - pT;
+
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    int x0 = ox * sW - pL;
+                    T best = default!;
+                    bool any = false;
+
+                    for (int ky = 0; ky < kH; ky++)
+                    {
+                        int y = y0 + ky * dH;
+                        if ((uint)y >= (uint)inH)
+                            continue;
+
+                        long rowBase = inBase + (long)y * inW;
+                        for (int kx = 0; kx < kW; kx++)
+                        {
+                            int x = x0 + kx * dW;
+                            if ((uint)x >= (uint)inW)
+                                continue;
+
+                            T value = source[(int)(rowBase + x)];
+                            if (!any || value.CompareTo(best) > 0)
+                            {
+                                best = value;
+                                any = true;
+                            }
+                        }
+                    }
+
+                    target[(int)(outBase + (long)oy * outW + ox)] = best;
+                }
+            }
+        }
+
     }
 
     // ---------------- AveragePool ----------------
@@ -1240,6 +1424,38 @@ internal static class DnnOps
                 if (linear)
                     wxTab![ox] = Math.Clamp(sx, 0, inW - 1) - mapX[ox];
             }
+
+            // 量化张量（u8/i8）只支持 nearest：整数插值没有意义，量化图（YuNet-int8）也只用 nearest。
+            // 元素是 1 字节，拷贝与符号无关，所以 u8/i8 共用一条 byte 通道。
+            if (input.DType is DType.U8 or DType.I8)
+            {
+                if (linear)
+                    throw new OnnxSharpException($"Resize '{Name}': linear mode on {input.DType} is not supported");
+
+                ParallelRange.For(batches * channels, (begin, end) =>
+                {
+                    var s = input.AsSpan<byte>();
+                    var d = output.AsSpan<byte>();
+
+                    for (int t = begin; t < end; t++)
+                    {
+                        long inBase = (long)t * inH * inW;
+                        long outBase = (long)t * outH * outW;
+
+                        for (int oy = 0; oy < outH; oy++)
+                        {
+                            long rowIn = inBase + (long)mapY[oy] * inW;
+                            long rowOut = outBase + (long)oy * outW;
+
+                            for (int ox = 0; ox < outW; ox++)
+                                d[(int)(rowOut + ox)] = s[(int)(rowIn + mapX[ox])];
+                        }
+                    }
+                });
+
+                return;
+            }
+
 
             ParallelRange.For(batches * channels, (begin, end) =>
             {

@@ -105,9 +105,13 @@ internal static class QuantOps
             List<DType> outTypes,
             List<DType> tempTypes)
         {
+            // 输出 dtype 跟 zero_point 一致（u8 或 i8）——量化模型两种都有，
+            // 判错会把 zp 的符号语义搞反（YuNet-int8 就是 i8）。
+            var quantized = inTypes.Count > 2 && inTypes[2] == DType.I8 ? DType.I8 : DType.U8;
+
             outTypes.Clear();
             for (int i = 0; i < requiredOutputs; i++)
-                outTypes.Add(DType.U8);
+                outTypes.Add(quantized);
 
             tempTypes.Clear();
             for (int i = 0; i < requiredTemps; i++)

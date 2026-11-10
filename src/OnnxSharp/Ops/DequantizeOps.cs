@@ -1,3 +1,6 @@
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 
@@ -33,8 +36,7 @@ internal static class DequantizeOps
                 float s = scale[Math.Min(c, scale.Length - 1)];
                 int z = zeroPoint.IsEmpty ? 0 : zeroPoint[Math.Min(c, zeroPoint.Length - 1)];
                 int b = (o * channels + c) * inner;
-                for (int i = 0; i < inner; i++)
-                    target[b + i] = (values[b + i] - z) * s;
+                DequantizeRaw(values.Slice(b, inner), target.Slice(b, inner), s, z);
             }
 
             return;
@@ -51,8 +53,7 @@ internal static class DequantizeOps
                 float s = scale[Math.Min(c, scale.Length - 1)];
                 int z = zeroPoint.IsEmpty ? 0 : zeroPoint[Math.Min(c, zeroPoint.Length - 1)];
                 int b = (o * channels + c) * inner;
-                for (int i = 0; i < inner; i++)
-                    target[b + i] = (values[b + i] - z) * s;
+                DequantizeRaw(values.Slice(b, inner), target.Slice(b, inner), s, z);
             }
         }
     }
@@ -85,6 +86,100 @@ internal static class DequantizeOps
                 int clamped = (int)Math.Clamp(q, min, max);
                 quantized[b + i] = unchecked((byte)(sbyte)clamped);
             }
+        }
+    }
+
+    /// <summary>
+    /// 量化值 → F32：<c>(q - zero_point) * scale</c>（u8/i8，AVX2 一次 8 个）。
+    /// </summary>
+    public static void DequantizeValues(Tensor source, Span<float> destination, float scale, int zeroPoint)
+    {
+        if (source.DType == DType.I8)
+            DequantizeRaw(source.AsSpan<sbyte>(), destination, scale, zeroPoint);
+        else
+            DequantizeRaw(source.AsSpan<byte>(), destination, scale, zeroPoint);
+    }
+
+    private static void DequantizeRaw(ReadOnlySpan<sbyte> values, Span<float> destination, float scale, int zeroPoint)
+    {
+        var vScale = Vector256.Create(scale);
+        var vZero = Vector256.Create((float)zeroPoint);
+        int i = 0;
+
+        if (Avx2.IsSupported)
+        {
+            for (; i + 8 <= values.Length; i += 8)
+            {
+                var raw = Vector128.LoadUnsafe(ref MemoryMarshal.GetReference(values[i..]));
+                var floats = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(raw));
+                Avx.Multiply(Avx.Subtract(floats, vZero), vScale).StoreUnsafe(ref destination[i]);
+            }
+        }
+
+        for (; i < values.Length; i++)
+            destination[i] = (values[i] - zeroPoint) * scale;
+    }
+
+    private static void DequantizeRaw(ReadOnlySpan<byte> values, Span<float> destination, float scale, int zeroPoint)
+    {
+        var vScale = Vector256.Create(scale);
+        var vZero = Vector256.Create((float)zeroPoint);
+        int i = 0;
+
+        if (Avx2.IsSupported)
+        {
+            for (; i + 8 <= values.Length; i += 8)
+            {
+                var raw = Vector128.LoadUnsafe(ref MemoryMarshal.GetReference(values[i..]));
+                var floats = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(raw));
+                Avx.Multiply(Avx.Subtract(floats, vZero), vScale).StoreUnsafe(ref destination[i]);
+            }
+        }
+
+        for (; i < values.Length; i++)
+            destination[i] = (values[i] - zeroPoint) * scale;
+    }
+
+    /// <summary>
+    /// 把 F32 值按 <c>scale</c>/<c>zero_point</c> 饱和写回 u8/i8（<c>round_half_even</c>，AVX2 一次 8 个）。
+    /// 量化逐元素算子（<c>QLinearAdd</c>/<c>QLinearSigmoid</c>/<c>QLinearConv</c>）的公共尾巴。
+    /// </summary>
+    public static void QuantizeValues(ReadOnlySpan<float> values, Tensor destination, float scale, int zeroPoint)
+    {
+        float inverse = 1f / scale;
+
+        bool signed = destination.DType == DType.I8;
+        int min = signed ? sbyte.MinValue : 0;
+        int max = signed ? sbyte.MaxValue : 255;
+
+        var quantized = destination.AsSpan<byte>();
+        var vInverse = Vector256.Create(inverse);
+        var vZero = Vector256.Create((float)zeroPoint);
+        var vMin = Vector256.Create((float)min);
+        var vMax = Vector256.Create((float)max);
+
+        Span<int> lanes = stackalloc int[8];
+        int i = 0;
+
+        if (Avx.IsSupported)
+        {
+            for (; i + 8 <= values.Length; i += 8)
+            {
+                var scaled = Avx.Multiply(Vector256.LoadUnsafe(ref MemoryMarshal.GetReference(values[i..])), vInverse);
+                var rounded = Avx.Add(Avx.RoundToNearestInteger(scaled), vZero);
+                rounded = Avx.Min(vMax, Avx.Max(vMin, rounded));
+
+                Avx.ConvertToVector256Int32(rounded).StoreUnsafe(ref lanes[0]);
+
+                for (int k = 0; k < 8; k++)
+                    quantized[i + k] = unchecked((byte)(sbyte)lanes[k]);
+            }
+        }
+
+        for (; i < values.Length; i++)
+        {
+            float q = MathF.Round(values[i] * inverse, MidpointRounding.ToEven) + zeroPoint;
+            quantized[i] = unchecked((byte)(sbyte)Math.Clamp((int)q, min, max));
         }
     }
 
