@@ -1689,6 +1689,51 @@ internal static class DnnOps
             var source = input.AsSpan<float>();
             var target = output.AsSpan<float>();
 
+            // axis 是最后一维（decoder 的 logits 就是 [1,21,8359]）时每行连续：
+            // 用 VectorMath 的向量化 exp 一次算完整行，外层的 double Exp（每元素 20ns 级）省掉。
+            if (inner == 1 && VectorMath.Available)
+            {
+                unsafe
+                {
+                    fixed (float* ps = source)
+                    fixed (float* pt = target)
+                    {
+                        Span<float> lanes = stackalloc float[8];
+
+                        for (int o = 0; o < outer; o++)
+                        {
+                            float* row = ps + (long)o * length;
+                            float* dstRow = pt + (long)o * length;
+
+                            int k = 0;
+                            var vMax = Vector256.Create(float.NegativeInfinity);
+                            for (; k + 8 <= length; k += 8)
+                                vMax = Vector256.Max(vMax, Vector256.Load(row + k));
+
+                            vMax.CopyTo(lanes);
+                            float max = float.NegativeInfinity;
+                            for (int i = 0; i < lanes.Length; i++)
+                                max = MathF.Max(max, lanes[i]);
+                            for (; k < length; k++)
+                                max = MathF.Max(max, row[k]);
+
+                            // exp(x - max) 写进输出并求和的向量化版本
+                            float sum = VectorMath.SumExp(row, dstRow, length, -max);
+                            float logSum = MathF.Log(sum) + max;
+
+                            var vLog = Vector256.Create(logSum);
+                            k = 0;
+                            for (; k + 8 <= length; k += 8)
+                                Avx.Subtract(Vector256.Load(row + k), vLog).Store(dstRow + k);
+                            for (; k < length; k++)
+                                dstRow[k] = row[k] - logSum;
+                        }
+                    }
+                }
+
+                return;
+            }
+
             for (int o = 0; o < outer; o++)
             {
                 for (int i = 0; i < inner; i++)
@@ -1724,6 +1769,21 @@ internal static class DnnOps
 
         /// <summary>由 <see cref="GraphFusion"/> 折进来的 bias add（见 <see cref="IBiasAddable"/>）。</summary>
         public Tensor? FusedBias { get; set; }
+
+        /// <summary>常量 B 的预打包面板（按权重张量实例缓存；非 const 输入不会走这里）。</summary>
+        private GemmKernel.PackedB? _packedWeights;
+        private Tensor? _packedSource;
+
+        private GemmKernel.PackedB GetPackedWeights(ReadOnlySpan<float> weights, int k, int n, Tensor source)
+        {
+            if (_packedWeights is not null && ReferenceEquals(_packedSource, source)
+                && _packedWeights.K == k && _packedWeights.N == n)
+                return _packedWeights;
+
+            _packedWeights = GemmKernel.Pack(weights, k, n);
+            _packedSource = source;
+            return _packedWeights;
+        }
 
         public override void GetMemoryShapes(
             IReadOnlyList<TensorShape> inShapes,
@@ -1852,6 +1912,21 @@ internal static class DnnOps
             if (!bBatched && !aBroadcast)
             {
                 int rows = checked((int)(batches * m));
+
+                // 常量权重（rf-detr / YOLO / LLM 的投影层都是）：打包一次，每帧零拷贝。
+                // 非真实常量时不能缓存（输出缓冲会被复用），所以用 IsConstInput 把关。
+                if (GemmKernel.PrepackEnabled && IsConstInput(1))
+                {
+                    var packed = GetPackedWeights(srcB.Slice(0, k * n), k, n, b);
+                    GemmKernel.MultiplyPacked(
+                        srcA.Slice(0, rows * k),
+                        packed,
+                        dst.Slice(0, rows * n),
+                        rows,
+                        columnBias: columnBias);
+                    return;
+                }
+
                 GemmKernel.Multiply(
                     srcA.Slice(0, rows * k),
                     srcB.Slice(0, k * n),
