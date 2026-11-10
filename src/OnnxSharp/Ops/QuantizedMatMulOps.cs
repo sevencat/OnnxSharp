@@ -123,7 +123,7 @@ internal static class QuantizedMatMulOps
             var weights = packed is null ? GetFloatWeights(w, k, n, weightZeroPoints) : null;
 
             var clock = System.Diagnostics.Stopwatch.StartNew();
-            long t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+            long t1 = 0, t2 = 0, t3 = 0;
 
             // ---- 1) 与原 DQL 相同的 per-tensor 动态量化参数
             var source = a.AsSpan<float>();
@@ -268,7 +268,32 @@ internal static class QuantizedMatMulOps
             var vMin = Vector256<float>.Zero;
             var vMax = Vector256.Create(255f);
 
+            var vZero512 = Vector512.Create((float)zeroPoint);
+            var vMax512 = Vector512.Create(255f);
+
             int i = 0;
+
+            if (Avx512F.IsSupported)
+            {
+                var vInverse512 = Vector512.Create(inverse);
+
+                for (; i + 16 <= source.Length; i += 16)
+                {
+                    var x = Vector512.LoadUnsafe(ref MemoryMarshal.GetReference(source[i..]));
+                    var scaled = Avx512F.Multiply(x, vInverse512);
+
+                    // round-half-even：512 位的 vroundps 没有暴露，两半各用 256 位（仍是 16 宽）
+                    // （试过 vcvtps2dq+vcvtps2dq 的往返，但 FloatRoundingMode 在 net8.0 上没有）
+                    var rounded = Vector512.Create(
+                        Avx.RoundToNearestInteger(scaled.GetLower()),
+                        Avx.RoundToNearestInteger(scaled.GetUpper()));
+
+                    var q = Avx512F.Add(rounded, vZero512);
+                    q = Avx512F.Min(vMax512, Avx512F.Max(Vector512<float>.Zero, q));
+                    Avx512F.Subtract(q, vZero512).StoreUnsafe(ref destination[i]);
+                }
+            }
+
             if (Avx2.IsSupported)
             {
                 for (; i + 8 <= source.Length; i += 8)

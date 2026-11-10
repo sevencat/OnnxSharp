@@ -112,6 +112,33 @@ public static class Quantizer
         float max = 0f;
         int i = 0;
 
+        if (Avx512F.IsSupported)
+        {
+            var vectorMin = Vector512<float>.Zero;
+            var vectorMax = Vector512<float>.Zero;
+
+            for (; i + 16 <= source.Length; i += 16)
+            {
+                var value = Vector512.LoadUnsafe(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source[i..]));
+
+                // NaN 的 lane 置 0（minps/maxps 对 NaN 返回第二个操作数，不能直接喂）
+                value = Vector512.ConditionalSelect(
+                    Vector512.Equals(value, value), value, Vector512<float>.Zero);
+
+                vectorMin = Avx512F.Min(vectorMin, value);
+                vectorMax = Avx512F.Max(vectorMax, value);
+            }
+
+            Span<float> lanes = stackalloc float[16];
+            vectorMin.CopyTo(lanes);
+            for (int lane = 0; lane < lanes.Length; lane++)
+                min = MathF.Min(min, lanes[lane]);
+
+            vectorMax.CopyTo(lanes);
+            for (int lane = 0; lane < lanes.Length; lane++)
+                max = MathF.Max(max, lanes[lane]);
+        }
+
         if (Avx.IsSupported)
         {
             var vectorMin = Vector256<float>.Zero;

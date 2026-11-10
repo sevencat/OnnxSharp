@@ -13,20 +13,45 @@ public enum Int8KernelTier
     /// <summary>纯标量：正确性 oracle，也是没有 int8 SIMD 时的兜底。</summary>
     Scalar = 0,
 
-    /// <summary><c>vpdpbusd</c>（.NET 的 <see cref="AvxVnni"/> 只暴露 256 位）。</summary>
-    AvxVnni = 1,
+    /// <summary>
+    /// <c>vpmovzxbw</c> + <c>vpmovsxbw</c> + <c>vpmaddwd</c>（512 位）：把 u8 激活与 s8 权重都扩到 i16
+    /// 再点积。**精确、不饱和**（<c>vpmaddwd</c> 累加进 i32）；这是 OpenCV 无 VNNI 时的同款做法
+    /// （<c>v_dotprod_expand(s8,s8)</c>）。每 64 个 MAC 约 5 条指令。
+    /// </summary>
+    Avx512Bw = 1,
+
+    /// <summary><c>vpdpbusd</c>（.NET 的 <see cref="AvxVnni"/> 只暴露 256 位，且仅 Intel 12 代+）。</summary>
+    AvxVnni = 2,
 }
 
 /// <summary>int8 内核的档位探测（静态构造里算一次）。</summary>
 public static class Int8Kernel
 {
-    private static readonly Int8KernelTier s_tier = AvxVnni.IsSupported ? Int8KernelTier.AvxVnni : Int8KernelTier.Scalar;
+    /// <summary>
+    /// <c>AvxVnni</c>（Intel 12 代+）默认启用；**AVX-512BW 的 i16 展开路径默认关闭** ——
+    /// 实测它比「权重展开成 F32 + F32 GEMM」慢 4 倍（`plan.md §M10-A`：146~225 vs 605~789 GFLOPS），
+    /// 只在显式设置 <c>ONNXSHARP_INT8_TIER=avx512bw</c> 时启用（对照和回归用）。
+    /// </summary>
+    private static readonly Int8KernelTier s_tier = Detect();
+
+    private static Int8KernelTier Detect()
+    {
+        if (AvxVnni.IsSupported)
+            return Int8KernelTier.AvxVnni;
+
+        string? requested = Environment.GetEnvironmentVariable("ONNXSHARP_INT8_TIER");
+        if (Avx512BW.IsSupported && string.Equals(requested, "avx512bw", StringComparison.OrdinalIgnoreCase))
+            return Int8KernelTier.Avx512Bw;
+
+        return Int8KernelTier.Scalar;
+    }
 
     public static Int8KernelTier Tier => s_tier;
 
     public static string Describe() => s_tier switch
     {
         Int8KernelTier.AvxVnni => "avx-vnni (vpdpbusd, 256-bit)",
+        Int8KernelTier.Avx512Bw => "avx512bw (vpmovzx/sxbw + vpmaddwd, 512-bit)",
         _ => "scalar",
     };
 }
@@ -101,7 +126,7 @@ public sealed class PackedInt8Weights
             throw new ArgumentException($"weight buffer has {weights.Length} values, {k}x{n} needed");
 
         int kPadded = (k + 3) / 4 * 4;
-        int nPadded = (n + 7) / 8 * 8;
+        int nPadded = (n + 15) / 16 * 16;
 
         var data = new byte[(long)kPadded / 4 * nPadded * 4];
         var columnSums = new int[nPadded];
@@ -177,6 +202,8 @@ public static class Int8Gemm
 
         if (Int8Kernel.Tier == Int8KernelTier.AvxVnni && AvxVnni.IsSupported)
             MultiplyVnni(a, packed, c, m, aZeroPoint);
+        else if (Int8Kernel.Tier == Int8KernelTier.Avx512Bw && Avx512BW.IsSupported)
+            MultiplyAvx512Bw(a, packed, c, m, aZeroPoint);
         else
             MultiplyIntegerScalar(a, packed, c, m, aZeroPoint);
     }
@@ -300,5 +327,178 @@ public static class Int8Gemm
                 for (int row = 0; row < m; row++)
                     Row(row);
         }
+    }
+
+    /// <summary>
+    /// AVX-512BW 路径：<c>vpmovzxbw</c>(A) + <c>vpmovsxbw</c>(B) 扩到 i16，再 <c>vpmaddwd</c> 累加进 i32。
+    /// <para>
+    /// <b>为什么不用 <c>vpmaddubsw</c></b>：它把「一对乘积」累加进 i16，而
+    /// <c>255×128×2 = 65280 &gt; 32767</c> 会饱和（OpenCV 也因此绕开它）。扩到 i16 再
+    /// <c>vpmaddwd</c> 没这个问题 —— 累加器是 i32，结果**精确**。
+    /// </para>
+    /// <para>
+    /// 布局沿用 <see cref="PackedInt8Weights"/> 的 <c>[kBlock][nPadded][4]</c>：一次读 64 字节
+    /// = 16 列 × 4 个 k，正好两条 zmm（各 32 个 i16），A 的 4 个字节广播后两条共用。
+    /// </para>
+    /// </summary>
+    private static unsafe void MultiplyAvx512Bw(
+        ReadOnlySpan<byte> a,
+        PackedInt8Weights packed,
+        Span<int> c,
+        int m,
+        int aZeroPoint)
+    {
+        int k = packed.K;
+        int n = packed.N;
+        int kPadded = packed.KPadded;
+        int nPadded = packed.NPadded;
+        int kBlocks = kPadded / 4;
+
+        byte[] data = packed.Data;
+        int[] columnSums = packed.ColumnSums;
+        int[] bZeroPoints = packed.BZeroPoints;
+        int offset = packed.ZeroPointOffset;
+
+        // 零点校正拆成「随行变化」与「每次调用一次」两部分：
+        //   Σ(a-azp)(b-bzp) = Σa·b'' + (offset-bzp)·Σa - azp·Σb + azp·bzp·k
+        var first = new int[nPadded];
+        var second = new int[nPadded];
+        for (int col = 0; col < nPadded; col++)
+        {
+            int bzp = bZeroPoints[col];
+            first[col] = offset - bzp;
+            second[col] = aZeroPoint * (bzp * k - columnSums[col]);
+        }
+
+        fixed (byte* aPointer = a)
+        fixed (int* cPointer = c)
+        fixed (byte* dataPointer = data)
+        fixed (int* firstPointer = first)
+        fixed (int* secondPointer = second)
+        {
+            nint aAddress = (nint)aPointer;
+            nint cAddress = (nint)cPointer;
+            nint dataAddress = (nint)dataPointer;
+            nint firstAddress = (nint)firstPointer;
+            nint secondAddress = (nint)secondPointer;
+
+            // 一个线程负责 [colBegin, colEnd) 这些 16 列面板 × [rowBegin, rowEnd) 这些行。
+            // 列切分（默认）让每个线程只读自己那段 B —— 按行切的话 16 个线程会把整块 B 各流一遍。
+            void Compute(int colBegin, int colEnd, int rowBegin, int rowEnd)
+            {
+                Span<byte> padded = kPadded <= 4096 ? stackalloc byte[kPadded] : new byte[kPadded];
+                Span<int> lanes = stackalloc int[16];
+
+                fixed (byte* paddedPointer = padded)
+                {
+                    for (int row = rowBegin; row < rowEnd; row++)
+                    {
+                        byte* aRow = (byte*)aAddress + (long)row * k;
+                        int* cRow = (int*)cAddress + (long)row * n + (long)colBegin * 16;
+
+                        int rowSum = 0;
+                        for (int i = 0; i < k; i++)
+                        {
+                            byte value = aRow[i];
+                            padded[i] = value;
+                            rowSum += value;
+                        }
+
+                        for (int i = k; i < kPadded; i++)
+                            padded[i] = 0;
+
+                        var rowSumVector = Vector512.Create(rowSum);
+
+                        int* cBlock = cRow;
+                        for (int colBlock = colBegin; colBlock < colEnd; colBlock++, cBlock += 16)
+                        {
+                            int column = colBlock * 16;
+                            var accLow = Vector512<int>.Zero;
+                            var accHigh = Vector512<int>.Zero;
+
+                            for (int kb = 0; kb < kBlocks; kb++)
+                            {
+                                uint dword = Unsafe.ReadUnaligned<uint>(ref paddedPointer[kb * 4]);
+                                var a16 = Avx512BW.ConvertToVector512Int16(Vector512.Create(dword).AsByte().GetLower());
+
+                                byte* bp = (byte*)dataAddress + ((long)kb * nPadded + column) * 4;
+                                var bLow = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(ref *(sbyte*)bp));
+                                var bHigh = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(ref *(sbyte*)(bp + 32)));
+
+                                accLow = Avx512F.Add(accLow, Avx512BW.MultiplyAddAdjacent(a16, bLow));
+                                accHigh = Avx512F.Add(accHigh, Avx512BW.MultiplyAddAdjacent(a16, bHigh));
+                            }
+
+                            // 每列 4 个 i16 = 2 个 dword（k0k1 / k2k3）→ 折叠成每列 1 个和
+                            var sums = Vector512.Create(FoldPairs(accLow), FoldPairs(accHigh));
+
+                            var corrections = Avx512F.Add(
+                                Avx512F.MultiplyLow(
+                                    Vector512.LoadUnsafe(ref *(int*)(firstAddress + (long)column * sizeof(int))),
+                                    rowSumVector),
+                                Vector512.LoadUnsafe(ref *(int*)(secondAddress + (long)column * sizeof(int))));
+
+                            var total = Avx512F.Add(sums, corrections);
+
+                            int width = n - column < 16 ? n - column : 16;
+                            if (width == 16)
+                            {
+                                total.StoreUnsafe(ref *cBlock);
+                            }
+                            else
+                            {
+                                total.CopyTo(lanes);
+                                for (int j = 0; j < width; j++)
+                                    cBlock[j] = lanes[j];
+                            }
+                        }
+                    }
+                }
+            }
+
+            int colBlocks = (n + 15) / 16;
+            int threads = Threading.ParallelRange.Threads;
+
+            if ((long)m * k * n < ParallelThreshold)
+            {
+                Compute(0, colBlocks, 0, m);
+            }
+            else if (colBlocks >= threads)
+            {
+                // 列切分：每个线程只读自己那段权重面板
+                int basePer = colBlocks / threads;
+                int rem = colBlocks % threads;
+
+                Threading.ParallelRange.For(threads, (begin, end) =>
+                {
+                    for (int t = begin; t < end; t++)
+                    {
+                        int b0 = t * basePer + Math.Min(t, rem);
+                        int b1 = b0 + basePer + (t < rem ? 1 : 0);
+                        if (b0 < b1)
+                            Compute(b0, b1, 0, m);
+                    }
+                });
+            }
+            else
+            {
+                // 列块不够分（n 很小）：退回按行并行
+                Threading.ParallelRange.For(m, (begin, end) => Compute(0, colBlocks, begin, end));
+            }
+        }
+    }
+
+    // 交换相邻 dword（把「每列两个部分和」并到一起）与取偶数 lane
+    private static readonly Vector512<int> SwapPairs =
+        Vector512.Create(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+
+    private static readonly Vector512<int> EvenLanes =
+        Vector512.Create(0, 2, 4, 6, 8, 10, 12, 14, 0, 2, 4, 6, 8, 10, 12, 14);
+
+    /// <summary>把「每列 2 个 dword」的累加器压成「8 列、每列一个和」（放在低 8 个 lane）。</summary>
+    private static Vector256<int> FoldPairs(Vector512<int> accumulator)
+    {
+        var summed = Avx512F.Add(accumulator, Avx512F.PermuteVar16x32(accumulator, SwapPairs));
+        return Avx512F.PermuteVar16x32(summed, EvenLanes).GetLower();
     }
 }

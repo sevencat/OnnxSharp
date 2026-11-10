@@ -17,7 +17,75 @@ internal static class Int8Tests
         yield return new("int8: dequant-weight gemm matches the reference", DequantGemmMatchesReference);
         yield return new("int8: F32 substitute stays exact at k=1280", F32SubstituteExactAtLongK);
         yield return new("int8: dequant-weight gemm vs fp32 gemm throughput", DequantGemmThroughput);
+        yield return new("int8: kernel vs fp32 packed gemm on asr shapes", KernelVsPackedThroughput);
         yield return new("int8: reports the selected kernel tier", TierReported);
+    }
+
+    /// <summary>
+    /// P1 决策门：同一批 ASR 形状上，「int8 整数内核」是否比「int8 权重展开成 F32 + 预打包面板」
+    /// 更快。达不到 1.2× 就说明这一档 CPU 吃不到 int8 的红利（那就只保留 Scalar/VNNI，
+    /// 别把 DQM 切过去）。打印出来的数字直接进 <c>plan.md</c>。
+    /// </summary>
+    private static void KernelVsPackedThroughput()
+    {
+        (int M, int K, int N)[] shapes = [(96, 320, 1280), (96, 320, 960), (96, 1280, 320), (96, 320, 320)];
+        var random = new Random(2026);
+
+        foreach ((int m, int k, int n) in shapes)
+        {
+            var activation = new byte[m * k];
+            random.NextBytes(activation);
+
+            var weights = new sbyte[k * n];
+            for (int i = 0; i < weights.Length; i++)
+                weights[i] = (sbyte)(random.Next(256) - 128);
+
+            var weightZeroPoints = new int[n];
+            for (int column = 0; column < n; column++)
+                weightZeroPoints[column] = random.Next(-4, 5);
+
+            const int aZeroPoint = 121;
+
+            // int8 整数内核（int32 输出）
+            var packedInt8 = PackedInt8Weights.PackSigned(weights, k, n, weightZeroPoints);
+            var intResult = new int[m * n];
+            double int8Ms = Time(() =>
+                Int8Gemm.MultiplyInteger(activation, packedInt8, intResult, m, aZeroPoint));
+
+            // 对照：展开成 F32 + 预打包面板（现在 DQM 走的路）
+            var floatActivation = new float[m * k];
+            Int8F32Gemm.WidenActivation(activation, floatActivation, aZeroPoint);
+            var floatWeights = new float[k * n];
+            Int8F32Gemm.WidenWeights(weights, floatWeights, k, n, weightZeroPoints);
+            var packedFloat = GemmKernel.Pack(floatWeights, k, n);
+            var floatResult = new float[m * n];
+            double f32Ms = Time(() => GemmKernel.MultiplyPacked(floatActivation, packedFloat, floatResult, m));
+
+            double flops = 2.0 * m * k * n;
+            Console.WriteLine(
+                $"        [{m}x{k}x{n}] int8 {int8Ms:F3} ms ({flops / int8Ms / 1e6:F0} GFLOPS)  " +
+                $"f32-packed {f32Ms:F3} ms ({flops / f32Ms / 1e6:F0} GFLOPS)  ratio {f32Ms / int8Ms:F2}x");
+        }
+
+        // 分层编译按**调用次数**升级：慢的内核在按时间预热时可能一次都没跑成 tier-1
+        // （tier-0 能慢两个数量级），所以这里先跑满固定次数再量。
+        static double Time(Action body)
+        {
+            for (int i = 0; i < 60; i++)
+                body();
+
+            double best = double.MaxValue;
+            for (int i = 0; i < 15; i++)
+            {
+                var watch = System.Diagnostics.Stopwatch.StartNew();
+                body();
+                watch.Stop();
+                if (watch.Elapsed.TotalMilliseconds < best)
+                    best = watch.Elapsed.TotalMilliseconds;
+            }
+
+            return best;
+        }
     }
 
     private static void QuantizeDequantize()
