@@ -887,6 +887,23 @@ internal static class DnnOps
             int dH = dilations[0], dW = dilations[1];
             int pT = pads[0], pL = pads[1];
 
+            // 2×2 / stride 2 / 无 padding 的下采样池化（YuNet 的 4 个 MaxPool 全是这形状）：
+            // 一次算 8 个输出 —— 两次 8 宽加载 → 去交织出偶/奇列 → 再与相邻行取 max。
+            if (input.DType == DType.F32 && kH == 2 && kW == 2 && sH == 2 && sW == 2
+                && dH == 1 && dW == 1 && pT == 0 && pL == 0 && Avx.IsSupported)
+            {
+                ParallelRange.For(batches * channels, (begin, end) =>
+                {
+                    var plane = input.AsSpan<float>();
+                    var pooled = output.AsSpan<float>();
+
+                    for (int t = begin; t < end; t++)
+                        MaxPool2x2(plane, pooled, t, inH, inW, outH, outW);
+                });
+
+                return;
+            }
+
             // 量化张量的池化：同一 scale/zp 下 max 单调，所以可以直接对整数取 max（ORT 同做法）
             if (input.DType is DType.U8 or DType.I8)
             {
@@ -990,6 +1007,73 @@ internal static class DnnOps
                     }
                 }
             });
+        }
+
+        /// <summary>
+        /// 2×2 / stride 2 / 无 padding 的池化（一次 8 个输出）：
+        /// 两个 8 宽加载覆盖 16 个输入，<c>vshufps</c> 拆成偶列/奇列后取 max，再与下一行合并。
+        /// </summary>
+        private static void MaxPool2x2(
+            ReadOnlySpan<float> source,
+            Span<float> target,
+            int t,
+            int inH,
+            int inW,
+            int outH,
+            int outW)
+        {
+            long inBase = (long)t * inH * inW;
+            long outBase = (long)t * outH * outW;
+
+            var evenIndex = Vector256.Create(0, 1, 4, 5, 2, 3, 6, 7);
+
+            for (int oy = 0; oy < outH; oy++)
+            {
+                int y0 = oy * 2;
+                long row0 = inBase + (long)y0 * inW;
+                long row1 = y0 + 1 < inH ? inBase + (long)(y0 + 1) * inW : -1;
+                long outRow = outBase + (long)oy * outW;
+
+                int ox = 0;
+                for (; ox + 8 <= outW && ox * 2 + 16 <= inW; ox += 8)
+                {
+                    int x = ox * 2;
+                    var a0 = Vector256.LoadUnsafe(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source[(int)(row0 + x)..]));
+                    var a1 = Vector256.LoadUnsafe(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source[(int)(row0 + x + 8)..]));
+
+                    var even = Avx2.PermuteVar8x32(Avx.Shuffle(a0, a1, 0x88), evenIndex);
+                    var odd = Avx2.PermuteVar8x32(Avx.Shuffle(a0, a1, 0xDD), evenIndex);
+                    var best = Vector256.Max(even, odd);
+
+                    if (row1 >= 0)
+                    {
+                        var b0 = Vector256.LoadUnsafe(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source[(int)(row1 + x)..]));
+                        var b1 = Vector256.LoadUnsafe(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source[(int)(row1 + x + 8)..]));
+
+                        var evenB = Avx2.PermuteVar8x32(Avx.Shuffle(b0, b1, 0x88), evenIndex);
+                        var oddB = Avx2.PermuteVar8x32(Avx.Shuffle(b0, b1, 0xDD), evenIndex);
+                        best = Vector256.Max(best, Vector256.Max(evenB, oddB));
+                    }
+
+                    best.StoreUnsafe(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(target[(int)(outRow + ox)..]));
+                }
+
+                for (; ox < outW; ox++)
+                {
+                    int x = ox * 2;
+                    float best = source[(int)(row0 + x)];
+                    if (x + 1 < inW)
+                        best = MathF.Max(best, source[(int)(row0 + x + 1)]);
+                    if (row1 >= 0)
+                    {
+                        best = MathF.Max(best, source[(int)(row1 + x)]);
+                        if (x + 1 < inW)
+                            best = MathF.Max(best, source[(int)(row1 + x + 1)]);
+                    }
+
+                    target[(int)(outRow + ox)] = best;
+                }
+            }
         }
 
         /// <summary>
