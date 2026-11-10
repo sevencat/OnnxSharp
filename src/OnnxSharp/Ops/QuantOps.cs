@@ -242,6 +242,9 @@ internal static class QuantOps
         private Tensor? _floatSource;
         private int[]? _floatZeroPoints;
 
+        /// <summary>展开成 F32 后再打包成列块面板（常量权重一次完成，之后每帧零拷贝）。</summary>
+        private GemmKernel.PackedB? _packedFloat;
+
         public MatMulIntegerLayer(LayerParams parameters)
         {
             Type = parameters.Type;
@@ -311,7 +314,7 @@ internal static class QuantOps
 
             if (QuantOps.PreferFloatWeights)
             {
-                var weights = GetFloatWeights(b, k, n, bZeroPoints);
+                var packedFloat = GetPackedFloatWeights(b, k, n, bZeroPoints);
                 float[] buffer = ArrayPool<float>.Shared.Rent(m * k);
 
                 try
@@ -322,7 +325,7 @@ internal static class QuantOps
                     else
                         Int8F32Gemm.WidenActivation(a.AsSpan<byte>(), activation, aZeroPoint);
 
-                    Int8F32Gemm.MultiplyInteger(activation, weights, outputs[0].AsSpan<int>(), m, k, n);
+                    Int8F32Gemm.MultiplyInteger(activation, packedFloat, outputs[0].AsSpan<int>(), m);
                 }
                 finally
                 {
@@ -359,6 +362,28 @@ internal static class QuantOps
             _floatSource = weight;
             _floatZeroPoints = zeroPoints;
             return buffer;
+        }
+
+        /// <summary>
+        /// 展开成 F32 后**打包成列块面板**（常量权重一次完成）：之后每帧的 GEMM 不再重排 B。
+        /// 面板与 F32 权重同量级，展开用的整份 F32 会丢弃，所以不额外占内存。
+        /// </summary>
+        private GemmKernel.PackedB GetPackedFloatWeights(Tensor weight, int k, int n, int[] zeroPoints)
+        {
+            if (_packedFloat is not null && ReferenceEquals(_floatSource, weight) && ZeroPointsEqual(_floatZeroPoints, zeroPoints))
+                return _packedFloat;
+
+            var widened = new float[checked(k * n)];
+            if (weight.DType == DType.I8)
+                Int8F32Gemm.WidenWeights(weight.AsSpan<sbyte>(), widened, k, n, zeroPoints);
+            else
+                Int8F32Gemm.WidenWeights(weight.AsSpan<byte>(), widened, k, n, zeroPoints);
+
+            _packedFloat = GemmKernel.Pack(widened, k, n);
+            _floatWeights = null;
+            _floatSource = weight;
+            _floatZeroPoints = zeroPoints;
+            return _packedFloat;
         }
 
         private static int ReadScalar(IReadOnlyList<Tensor> inputs, int index)

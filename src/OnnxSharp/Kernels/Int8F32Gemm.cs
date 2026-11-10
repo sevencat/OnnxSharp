@@ -57,6 +57,35 @@ public static class Int8F32Gemm
         }
     }
 
+    /// <summary>
+    /// 同 <see cref="MultiplyInteger(ReadOnlySpan{float}, ReadOnlySpan{float}, Span{int}, int, int, int)"/>，
+    /// 但权重是**预打包面板**（常量权重每帧零拷贝，省掉每次 <c>Multiply</c> 内部的 B 重排）。
+    /// </summary>
+    internal static void MultiplyInteger(
+        ReadOnlySpan<float> activation,
+        GemmKernel.PackedB weights,
+        Span<int> destination,
+        int m)
+    {
+        int count = checked(m * weights.N);
+        if (destination.Length < count)
+            throw new ArgumentException($"destination has {destination.Length} values, {count} needed", nameof(destination));
+
+        float[] buffer = ArrayPool<float>.Shared.Rent(count);
+        try
+        {
+            var accumulator = buffer.AsSpan(0, count);
+            GemmKernel.MultiplyPacked(activation, weights, accumulator, m);
+
+            for (int i = 0; i < count; i++)
+                destination[i] = (int)MathF.Round(accumulator[i], MidpointRounding.ToEven);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(buffer);
+        }
+    }
+
     /// <summary>u8 → <c>a - zeroPoint</c>。</summary>
     public static void WidenActivation(ReadOnlySpan<byte> source, Span<float> destination, int zeroPoint)
     {

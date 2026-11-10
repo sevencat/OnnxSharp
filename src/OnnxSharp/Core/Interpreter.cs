@@ -68,12 +68,15 @@ internal static class Interpreter
             IReadOnlyList<Tensor> outs;
             IReadOnlyList<Tensor> temps;
 
+            // 签名（输入形状 + 类型）只比一次：缓存命中判定和 Finalize 判定用的是同一份数据，
+            // 之前这里比了两遍（2076 个节点的 decoder 上就是几千次多余的数组遍历）。
+            bool sameSignature = layer.ShapeCacheValid
+                && SameShapes(layer.CachedInShapes, inpShapes)
+                && SameTypes(layer.CachedInTypes, inpTypes);
+
             if (!op.DynamicOutputShapes())
             {
-                bool cacheHit = !DisableShapeCache
-                    && layer.ShapeCacheValid
-                    && SameShapes(layer.CachedInShapes, inpShapes)
-                    && SameTypes(layer.CachedInTypes, inpTypes);
+                bool cacheHit = !DisableShapeCache && sameSignature;
 
                 if (cacheHit)
                 {
@@ -139,9 +142,7 @@ internal static class Interpreter
                 continue;
             }
 
-            bool signatureChanged = !layer.FinalizedOnce
-                || !SameShapes(layer.LastInShapes, inpShapes)
-                || !SameTypes(layer.LastInTypes, inpTypes);
+            bool signatureChanged = !layer.FinalizedOnce || !sameSignature;
 
             if (signatureChanged)
             {
