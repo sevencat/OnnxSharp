@@ -18,7 +18,74 @@ internal static class Int8Tests
         yield return new("int8: F32 substitute stays exact at k=1280", F32SubstituteExactAtLongK);
         yield return new("int8: dequant-weight gemm vs fp32 gemm throughput", DequantGemmThroughput);
         yield return new("int8: kernel vs fp32 packed gemm on asr shapes", KernelVsPackedThroughput);
+        yield return new("int8: dequantize/quantize linear honour scale, zero point and axis", DequantizeLinearSemantics);
         yield return new("int8: reports the selected kernel tier", TierReported);
+    }
+
+    /// <summary>
+    /// <c>DequantizeLinear</c> / <c>QuantizeLinear</c>（QDQ 图的地基）：per-tensor、per-axis、
+    /// u8 与 i8 的语义都要对，且 <c>quantize(dequantize(q)) == q</c>（可逆）。
+    /// </summary>
+    private static void DequantizeLinearSemantics()
+    {
+        // per-tensor u8：[0,128,255]、scale 0.5、zp 128 → [-64, 0, 63.5]
+        {
+            var source = Tensor.Allocate(new TensorShape(3), DType.U8);
+            source.AsSpan<byte>().Clear();
+            var values = source.AsSpan<byte>();
+            values[0] = 0;
+            values[1] = 128;
+            values[2] = 255;
+
+            var output = Tensor.Allocate(new TensorShape(3), DType.F32);
+            Ops.DequantizeOps.Dequantize(source, [0.5f], [128], axis: 1, output);
+
+            Assert.Near(-64f, output.AsSpan<float>()[0], 1e-5f, "[0]");
+            Assert.Near(0f, output.AsSpan<float>()[1], 1e-5f, "[1]");
+            Assert.Near(63.5f, output.AsSpan<float>()[2], 1e-5f, "[2]");
+        }
+
+        // per-axis：[2,3] 沿 axis 1，scale = [0.5, 1, 2]、zp = [10, 10, 10]
+        {
+            var source = Tensor.Allocate(new TensorShape(2, 3), DType.U8);
+            var values = source.AsSpan<byte>();
+            for (int i = 0; i < values.Length; i++)
+                values[i] = (byte)(10 + i);            // 10..15 → (q - 10) = 0..5
+
+            var output = Tensor.Allocate(new TensorShape(2, 3), DType.F32);
+            Ops.DequantizeOps.Dequantize(source, [0.5f, 1f, 2f], [10, 10, 10], axis: 1, output);
+
+            var result = output.AsSpan<float>();
+            float[] expected = [0f, 1f, 4f, 1.5f, 4f, 10f];
+            for (int i = 0; i < expected.Length; i++)
+                Assert.Near(expected[i], result[i], 1e-5f, $"per-axis[{i}]");
+        }
+
+        // i8 + 负 axis（-1）与可逆性：q → x → q
+        {
+            var source = Tensor.Allocate(new TensorShape(2, 4), DType.I8);
+            var values = source.AsSpan<sbyte>();
+            values[0] = -128;
+            values[1] = -1;
+            values[2] = 0;
+            values[3] = 127;
+            values[4] = 5;
+            values[5] = -5;
+            values[6] = 42;
+            values[7] = -42;
+
+            var floats = Tensor.Allocate(new TensorShape(2, 4), DType.F32);
+            Ops.DequantizeOps.Dequantize(source, [2f], [-5], axis: -1, floats);
+
+            Assert.Near((-128 + 5) * 2f, floats.AsSpan<float>()[0], 1e-4f, "i8[0]");
+            Assert.Near((127 + 5) * 2f, floats.AsSpan<float>()[3], 1e-4f, "i8[3]");
+
+            var roundtrip = Tensor.Allocate(new TensorShape(2, 4), DType.I8);
+            Ops.DequantizeOps.Quantize(floats, [2f], [-5], axis: -1, roundtrip);
+
+            for (int i = 0; i < values.Length; i++)
+                Assert.Equal(values[i], roundtrip.AsSpan<sbyte>()[i], $"roundtrip[{i}]");
+        }
     }
 
     /// <summary>

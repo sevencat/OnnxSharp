@@ -706,7 +706,7 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 
 | 阶段 | 任务 | 关键实现 | 验收（决策门） |
 |---|---|---|---|
-| **P0** | **`M10-15` 权重预打包 + 零拷贝**（不涉及 int8） | `GemmKernel` 增 `PackPanels(b, k, n)` → `[n/nb][k][nb]` 面板数组与 `MultiplyPacked(a, packed, c, m, k, n, …)`；`QuantizedMatMulOps` / `MatMulLayer` / `FusedAttention` 按**权重张量实例**缓存面板（`ReferenceEquals` + shape 校验，同 `_floatWeights` 的写法）；开关 `ONNXSHARP_NO_PREPACK=1` | `gemmbench` 增 `--prepack` 对照：`96×320×1280`、`96×320×960`、`96×1280×320` 三形状 **≥ −25%**；encoder DQM 段 ≥ −25%；ASR 文本与 `max|diff|` 不变。**✅ 已完成，见 A5** |
+| **P0** | **`M10-15` 权重预打包 + 零拷贝**（不涉及 int8） | `GemmKernel` 增 `PackPanels(b, k, n)` → `[n/nb][k][nb]` 面板数组与 `MultiplyPacked(a, packed, c, m, k, n, …)`；`QuantizedMatMulOps` / `MatMulLayer` / `FusedAttention` 按**权重张量实例**缓存面板（`ReferenceEquals` + shape 校验，同 `_floatWeights` 的写法）；开关 `ONNXSHARP_NO_PREPACK=1` | `gemmbench` 增 `--prepack` 对照：`96×320×1280`、`96×320×960`、`96×1280×320` 三形状 **≥ −25%**；encoder DQM 段 ≥ −25%；ASR 文本与 `max|diff|` 不变。**✅ 已完成，见 A8** |
 | **P1** | **`M10-16` int8 GEMM 内核分档** | `Int8KernelTier`：`Scalar` / `Avx2`（`vpmovsxbw`+`vpmaddwd` ymm）/ `Avx512Bw`（zmm，64 B = 16 列 × 4 k 一次算完）/ `Vnni256`（`AvxVnni`，Intel 12 代+）；`KR=4` 面板复用现有 `PackedInt8Weights`；零点校正 `colsum`+`rowterm` | 与标量 oracle **逐位一致**（含 u8/s8、per-column zp、非对齐 k/n）；`int8bench` 在三形状上 **≥ 1.2× 现 F32 GEMM**（**达不到就只保留 Scalar/Vnni256，别硬上**） |
 | **P2** | **`M10-17` DQM 接 int8 内核** | 量化 A 成 u8 缓冲（`m·k` 字节，不展开 F32）→ `Int8Gemm` → epilogue `acc·(a_scale·w_scale[col]) + bias[col]`；权重走 P0 的 int8 面板缓存；`ONNXSHARP_INT8_KERNEL=auto\|f32\|int8` | encoder（≤ 35 ms）且 `FusedAttention` 不变；`quant:` 用例保持 bit-exact；ASR 文本不变 |
 | **P3** | **`M10-18` int8 Conv** | im2col + int8 GEMM（1-D/depthwise 变体参照 `fastConv`/`fastDepthwiseConv`）；int32 bias + per-channel multiplier | encoder 41 个 Conv 1.7 → **≤ 1.0 ms**；与 ORT `max|diff| ≤ 1`（u8 输出） |
@@ -755,7 +755,58 @@ P3/P4 只有在 P0~P2 落地后 encoder 仍 > 30 ms 才启动（现在它们合�
 才投入 2~3 天做可选 oneDNN 后端；否则不做。唯一支持「长期值得」的场景是**跨机器分发**
 （Intel 12 代+ 的 `AvxVnni`、ARM `sdot` 我们都要自己写，而 oneDNN/XNNPACK 已经覆盖）。
 
-#### A5. P0 实测结果（2026-11-11 深夜，已完成）
+#### A5. P1/P2 实测：int8 整数内核在本机是**负收益**（2026-11-11 深夜）
+
+按 A2 的决策门先做内核再决定接线，结果是**不接线**：
+
+| 形状（ASR encoder 实测形状） | int8 内核（i16 展开 + `vpmaddwd`） | F32 预打包面板 | 比值 |
+|---|---|---|---|
+| 96×320×1280 | 0.538 ms（146 GFLOPS） | 0.124 ms（632） | **0.23×** |
+| 96×320×960 | 0.406 ms（145） | 0.088 ms（669） | **0.22×** |
+| 96×1280×320 | 0.349 ms（225） | 0.100 ms（789） | **0.29×** |
+| 96×320×320 | 0.173 ms（114） | 0.033 ms（605） | **0.19×** |
+
+原因和 A3 的预判一致：`.NET` 不暴露 `Avx512Vnni`、本机 `AvxVnni=False`，唯一精确的替代
+（`vpmovzxbw`+`vpmovsxbw`+`vpmaddwd`）每 64 个 MAC 要 ~6 条指令，而 F32 的 `vfmadd` 只要 4 条
+（还不用展开）；在 m=96 这种小形状上 F32 GEMM 只有 ~15% 峰值、并不是带宽受限，
+所以「权重小 4×」的红利完全被多出来的指令吃掉。
+
+**处置**：内核保留（与标量 oracle 逐位一致，是 VNNI 机器上的现成实现），
+但 `Int8Kernel` 默认**不选它**（`Scalar`，非 VNNI 机器继续走「权重展开 F32」的 F32 substitute），
+只有 `ONNXSHARP_INT8_TIER=avx512bw` 时启用；决策门的数字固化进用例
+`int8: kernel vs fp32 packed gemm on asr shapes`。
+
+#### A6. 顺带拿到的两个小收益 + QDQ 起步（同日）
+
+1. **`Quantizer.MinMax` 与 DQM 的量化展开改 512 位**：minmax 1.5 → **0.6 ms**
+   （纯扫描，512 位直接见效；量化展开因为 `vroundps` 没有 512 位、要拆两半 round 再拼回，
+   收益不明显，代码留在 512 位以省 load/store）。
+2. **`QuantizeLinear` / `DequantizeLinear` 落地**（`Ops/DequantizeOps.cs`）：per-tensor 与
+   per-axis、u8/i8、负 axis，量化↔反量化可逆；新增用例
+   `int8: dequantize/quantize linear honour scale, zero point and axis`。
+
+**encoder 现在是 30.7 ms**（起点 43.1，−29%），与 ORT 的 26.8 差 **1.15×**。
+
+#### A7. `yunet_int8.onnx` 的实测结论（下一步的入口）
+
+模型（`F:\ai\models\yunet\yunet_int8.onnx`，`onnx.quantize` 导出，opset 13，112 节点）能解析，但**还跑不了**：
+
+| 算子 | 个数 | 状态 |
+|---|---|---|
+| `QLinearConv` | 53 | ❌ 未实现（**P3 的主体**：im2col + int8 GEMM + per-channel 重量化） |
+| `DequantizeLinear` | 16 | ✅ 本轮已支持 |
+| `QuantizeLinear` | 5 | ✅ 本轮已支持 |
+| `QLinearSigmoid` | 6 | ❌ 未实现（**P4**：`activLUT` 256 项查表即可） |
+| `QLinearAdd` | 2 | ❌ 未实现（**P4**：per-input scale/zp 的 int8 加） |
+| `MaxPool` | 4 | ⚠️ 现有实现是 F32；int8 池化要单独一档（`Pool2Int8`） |
+| `Transpose`/`Reshape`/`Resize` | 26 | ✅ |
+
+所以 YuNet int8 的剩余工作就是 **P3（QLinearConv）+ P4（QLinearAdd/QLinearSigmoid/int8 MaxPool）**，
+与 OpenCV 的 `convInt8Block`（`activLUT` + per-channel multiplier）是同一套东西。
+
+#### A8. 附：P0 的分段实测（决策依据）
+
+
 
 先插桩把 `DynamicQuantizeMatMul` 内部四段拆开（`ONNXSHARP_DQM_BREAKDOWN=1` +
 `tools/scripts/dqm_breakdown.py`，每个形状取最小值）：

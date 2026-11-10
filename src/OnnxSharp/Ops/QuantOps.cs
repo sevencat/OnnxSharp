@@ -18,6 +18,112 @@ internal static class QuantOps
     {
         LayerRegistry.Register("DynamicQuantizeLinear", p => new DynamicQuantizeLinearLayer(p));
         LayerRegistry.Register("MatMulInteger", p => new MatMulIntegerLayer(p));
+        LayerRegistry.Register("QuantizeLinear", p => new QuantizeLinearLayer(p));
+        LayerRegistry.Register("DequantizeLinear", p => new DequantizeLinearLayer(p));
+    }
+
+    // ---------------- DequantizeLinear / QuantizeLinear ----------------
+
+    /// <summary>
+    /// <c>DequantizeLinear(x, scale, zero_point?)</c> → F32：<c>y = (x - zp) * scale</c>。
+    /// <para>
+    /// <paramref name="scale"/> 可以是标量（per-tensor）或长度 = <c>x.shape[axis]</c> 的向量（per-axis，
+    /// 权重常见）。QDQ 图里它总是紧跟着一个 <c>QuantizeLinear</c>，或承接量化算子的输出。
+    /// </para>
+    /// </summary>
+    private sealed class DequantizeLinearLayer : Layer
+    {
+        private readonly int _axis;
+
+        public DequantizeLinearLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _axis = (int)parameters.GetInt("axis", 1);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+            => outShapes.Add(inShapes[0]);
+
+        public override void GetTypes(
+            IReadOnlyList<DType> inTypes,
+            int requiredOutputs,
+            int requiredTemps,
+            List<DType> outTypes,
+            List<DType> tempTypes)
+        {
+            outTypes.Clear();
+            for (int i = 0; i < requiredOutputs; i++)
+                outTypes.Add(DType.F32);
+
+            tempTypes.Clear();
+            for (int i = 0; i < requiredTemps; i++)
+                tempTypes.Add(DType.F32);
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var scale = OpUtil.ReadFloats(inputs[1]);
+            var zeroPoint = Inputs.Count > 2 && Inputs[2].Idx != 0 ? OpUtil.ReadInts(inputs[2]) : [0];
+
+            DequantizeOps.Dequantize(inputs[0], scale, zeroPoint, _axis, outputs[0]);
+        }
+    }
+
+    /// <summary>
+    /// <c>QuantizeLinear(x, scale, zero_point?)</c> → u8/i8（见 <see cref="DequantizeOps"/>）。
+    /// </summary>
+    private sealed class QuantizeLinearLayer : Layer
+    {
+        private readonly int _axis;
+
+        public QuantizeLinearLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _axis = (int)parameters.GetInt("axis", 1);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+            => outShapes.Add(inShapes[0]);
+
+        public override void GetTypes(
+            IReadOnlyList<DType> inTypes,
+            int requiredOutputs,
+            int requiredTemps,
+            List<DType> outTypes,
+            List<DType> tempTypes)
+        {
+            outTypes.Clear();
+            for (int i = 0; i < requiredOutputs; i++)
+                outTypes.Add(DType.U8);
+
+            tempTypes.Clear();
+            for (int i = 0; i < requiredTemps; i++)
+                tempTypes.Add(DType.F32);
+        }
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var scale = OpUtil.ReadFloats(inputs[1]);
+            var zeroPoint = Inputs.Count > 2 && Inputs[2].Idx != 0 ? OpUtil.ReadInts(inputs[2]) : [0];
+
+            DequantizeOps.Quantize(inputs[0], scale, zeroPoint, _axis, outputs[0]);
+        }
     }
 
     /// <summary>
