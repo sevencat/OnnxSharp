@@ -1544,6 +1544,57 @@ $ dotnet run --project tests/OnnxSharp.Tests
 > `max|diff|` 1.9e-3 出现在量级 ~267 的输出上（相对误差 ~7e-6），是累加顺序差异，不是算错。
 > 5.4 s 是标量直接卷积的耗时，性能优化在 M4。
 
+### 7.4 safetensors → ONNX 权重补丁（`sft2onnx`，2026-11-11）
+
+**问题起点**：训练侧产出 `*.safetensors`，部署侧只有 C#（不能装 Python）。能不能纯 C# 转换？
+
+**结论：格式层能，语义层不能「自动」。** ONNX 文件 = **计算图 + 权重**，safetensors **只有权重**。
+`config.json` 里也**没有图**（只有 `hidden_size` / `num_hidden_layers` 这类超参，前向逻辑在 Python 源码里）。
+所以任何「safetensors → onnx」的工具本质都是「**认识某个架构 → 重建模型 → 再导出**」
+（`optimum-cli` 认 HF 的一批，ultralytics 的 `model.export()` 认 YOLO 那一批）。
+
+因此落地成**权重补丁**：拿一份现成骨架 ONNX，只把 initializer 的数据换掉，图一字不动。
+
+```
+src/OnnxSharp/Safetensors/SafeTensorFile.cs          头部解析 + RandomAccess 分块读（不整包映射）
+src/OnnxSharp/Safetensors/SafeTensorFormat*.cs       dtype 表 + 数值转换（F16/BF16/F64 → F32、整型互转）
+src/OnnxSharp/Onnx/ProtoRaw.cs                      可保序的 protobuf 读写（现有 Proto 只能读且丢字段顺序）
+src/OnnxSharp/Onnx/OnnxWeightPatcher.cs             补丁逻辑（Inspect / Apply / external data）
+tools/OnnxSharp.Sft2Onnx/                           命令行：patch / list
+```
+
+**实测**（yolo11n，196 个 initializer / 10.2 MiB / 混合 F32+int64）：
+
+| 检查 | 结果 |
+|---|---|
+| 补丁耗时 | 67 ms（含 10 MiB 读写） |
+| ORT 跑「原模型」vs「补丁后模型」 | **max\|diff\| = 0.0**（逐位一致） |
+| 本引擎跑补丁后 vs ORT golden | max\|diff\| 2.47e-3（量级 636 的输出，相对 ~4e-6，一直如此） |
+| F16 权重 + F32 骨架 | 自动转换，max\|diff\| 1.28（F16 量化误差） |
+| `--verify` | `loaded OK, inputs [images], outputs [output0]` |
+
+**踩到的四个坑**（都已进代码/提示）：
+
+1. **标量 initializer 的 rank 不一致**。ONNX 写 `dims=[]`（rank 0），numpy 存 safetensors 却是 `(1,)`。
+   真实案例：yolo11n 的 `/model.10/m/m.0/attn/Constant_1_output_0`（4 字节、元素数相同）。
+   → 判定规则改成「**去掉前导 1 后必须逐维相等**」；`[2,3]` vs `[3,2]` 仍必须报错，否则转置错误会被静默吞掉。
+2. **PyTorch legacy 导出器会改名字**。`torch.onnx.export(dynamo=False)` 对 `nn.Linear` 权重写 `onnx::MatMul_249`，
+   只有部分参数保留原名（ViT 小模型：40 个参数里 12 个变成 `onnx::MatMul_*`）。对照：**ultralytics 导出的 YOLO 名字是干净的**
+   （`model.0.conv.weight`，196 个里只有 6 个 `onnx::` 且都是 int64 形状常量）→ 名称匹配在主场景可用，
+   其它模型用 `--map`。`dynamo=True`（新导出器，保留参数名）需要 `onnxscript`，本机未装。
+3. **`fuse=True` 的骨架没法补 BN 权重**。ultralytics `export()` 默认把 BN 折进 Conv 并删掉 `bn.*`，
+   safetensors 里的 `running_mean` / `running_var` 就无处安放。→ 骨架必须 `fuse=False`；
+   工具检测到未匹配的 `running_mean/var` 会打印这条提示。
+4. **`external_data` 必须搬进来**。骨架自带外部数据文件时，未匹配的 initializer 若原样保留，
+   输出模型换个目录就找不到权重 → 读进内存重新内联（超过阈值再按 4096 对齐写成新的 `.data`）。
+
+**顺带得到的结论**（回答「能不能纯 C# 从 safetensors + config 生成 ONNX」）：
+- **对 HF/YOLO 这类「库里有架构代码」的模型**：必须要么转 ONNX（Python 一步），要么在 C# 里重写架构，
+  后者对 YOLO 约 1500 行且随版本变 —— 不值。
+- **纯 C# 的唯一通用解就是本工具**（骨架 + 补丁），约 550 行，零依赖。
+- 若目标只是「喂给 OnnxSharp」，还可以跳过 ONNX 序列化：`LayerRegistry.Create` + `Graph.Append` 都是 public，
+  直接建图跑（省掉 protobuf writer），但同样需要架构代码 —— 只对**结构固定不变**的自研网络划算。
+
 ---
 
 ## 8. 许可与合规

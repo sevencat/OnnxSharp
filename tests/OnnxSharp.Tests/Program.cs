@@ -28,5 +28,6 @@ cases.AddRange(AsrEncoderTests.Cases());
 cases.AddRange(OcrTests.Cases());
 cases.AddRange(Sam3Tests.Cases());
 cases.AddRange(YoloGoldenTests.Cases());
+cases.AddRange(SafeTensorTests.Cases());
 
 return Harness.RunAll(cases);

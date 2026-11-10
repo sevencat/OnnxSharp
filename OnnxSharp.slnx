@@ -7,5 +7,6 @@
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/OnnxSharp.Cli/OnnxSharp.Cli.csproj" />
+    <Project Path="tools/OnnxSharp.Sft2Onnx/OnnxSharp.Sft2Onnx.csproj" />
   </Folder>
 </Solution>

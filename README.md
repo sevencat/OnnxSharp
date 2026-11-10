@@ -460,6 +460,25 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 
 > 计时口径：`--iters` 默认 1，即「第一帧」的真实延迟（含 JIT）。要稳态数字用 `--iters 40` —— .NET 分层编译约 30 次调用后才升到 tier-1，少于此数会高 1.5~2 倍。
 
+`tools\OnnxSharp.Sft2Onnx`（独立小工具：把 safetensors 权重打进一份现成骨架，**纯 C#，不需要 Python**）：
+
+```powershell
+$sft = "tools\OnnxSharp.Sft2Onnx\bin\Release\net10.0\sft2onnx.exe"
+```
+
+| 命令 | 用途 |
+|---|---|
+| `sft2onnx patch <skeleton.onnx> <weights.safetensors> -o out.onnx [--verify]` | 只替换 initializer 的数据字段，图、metadata、未知字段按原始字节保留 |
+| `sft2onnx list <model.onnx\|weights.safetensors>` | 列出骨架的 initializer / 权重文件的张量（按扩展名自动识别） |
+
+`patch` 的选项：`--map <骨架名>=<权重名>`（可重复） / `--strip a,b`（默认 `module.,model.,_orig_mod.,backbone.`） / `--strict` / `--external-threshold <GiB>`（默认 1，超过就写外部数据文件） / `--data-name` / `--verify`（写完用引擎加载一遍）。
+
+> **为什么必须有骨架**：ONNX = 计算图 + 权重；safetensors 只有权重。架构没法从权重反推，所以图由骨架提供 —— 训练侧产出 `best.safetensors`，部署侧用发布时附带的那份骨架生成最终模型。
+>
+> 实测（yolo11n，196 个 initializer / 10.2 MiB）：替换耗时 **67 ms**，ORT 跑补丁前后 **max\|diff\| = 0.0**（逐位一致）；权重存成 F16、骨架是 F32 时自动转换，max\|diff\| 1.28（F16 量化误差，相对 2e-3）。
+>
+> ⚠️ 骨架要用 **`fuse=False`** 导出（Ultralytics 的 `export()` 默认 `fuse=True` 会把 BatchNorm 折进 Conv，`bn.*` 权重就没有对应项）。工具检测到未匹配的 `running_mean/running_var` 会直接提示这一点。
+
 ### 支持算子
 
 76 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` / `MatMulArgMax` / `DynamicQuantizeMatMul` / `FusedAttention` / `DflSoftmax` 是图融合的产物）：
@@ -625,10 +644,11 @@ src/OnnxSharp/
                 其它 ASR 模型（Whisper / Zipformer / streaming paraformer）以后放同级的兄弟目录
   Imaging/   共享图像预处理：ImagePixels / ImageGeometry / AxisMap / ImageTensor（Vision / OCR / SAM3 共用）
 tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / sam3 / 微基准 + ImageFacade 图像 IO
+tools/OnnxSharp.Sft2Onnx/  safetensors → ONNX 权重补丁（patch / list），纯 C#
 tools/scripts/         dump_shapes / gen_golden / extract_ocr_models.ps1 / onnx_fp16_to_f32 / fbank_probe
                        / make_quant_model / split_before_control_flow / sherpa_encoder_probe
                        / probe_tensors / inspect_loop / compare_outputs
-tests/OnnxSharp.Tests/ 零依赖测试运行器（80 用例），直接 dotnet run
+tests/OnnxSharp.Tests/ 零依赖测试运行器（116 用例），直接 dotnet run
 bench/                四引擎 × 6 模型的对照脚本与产物
 ```
 
@@ -941,6 +961,21 @@ code; it is deliberately not bundled here so an optional feature does not drag i
 Key `detect` flags: `--family auto|yolo|rfdetr`, `--conf`, `--iou` (YOLO), `--max-det`, `--classes`, `--layout`, `--class-agnostic`, `--background -1|none` and `--norm imagenet|255` (RF-DETR), `--labels`, `--json`, `--input <f32.bin> --shape 1,3,640,640`, `--iters N`, `--size N`.
 
 > Timing note: `--iters` defaults to 1, i.e. real first-frame latency including JIT. For steady-state numbers use `--iters 40` — .NET tiered compilation promotes hot methods only after ~30 calls, otherwise results are 1.5–2× too slow.
+
+`sft2onnx` (separate small tool: patch safetensors weights into an existing ONNX skeleton, **pure C#, no Python**):
+
+| Command | Purpose |
+|---|---|
+| `sft2onnx patch <skeleton.onnx> <weights.safetensors> -o out.onnx [--verify]` | Replace only the initializer data fields; graph, metadata and unknown fields are carried over byte-for-byte |
+| `sft2onnx list <model.onnx\|weights.safetensors>` | List skeleton initializers / weight-file tensors (auto-detected by extension) |
+
+Flags: `--map <skeletonName>=<weightName>` (repeatable), `--strip a,b` (defaults to `module.,model.,_orig_mod.,backbone.`), `--strict`, `--external-threshold <GiB>` (default 1), `--data-name`, `--verify`.
+
+> **Why a skeleton is required**: an ONNX file is a graph *plus* weights; safetensors only has weights. The architecture cannot be recovered from weights, so the graph comes from a skeleton — training produces `best.safetensors`, deployment turns it into a model with the skeleton shipped alongside.
+>
+> Measured on yolo11n (196 initializers, 10.2 MiB): **67 ms** to patch, and ONNXRuntime gives **max\|diff\| = 0.0** between the original and the patched model. F16 weights against an F32 skeleton are converted automatically (max\|diff\| 1.28, i.e. F16 precision at 2e-3 relative).
+>
+> ⚠️ Export the skeleton with **`fuse=False`** — Ultralytics defaults to `fuse=True`, which folds BatchNorm into Conv so `bn.*` weights have nothing to match. The tool detects unmatched `running_mean/running_var` and says so.
 
 ### Quantized inference (int8)
 
