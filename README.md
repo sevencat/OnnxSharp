@@ -469,6 +469,7 @@ $sft = "tools\OnnxSharp.Sft2Onnx\bin\Release\net10.0\sft2onnx.exe"
 | 命令 | 用途 |
 |---|---|
 | `sft2onnx patch <skeleton.onnx> <weights.safetensors> -o out.onnx [--verify]` | 只替换 initializer 的数据字段，图、metadata、未知字段按原始字节保留 |
+| `sft2onnx extract <model.onnx> -o w.safetensors [--graph-out skeleton.onnx]` | 反向：把 ONNX 的权重抽成 safetensors，并（可选）写出只含图的骨架 |
 | `sft2onnx list <model.onnx\|weights.safetensors>` | 列出骨架的 initializer / 权重文件的张量（按扩展名自动识别） |
 
 `patch` 的选项：`--map <骨架名>=<权重名>`（可重复） / `--strip a,b`（默认 `module.,model.,_orig_mod.,backbone.`） / `--strict` / `--external-threshold <GiB>`（默认 1，超过就写外部数据文件） / `--data-name` / `--verify`（写完用引擎加载一遍）。
@@ -478,6 +479,17 @@ $sft = "tools\OnnxSharp.Sft2Onnx\bin\Release\net10.0\sft2onnx.exe"
 > 实测（yolo11n，196 个 initializer / 10.2 MiB）：替换耗时 **67 ms**，ORT 跑补丁前后 **max\|diff\| = 0.0**（逐位一致）；权重存成 F16、骨架是 F32 时自动转换，max\|diff\| 1.28（F16 量化误差，相对 2e-3）。
 >
 > ⚠️ 骨架要用 **`fuse=False`** 导出（Ultralytics 的 `export()` 默认 `fuse=True` 会把 BatchNorm 折进 Conv，`bn.*` 权重就没有对应项）。工具检测到未匹配的 `running_mean/running_var` 会直接提示这一点。
+>
+> **两个方向不对称**：`ONNX → safetensors + 骨架` 是无损搬运（图和权重都在文件里，实测 yolo11n 拆出 86 KB 骨架 + 10.15 MiB 权重，再打回去**字节数完全相同、ORT 逐位一致**）；反过来 `safetensors + config → ONNX` 才难，因为图不存在，需要架构代码。注意 `extract` 出来的骨架**不能直接推理**（数据被剥掉了），它只配合 `patch` 使用。
+
+`extract` 的实测（yolo11n）：
+
+| | 大小 |
+|---|---|
+| `yolo11n.onnx` | 10,720,227 B |
+| `extract` → 骨架 | 86,042 B（320 节点 + 196 个 initializer 头） |
+| `extract` → safetensors | 10,651,800 B（196 张量） |
+| 骨架 + 权重 → `patch` 回来 | 10,720,227 B（**与原文件字节数相同**），ORT max\|diff\| = **0.0** |
 
 ### 支持算子
 
@@ -967,6 +979,7 @@ Key `detect` flags: `--family auto|yolo|rfdetr`, `--conf`, `--iou` (YOLO), `--ma
 | Command | Purpose |
 |---|---|
 | `sft2onnx patch <skeleton.onnx> <weights.safetensors> -o out.onnx [--verify]` | Replace only the initializer data fields; graph, metadata and unknown fields are carried over byte-for-byte |
+| `sft2onnx extract <model.onnx> -o w.safetensors [--graph-out skeleton.onnx]` | Reverse direction: pull the weights out into safetensors and (optionally) write a graph-only skeleton |
 | `sft2onnx list <model.onnx\|weights.safetensors>` | List skeleton initializers / weight-file tensors (auto-detected by extension) |
 
 Flags: `--map <skeletonName>=<weightName>` (repeatable), `--strip a,b` (defaults to `module.,model.,_orig_mod.,backbone.`), `--strict`, `--external-threshold <GiB>` (default 1), `--data-name`, `--verify`.
@@ -976,6 +989,8 @@ Flags: `--map <skeletonName>=<weightName>` (repeatable), `--strip a,b` (defaults
 > Measured on yolo11n (196 initializers, 10.2 MiB): **67 ms** to patch, and ONNXRuntime gives **max\|diff\| = 0.0** between the original and the patched model. F16 weights against an F32 skeleton are converted automatically (max\|diff\| 1.28, i.e. F16 precision at 2e-3 relative).
 >
 > ⚠️ Export the skeleton with **`fuse=False`** — Ultralytics defaults to `fuse=True`, which folds BatchNorm into Conv so `bn.*` weights have nothing to match. The tool detects unmatched `running_mean/running_var` and says so.
+>
+> **The two directions are not symmetric**: `ONNX → safetensors + skeleton` is lossless packing (graph *and* weights are both in the file; yolo11n splits into an 86 KB skeleton + 10.15 MiB of weights and patches back to a **byte-identical size with max\|diff\| = 0.0** in ONNXRuntime). The opposite direction (`safetensors + config → ONNX`) is the hard one, because the graph does not exist and needs architecture code. Note that an `extract`-ed skeleton **is not runnable** — its data is stripped; it only pairs with `patch`.
 
 ### Quantized inference (int8)
 

@@ -25,6 +25,8 @@ internal static class SafeTensorTests
         yield return new("patcher: strip prefix matches suffixed names", StripPrefixMatches);
         yield return new("patcher: shape mismatch is actionable", ShapeMismatchMessage);
         yield return new("patcher: external data path round-trips", ExternalDataRoundTrip);
+        yield return new("extract: weights + skeleton round-trip through patch", ExtractRoundTrip);
+        yield return new("extract: typed int64_data is decoded", ExtractInt64Data);
     }
 
     // ---------------- 用例 ----------------
@@ -281,6 +283,98 @@ internal static class SafeTensorTests
         }
     }
 
+    private static void ExtractRoundTrip()
+    {
+        string directory = NewTempDirectory();
+        try
+        {
+            byte[] w = Floats(1f, 2f, 3f, 4f, 5f, 6f);
+            byte[] b = Floats(0.5f, 0.6f, 0.7f);
+            string model = BuildSkeleton(Path.Combine(directory, "model.onnx"), w, b);
+
+            // 原模型可直接推理 → 作为基准
+            Expect(RunOnce(model, 1f, 1f), 5.5f, 7.6f, 9.7f);
+
+            string weights = Path.Combine(directory, "extracted.safetensors");
+            string skeleton = Path.Combine(directory, "skeleton.onnx");
+            var report = OnnxWeightPatcher.Extract(model, weights, skeleton);
+
+            Assert.True(report.Tensors == 2, $"extracted {report.Tensors} tensors, expected 2");
+            Assert.True(report.WeightBytes == 36, $"extracted {report.WeightBytes} B, expected 36");
+            Assert.True(report.SkeletonBytes > 0 && report.SkeletonBytes < new FileInfo(model).Length,
+                $"skeleton {report.SkeletonBytes} B should be smaller than the model");
+
+            using var file = SafeTensorFile.Open(weights);
+
+            // 抽出来的字节必须与 ONNX 里的权重逐字节一致，dtype 也要还原对
+            Assert.True(file.ReadRaw("W").SequenceEqual(w), "extracted W bytes differ from the ONNX tensor");
+            Assert.True(file.ReadRaw("B").SequenceEqual(b), "extracted B bytes differ from the ONNX tensor");
+            Assert.True(file.Info("W").DType == "F32", $"W dtype should be F32, got {file.Info("W").DType}");
+            Assert.True(file.Metadata.TryGetValue("source", out string? source) && source == "model.onnx",
+                "metadata 'source' should point at the model file");
+
+            // 骨架 + 抽出来的权重 → 打回去，必须与原模型数值一致
+            string restored = Path.Combine(directory, "restored.onnx");
+            var patchReport = OnnxWeightPatcher.Apply(skeleton, file, restored, new OnnxWeightPatchOptions { Strict = true });
+            Assert.True(patchReport.Patched == 2, $"patched {patchReport.Patched} != 2");
+            Expect(RunOnce(restored, 1f, 1f), 5.5f, 7.6f, 9.7f);
+
+            // 剥掉数据的骨架本身不能推理（这正是「骨架」的定义）
+            bool threw = false;
+            try
+            {
+                RunOnce(skeleton, 1f, 1f);
+            }
+            catch (Exception)
+            {
+                threw = true;
+            }
+
+            Assert.True(threw, "a weight-stripped skeleton must not be runnable without weights");
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static void ExtractInt64Data()
+    {
+        string directory = NewTempDirectory();
+        try
+        {
+            // int64 走 typed 字段（int64_data）而不是 raw_data，且含负数（varint 符号扩展）
+            var graph = new List<byte>();
+            Field(graph, 1, Node(new[] { "x", "T" }, new[] { "y" }, "Identity", "id"));
+            StrField(graph, 2, "g");
+            Field(graph, 5, TensorInitInt64("T", new long[] { 3 }, new long[] { 1, -2, 3 }));
+            Field(graph, 11, ValueInfo("x", 7, new long[] { 3 }));
+            Field(graph, 12, ValueInfo("y", 7, new long[] { 3 }));
+
+            var model = new List<byte>();
+            Field(model, 1, 8);
+            StrField(model, 2, "onnxsharp-tests");
+            Field(model, 7, graph.ToArray());
+            Field(model, 8, OpsetId(17));
+
+            string modelPath = Path.Combine(directory, "int64.onnx");
+            File.WriteAllBytes(modelPath, model.ToArray());
+
+            string weightsPath = Path.Combine(directory, "int64.safetensors");
+            var report = OnnxWeightPatcher.Extract(modelPath, weightsPath);
+            Assert.True(report.Tensors == 1, $"extracted {report.Tensors} tensors, expected 1");
+
+            using var file = SafeTensorFile.Open(weightsPath);
+            Assert.True(file.Info("T").DType == "I64", $"T dtype should be I64, got {file.Info("T").DType}");
+            Assert.True(file.ReadRaw("T").SequenceEqual(Int64s(1, -2, 3)),
+                "typed int64_data should decode to little-endian int64 bytes");
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     // ---------------- 工具 ----------------
 
     private sealed record TensorSpec(string Name, string DType, long[] Shape, byte[] Data);
@@ -397,15 +491,15 @@ internal static class SafeTensorTests
         return path;
     }
 
-    /// <summary>造一个最小骨架：<c>y = MatMul(x, W) + B</c>，W=[2,3]、B=[3]，权重全 0。</summary>
-    private static string BuildSkeleton(string path)
+    /// <summary>造一个最小骨架：<c>y = MatMul(x, W) + B</c>，W=[2,3]、B=[3]；默认权重全 0。</summary>
+    private static string BuildSkeleton(string path, byte[]? weightBytes = null, byte[]? biasBytes = null)
     {
         var graph = new List<byte>();
         Field(graph, 1, Node(new[] { "x", "W" }, new[] { "t" }, "MatMul", "mm"));
         Field(graph, 1, Node(new[] { "t", "B" }, new[] { "y" }, "Add", "add"));
         StrField(graph, 2, "skeleton");
-        Field(graph, 5, TensorInit("W", 1, new long[] { 2, 3 }, new byte[24]));
-        Field(graph, 5, TensorInit("B", 1, new long[] { 3 }, new byte[12]));
+        Field(graph, 5, TensorInit("W", 1, new long[] { 2, 3 }, weightBytes ?? new byte[24]));
+        Field(graph, 5, TensorInit("B", 1, new long[] { 3 }, biasBytes ?? new byte[12]));
         Field(graph, 11, ValueInfo("x", 1, new long[] { 1, 2 }));
         Field(graph, 12, ValueInfo("y", 1, new long[] { 1, 3 }));
 
@@ -451,6 +545,28 @@ internal static class SafeTensorTests
         Field(tensor, 2, (ulong)dataType);
         StrField(tensor, 8, name);
         Field(tensor, 9, raw);
+        return tensor.ToArray();
+    }
+
+    /// <summary>int64 initializer，数据放在 typed 字段（<c>int64_data</c>）而不是 <c>raw_data</c>。</summary>
+    private static byte[] TensorInitInt64(string name, long[] dims, long[] values)
+    {
+        var tensor = new List<byte>();
+
+        var packedDims = new List<byte>();
+        foreach (long dim in dims)
+            Varint(packedDims, (ulong)dim);
+        if (packedDims.Count > 0)
+            Field(tensor, 1, packedDims.ToArray());
+
+        Field(tensor, 2, 7); // INT64
+        StrField(tensor, 8, name);
+
+        var packedValues = new List<byte>();
+        foreach (long value in values)
+            Varint(packedValues, unchecked((ulong)value));
+        Field(tensor, 7, packedValues.ToArray());
+
         return tensor.ToArray();
     }
 

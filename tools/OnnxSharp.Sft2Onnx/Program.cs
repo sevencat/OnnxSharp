@@ -23,6 +23,7 @@ internal static class Program
             return args[0] switch
             {
                 "patch" => Patch(args),
+                "extract" => Extract(args),
                 "list" => List(args),
                 _ => Usage(2),
             };
@@ -55,6 +56,10 @@ internal static class Program
 
               sft2onnx list <model.onnx | weights.safetensors>
                   按扩展名自动识别：ONNX 列出 initializer，safetensors 列出张量
+
+              sft2onnx extract <model.onnx> -o <weights.safetensors> [--graph-out <skeleton.onnx>]
+                  反向：把 ONNX 里的权重抽成 safetensors；给 --graph-out 时再写一份
+                  剥掉权重数据的骨架（只有图，供 patch 使用，不能直接推理）
 
             说明:
               ONNX = 计算图 + 权重，safetensors 只有权重。骨架提供「图」，本工具把「权重」换进去，
@@ -212,6 +217,59 @@ internal static class Program
         Console.WriteLine($"elapsed   : {started.ElapsedMilliseconds} ms");
 
         return verify ? Verify(output) : 0;
+    }
+
+    private static int Extract(string[] args)
+    {
+        if (args.Length < 2)
+        {
+            Console.Error.WriteLine("extract: needs <model.onnx>");
+            return Usage(2);
+        }
+
+        string modelPath = args[1];
+        string? output = null;
+        string? graphOutput = null;
+
+        for (int i = 2; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "-o":
+                case "--output":
+                    output = Next(args, ref i, args[i]);
+                    break;
+
+                case "--graph-out":
+                    graphOutput = Next(args, ref i, args[i]);
+                    break;
+
+                default:
+                    Console.Error.WriteLine($"unknown option '{args[i]}'");
+                    return Usage(2);
+            }
+        }
+
+        if (output is null)
+        {
+            Console.Error.WriteLine("extract: missing -o <weights.safetensors>");
+            return Usage(2);
+        }
+
+        var report = OnnxWeightPatcher.Extract(modelPath, output, graphOutput);
+
+        Console.WriteLine($"model     : {modelPath}");
+        Console.WriteLine($"weights   : {report.WeightsPath} ({report.Tensors} tensors, {FormatBytes(report.WeightBytes)})");
+
+        if (report.SkeletonPath is not null)
+        {
+            Console.WriteLine(
+                $"skeleton  : {report.SkeletonPath} ({FormatBytes(report.SkeletonBytes)}, "
+                + $"图 {FormatBytes(new FileInfo(modelPath).Length - report.WeightBytes)} + 头部)");
+            Console.WriteLine("note      : 骨架不含权重数据，不能直接推理；配合 patch 使用");
+        }
+
+        return 0;
     }
 
     private static int List(string[] args)

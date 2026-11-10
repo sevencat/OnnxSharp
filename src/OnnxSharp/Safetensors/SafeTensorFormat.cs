@@ -54,6 +54,30 @@ internal static partial class SafeTensorFormat
     };
 
     /// <summary>
+    /// ONNX <c>TensorProto.DataType</c> → safetensors 的 dtype 字符串（<see cref="ToOnnxDataType"/> 的逆）。
+    /// 用于把 ONNX 里的权重抽成 safetensors。
+    /// </summary>
+    public static string ToSafeTensorDType(int onnxType, string name) => onnxType switch
+    {
+        1 => "F32",
+        2 => "U8",
+        3 => "I8",
+        4 => "U16",
+        5 => "I16",
+        6 => "I32",
+        7 => "I64",
+        9 => "BOOL",
+        10 => "F16",
+        11 => "F64",
+        12 => "U32",
+        13 => "U64",
+        16 => "BF16",
+        _ => throw new OnnxSharpException(
+            $"tensor '{name}': ONNX data_type {onnxType} has no safetensors equivalent "
+            + "(FLOAT8 / COMPLEX / STRING 不支持)"),
+    };
+
+    /// <summary>
     /// <see cref="SafeTensorFile.GetTensor"/> 的目标类型：浮点一律 F32、整型取引擎支持的位宽
     /// （I16/U16 → I32，U32/U64 → I64）。这些类型 <see cref="DType"/> 里都有。
     /// </summary>

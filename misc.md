@@ -1588,6 +1588,30 @@ tools/OnnxSharp.Sft2Onnx/                           命令行：patch / list
 4. **`external_data` 必须搬进来**。骨架自带外部数据文件时，未匹配的 initializer 若原样保留，
    输出模型换个目录就找不到权重 → 读进内存重新内联（超过阈值再按 4096 对齐写成新的 `.data`）。
 
+**反向（`extract`）—— 图本来就在文件里，所以是纯搬运**：
+`sft2onnx extract model.onnx -o w.safetensors --graph-out skeleton.onnx`
+
+- 权重 → safetensors：`raw_data` 直拷；`float_data` / `double_data` / `int32_data` / `int64_data` /
+  `uint64_data` 等 typed 字段按**声明的 ONNX 类型**还原成小端字节（含负数 varint 的符号扩展）；
+  `external_data` 走原来那条读路径。dtype 反向映射：1/2/3/5/6/7/9/10/11/16 → F32/U8/I8/I16/I32/I64/BOOL/F16/F64/BF16。
+- 图 → 骨架：只丢数据字段（`raw_data` / `*_data` / `external_data` / `data_location`），
+  节点、value_info、metadata 原样保留。
+
+实测 yolo11n：10,720,227 B → **骨架 86,042 B + 权重 10,651,800 B**；再 patch 回去 10,720,227 B
+（**字节数完全相同**），ORT 跑「原模型」vs「往返模型」**max|diff| = 0.0**。
+
+⚠️ 剥掉数据的骨架**不能直接推理**（引擎会说 raw_data 长度不对），只能配合 patch —— 这就是骨架的定义。
+
+**方向不对称（这条最重要）**：
+
+| 方向 | 图在哪 | 成本 |
+|---|---|---|
+| `ONNX → safetensors + 骨架` | **文件里已有** | 纯搬运，~300 行（已实现） |
+| `safetensors + config → ONNX` | **不存在** | 必须有架构代码（YOLO ~1500 行，见 `parse_model`） |
+
+所以「能不能纯 C# 互转」的答案是**分方向的**：反方向能且无损；正方向只有「骨架 + 补丁」这一种纯 C# 解，
+除非你愿意把 ultralytics 的 `parse_model` + 每个模块的 forward 抄一遍。
+
 **顺带得到的结论**（回答「能不能纯 C# 从 safetensors + config 生成 ONNX」）：
 - **对 HF/YOLO 这类「库里有架构代码」的模型**：必须要么转 ONNX（Python 一步），要么在 C# 里重写架构，
   后者对 YOLO 约 1500 行且随版本变 —— 不值。
