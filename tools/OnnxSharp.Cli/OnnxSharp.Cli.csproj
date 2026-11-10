@@ -4,6 +4,20 @@
     <ProjectReference Include="..\..\src\OnnxSharp\OnnxSharp.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!--
+      图像侧只在 CLI 用：ImageFacade（Apache-2.0，纯托管）负责解码 / 绘制 / 保存 / 中文标签。
+      具体图片格式是**额外引入**的包 —— 软后端只带渲染与绘制，编解码要按需加 Sdcb.SimdCodecs.<Format>
+      并在 ImageHost 里注册；要支持别的格式（Webp / Pnm / Tiff …）就再加一行 PackageReference。
+      产品库 OnnxSharp 依旧零第三方依赖 —— 「像素由调用方给」的边界没有动。
+    -->
+    <PackageReference Include="Sevencat.ImageFacade" Version="0.1.0" />
+    <PackageReference Include="Sevencat.ImageFacade.SdcbSimdCodecs" Version="0.1.0" />
+    <PackageReference Include="Sdcb.SimdCodecs.Jpeg" Version="2.0.0" />
+    <PackageReference Include="Sdcb.SimdCodecs.Png" Version="2.0.0" />
+    <PackageReference Include="Sdcb.SimdCodecs.Bmp" Version="2.0.0" />
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>

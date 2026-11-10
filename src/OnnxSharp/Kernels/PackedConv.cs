@@ -378,10 +378,11 @@ internal static class PackedConv
 
                 if (begin == 0)
                 {
+                    // 注意：没有 bias 时 bias 指针是 null，四行都要判空（PaddleOCR 的 Conv+BN 就不带 bias）
                     c00 = c01 = Vector256.Create(bias is null ? 0f : bias[row]);
-                    c10 = c11 = row + 1 < rows ? Vector256.Create(bias[row + 1]) : Vector256<float>.Zero;
-                    c20 = c21 = row + 2 < rows ? Vector256.Create(bias[row + 2]) : Vector256<float>.Zero;
-                    c30 = c31 = row + 3 < rows ? Vector256.Create(bias[row + 3]) : Vector256<float>.Zero;
+                    c10 = c11 = bias is null || row + 1 >= rows ? Vector256<float>.Zero : Vector256.Create(bias[row + 1]);
+                    c20 = c21 = bias is null || row + 2 >= rows ? Vector256<float>.Zero : Vector256.Create(bias[row + 2]);
+                    c30 = c31 = bias is null || row + 3 >= rows ? Vector256<float>.Zero : Vector256.Create(bias[row + 3]);
                 }
                 else
                 {

@@ -1,12 +1,16 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Text;
 using System.Text.Json;
 using OnnxSharp.Core;
+using OnnxSharp.Ocr.PaddleOCR;
 using OnnxSharp.Onnx;
 using OnnxSharp.Tensors;
 using OnnxSharp.Vision;
+using ImageFacade;
+using FacadeDetection = ImageFacade.Pipeline.Detection;
+using FacadeDetectionStyle = ImageFacade.Pipeline.DetectionStyle;
 
 // 子命令：
 //   (无参数) / smoke         M0 冒烟：手工建图 Add + Relu，验证引擎链路
@@ -25,6 +29,7 @@ return args[0].ToLowerInvariant() switch
     "bench" => Bench(args),
     "profile" => Profile(args),
     "detect" => Detect(args),
+    "ocr" => Ocr(args),
     "gemmbench" => GemmBench(args),
     "parbench" => ParBench(args),
     "flopsbench" => FlopsBench(args),
@@ -49,12 +54,16 @@ static int Usage()
     Console.WriteLine("                                      # 计时迭代");
     Console.WriteLine("  OnnxSharp.Cli profile <model.onnx> --input <file.bin> [--iters N] [--top N]");
     Console.WriteLine("                                      # 逐算子耗时排行（找热点）");
-    Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> <image.ppm|bmp> [--conf 0.25] [--iou 0.45]");
+    Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> <image> [--conf 0.25] [--iou 0.45] [--out marked.jpg]");
     Console.WriteLine("                     [--labels names.txt] [--json out.json] [--max-det 300]");
     Console.WriteLine("                     [--classes N] [--layout auto|cf|cl|e2e] [--iters N]");
     Console.WriteLine("                                      # 内建 letterbox + decode + NMS，直接返回原图坐标的框");
     Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> --input <file.bin> [--shape 1,3,640,640] [...同上]");
     Console.WriteLine("                                      # 输入已预处理好的 F32，跳过 letterbox");
+    Console.WriteLine("  OnnxSharp.Cli ocr <image> --det det.onnx --rec rec.onnx --dict keys.txt [--out marked.jpg]");
+    Console.WriteLine("                     [--cls cls.onnx] [--limit 960] [--box 0.6] [--unclip 1.6] [--json]");
+    Console.WriteLine("                                      # PaddleOCR：DB 检测 → 方向分类 → CTC 识别");
+    Console.WriteLine("  （<image> 由 ImageFacade 解码：JPEG / PNG / BMP / PPM 都可以）");
     Console.WriteLine("  OnnxSharp.Cli gemmbench [--iters N] [--shape m,k,n]");
     Console.WriteLine("                                      # GEMM 微内核吞吐（GFLOPS），调优用");
     return 2;
@@ -152,13 +161,15 @@ static int DumpGraph(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.Error.WriteLine("usage: dump-graph <model.onnx> [--type <OpType>] [--limit N]");
+        Console.Error.WriteLine("usage: dump-graph <model.onnx> [--shape 1,3,960,960] [--type <OpType>] [--limit N]");
+        Console.Error.WriteLine("       --shape 用于全动态模型（如 PaddleOCR）：先给输入定具体尺寸，导入期才能折叠形状链");
         return 2;
     }
 
     string path = args[1];
     string? filter = null;
     int limit = int.MaxValue;
+    int[]? shape = null;
 
     for (int i = 2; i < args.Length - 1; i++)
     {
@@ -166,6 +177,8 @@ static int DumpGraph(string[] args)
             filter = args[++i];
         else if (args[i] == "--limit")
             limit = int.Parse(args[++i]);
+        else if (args[i] == "--shape")
+            shape = ParseShape(args[++i]);
     }
 
     if (!File.Exists(path))
@@ -175,7 +188,7 @@ static int DumpGraph(string[] args)
     }
 
     var watch = System.Diagnostics.Stopwatch.StartNew();
-    var net = Net.ReadModel(path);
+    var net = LoadModel(path, shape);
     var graph = net.MainGraph ?? throw new OnnxSharpException("no main graph");
     Interpreter.Run(net.Impl, graph, executeLayers: false);
     watch.Stop();
@@ -242,7 +255,7 @@ static int Run(string[] args)
     }
 
     var loadWatch = System.Diagnostics.Stopwatch.StartNew();
-    var net = Net.ReadModel(path);
+    var net = LoadModel(path, ParseShape(options.GetString("--shape")));
     loadWatch.Stop();
 
     var feeds = BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
@@ -313,7 +326,7 @@ static int Bench(string[] args)
         return 2;
     }
 
-    var net = Net.ReadModel(path);
+    var net = LoadModel(path, ParseShape(options.GetString("--shape")));
     BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
 
     int warmup = options.GetInt("--warmup", 1);
@@ -694,7 +707,7 @@ static int Profile(string[] args)
         return 2;
     }
 
-    var net = Net.ReadModel(path);
+    var net = LoadModel(path, ParseShape(options.GetString("--shape")));
     BindInputs(net, options.Inputs, ParseShape(options.GetString("--shape")));
 
     int iters = Math.Max(1, options.GetInt("--iters", 2));
@@ -782,7 +795,8 @@ static int Detect(string[] args)
         return 2;
     }
 
-    ImageData? image = imagePath is null ? null : ImageFile.Load(imagePath);
+    // 图像解码交给 ImageFacade（纯托管软后端，JPEG / PNG / BMP 都能读）
+    using CliImage? image = imagePath is null ? null : CliImage.Load(imagePath);
 
     // 模型只读一次：两个检测器都有接收 Net 的构造函数，避免重复解析 100+ MB 的权重。
     var net = Net.ReadModel(modelPath);
@@ -949,6 +963,166 @@ static int Detect(string[] args)
         Console.WriteLine($"json       : {jsonPath}");
     }
 
+    if (image is not null && options.GetString("--out") is { } detectOut)
+    {
+        SaveDetections(image, detections, labels, detectOut);
+        Console.WriteLine($"output     : {Path.GetFullPath(detectOut)}");
+    }
+
+    return 0;
+}
+
+// ---------------- 画框 / 保存（ImageFacade） ----------------
+
+/// <summary>把检测框画到源图上并另存（ImageFacade 自绘 + 内置中文字体，纯托管）。</summary>
+static void SaveDetections(CliImage image, IReadOnlyList<Detection> detections, string[]? labels, string path)
+{
+    var drawn = new FacadeDetection[detections.Count];
+    for (int i = 0; i < drawn.Length; i++)
+    {
+        Detection detection = detections[i];
+        drawn[i] = new FacadeDetection(
+            new RectF(detection.X, detection.Y, detection.Width, detection.Height),
+            LabelOf(labels, detection.ClassId),
+            detection.Score)
+        {
+            ClassId = detection.ClassId,
+        };
+    }
+
+    ImageFacade.Pipeline.DetectionDrawing.DrawDetections(image.Image, drawn, LabelStyle(image.Width, image.Height));
+    image.Image.Save(path, new SaveOptions { Quality = 92 });
+}
+
+/// <summary>把 OCR 文本行画到源图上并另存。</summary>
+static void SaveOcrLines(CliImage image, IReadOnlyList<OcrLine> lines, string path)
+{
+    var drawn = new FacadeDetection[lines.Count];
+    for (int i = 0; i < drawn.Length; i++)
+    {
+        OcrLine line = lines[i];
+        drawn[i] = new FacadeDetection(new RectF(line.X, line.Y, line.Width, line.Height), line.Text, line.Score);
+    }
+
+    ImageFacade.Pipeline.DetectionDrawing.DrawDetections(image.Image, drawn, LabelStyle(image.Width, image.Height));
+    image.Image.Save(path, new SaveOptions { Quality = 92 });
+}
+
+/// <summary>标签字号 / 线宽按图幅缩放：图越大字越大，不至于在大图上小到看不清。</summary>
+static FacadeDetectionStyle LabelStyle(int width, int height)
+{
+    float minSide = Math.Min(width, height);
+    return new FacadeDetectionStyle
+    {
+        FontSize = Math.Clamp(minSide * 0.02f, 14f, 72f),
+        StrokeWidth = Math.Clamp(minSide * 0.002f, 2f, 8f),
+    };
+}
+
+// ---------------- OCR：PaddleOCR（DB 检测 + 方向分类 + CTC 识别） ----------------
+
+static int Ocr(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: ocr <image.ppm|bmp> --det det.onnx --rec rec.onnx --dict ppocr_keys.txt");
+        Console.Error.WriteLine("                     [--cls cls.onnx] [--limit 960] [--box 0.6] [--unclip 1.6]");
+        Console.Error.WriteLine("                     [--rec-width 640] [--json out.json] [--no-cls]");
+        return 2;
+    }
+
+    string imagePath = args[1];
+    CliOptions options = ParseOptions(args, 2);
+
+    string? detPath = options.GetString("--det");
+    string? recPath = options.GetString("--rec");
+    string? dictPath = options.GetString("--dict");
+    string? clsPath = options.GetString("--cls");
+
+    if (detPath is null || recPath is null || dictPath is null)
+    {
+        Console.Error.WriteLine("ocr 需要 --det / --rec / --dict（PaddleOCR 的 det.onnx / rec.onnx / 字典）");
+        return 2;
+    }
+
+    if (!File.Exists(imagePath))
+    {
+        Console.Error.WriteLine($"image not found: {imagePath}");
+        return 2;
+    }
+
+    var ocrOptions = new PaddleOcrOptions
+    {
+        DetLimitSide = options.GetInt("--limit", 960),
+        DetThreshold = options.GetFloat("--det-conf", 0.3f),
+        BoxThreshold = options.GetFloat("--box", 0.6f),
+        UnclipRatio = options.GetFloat("--unclip", 1.6f),
+        RecMaxWidth = options.GetInt("--rec-width", 640),
+        // 没给 --cls 或显式 --no-cls 时不跑方向分类
+        UseClassification = clsPath is not null && !options.Has("--no-cls"),
+    };
+
+    var loadWatch = System.Diagnostics.Stopwatch.StartNew();
+    PaddleOcrModel model = PaddleOcrModel.FromFiles(detPath, recPath, dictPath, clsPath);
+    var pipeline = new PaddleOcrPipeline(model, ocrOptions);
+    loadWatch.Stop();
+
+    // 解码交给 ImageFacade：JPEG / PNG / BMP 都能直接读
+    using CliImage image = CliImage.Load(imagePath);
+
+    var watch = System.Diagnostics.Stopwatch.StartNew();
+    IReadOnlyList<OcrLine> lines = pipeline.Run(image.Pixels, image.Width, image.Height, OcrPixelFormat.Rgb24);
+    watch.Stop();
+
+    string? outPath = options.GetString("--out");
+    if (!string.IsNullOrEmpty(outPath))
+    {
+        SaveOcrLines(image, lines, outPath);
+        Console.WriteLine($"  output : {Path.GetFullPath(outPath)}");
+    }
+
+    string? jsonPath = options.GetString("--json");
+    if (!string.IsNullOrEmpty(jsonPath))
+    {
+        using var stream = File.Create(jsonPath);
+        using var json = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
+
+        json.WriteStartObject();
+        json.WriteString("image", Path.GetFileName(imagePath));
+        json.WriteNumber("width", image.Width);
+        json.WriteNumber("height", image.Height);
+        json.WriteString("model", model.ToString());
+        json.WriteNumber("detLimitSide", ocrOptions.DetLimitSide);
+        json.WriteNumber("elapsedMs", Math.Round(watch.Elapsed.TotalMilliseconds, 2));
+        json.WriteStartArray("lines");
+        foreach (OcrLine line in lines)
+        {
+            json.WriteStartObject();
+            json.WriteString("text", line.Text);
+            json.WriteNumber("score", Math.Round(line.Score, 4));
+            json.WriteStartArray("box");
+            json.WriteNumberValue(Math.Round(line.X, 1));
+            json.WriteNumberValue(Math.Round(line.Y, 1));
+            json.WriteNumberValue(Math.Round(line.Width, 1));
+            json.WriteNumberValue(Math.Round(line.Height, 1));
+            json.WriteEndArray();
+            json.WriteEndObject();
+        }
+        json.WriteEndArray();
+        json.WriteEndObject();
+        json.Flush();
+
+        Console.WriteLine($"{Path.GetFileName(imagePath)} {image.Width}x{image.Height}  ->  {Path.GetFullPath(jsonPath)}");
+        Console.WriteLine($"  result : {lines.Count} 行，{watch.Elapsed.TotalMilliseconds:F1} ms");
+        return 0;
+    }
+
+    Console.WriteLine($"{Path.GetFileName(imagePath)} {image.Width}x{image.Height}");
+    Console.WriteLine($"  model  : {model}  (det {Path.GetFileName(detPath)}, rec {Path.GetFileName(recPath)})");
+    Console.WriteLine($"  load   : {loadWatch.ElapsedMilliseconds} ms（含 det/rec 导入 + 折叠）");
+    Console.WriteLine($"  result : {lines.Count} 行，{watch.Elapsed.TotalMilliseconds:F1} ms（limit {ocrOptions.DetLimitSide}）");
+    foreach (OcrLine line in lines)
+        Console.WriteLine("    " + line);
     return 0;
 }
 
@@ -976,7 +1150,7 @@ static void WriteDetectJson(
     string path,
     string modelPath,
     string? imagePath,
-    ImageData? image,
+    CliImage? image,
     string family,
     string inputDescription,
     float confidence,
@@ -1070,6 +1244,13 @@ static int[]? ParseShape(string? text)
 
     return dims;
 }
+
+/// <summary>
+/// 读模型。给了 <c>--shape</c> 就先把输入尺寸固定下来再折叠 ——
+/// 全动态模型（PaddleOCR 的 det/rec）不给尺寸时形状链折不出常量，导入就会失败。
+/// </summary>
+static Net LoadModel(string path, int[]? shape)
+    => shape is { Length: > 0 } ? Net.ReadModel(path, shape) : Net.ReadModel(path);
 
 static List<Tensor> BindInputs(Net net, List<string> inputs, int[]? shapeOverride = null)
 {

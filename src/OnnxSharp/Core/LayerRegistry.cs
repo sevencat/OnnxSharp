@@ -40,6 +40,7 @@ public static class LayerRegistry
         Ops.IndexOps.Register();
         Ops.BroadcastOps.Register();
         Ops.MiscOps.Register();
+        Ops.NormOps.Register();
         Ops.AttnOps.Register();
         Ops.FusedEltwiseLayer.Register();
     }

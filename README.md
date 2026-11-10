@@ -15,7 +15,7 @@
 
 <p align="center">
   纯 C# 实现的 ONNX 推理引擎 —— <b>只有 CPU</b>（FP32，零第三方依赖），<b>没有</b> CUDA / Vulkan / OpenCL / DirectML 后端。<br>
-  可直接跑 YOLO11 / YOLOv8 / RF-DETR 的 ONNX 导出，并附带「一张图进、检测框出」的可选门面。
+  可直接跑 YOLO11 / YOLOv8 / RF-DETR / PP-OCRv6 的 ONNX 导出，并附带「一张图进、检测框出 / 文本行出」的可选门面。
 </p>
 
 <p align="center">
@@ -66,14 +66,16 @@
 | **后端** | **只有 CPU**（FP32，AVX2 / AVX-512 + 多线程）；**没有** CUDA / TensorRT / Vulkan / OpenCL / DirectML 后端 |
 | 依赖 | 零第三方包（不引用 `Google.Protobuf`、`Microsoft.ML.OnnxRuntime`），全部手写 |
 | 目标框架 | `net8.0` / `net10.0`，AOT 友好（不用反射、不用 `dynamic`） |
-| 算子 | 42 个，覆盖 YOLO11/v8 与 RF-DETR 的导出图（清单见 [支持算子](#支持算子)） |
+| 算子 | 67 个注册算子，覆盖 YOLO11/v8、RF-DETR 与 PP-OCRv6 的导出图（清单见 [支持算子](#支持算子)） |
 | 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链等） |
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
 | 线程 | 默认 `Environment.ProcessorCount`，可用环境变量 `ONNXSHARP_THREADS` 覆盖 |
 | 视觉门面 | `OnnxSharp.Vision`：letterbox / stretch 预处理、YOLO 解码 + NMS、RF-DETR 解码，返回**原图坐标**的框 |
+| OCR 门面 | `OnnxSharp.Ocr.PaddleOCR`：PP-OCRv6 det + 可选 cls + rec，DB 后处理 + CTC 解码，返回**原图坐标**的文本行 |
+| 动态图 | `Net.ReadModel(path, 输入形状)` 把全动态输入（`x[N,3,H,W]`）**特化**成静态图，导入期即可折叠形状链 |
 | 像素输入 | RGB 或 BGR（`bgr` 开关）+ 任意行跨度（`rowStride`，字节）—— OpenCV `Mat`、相机 SDK 的对齐缓冲可直接喂，不必先压成紧凑数组 |
 | 工具 | `OnnxSharp.Cli`：结构 dump、跑一次、计时、逐算子 profile、直接图片检测 |
-| 图像解码 | **不在库里**（避免引入图像库）；CLI 自带最小 PPM/BMP 解码，仅作演示 |
+| 图像解码 | **不在库里**（避免引入图像库）；CLI 用 ImageFacade 软后端 + 额外引入的 `Sdcb.SimdCodecs.Jpeg/Png/Bmp`（显式注册） |
 | 代码来源 | 由 AI 编码代理生成；需求、参考资料与验收由作者负责（见 [代码是 AI 写的](#代码是-ai-写的)） |
 
 ### 安装
@@ -92,7 +94,7 @@ dotnet add package Sevencat.OnnxSharp
 
 ```powershell
 dotnet build OnnxSharp.slnx -c Release
-dotnet run --project tests/OnnxSharp.Tests -c Release    # 51 个用例，全通过退出码 0
+dotnet run --project tests/OnnxSharp.Tests -c Release    # 59 个用例（3 个需本地模型，缺失则 SKIP），全通过退出码 0
 ```
 
 准备一个 ONNX 模型（例如 `yolo11n.onnx`）和一张图，用 CLI 直接检测：
@@ -115,8 +117,27 @@ detections : 24
   #1   class0           0.7525  [1080.5, 732.2, 127.8 x 325.7]
 ```
 
-> CLI 只解 PPM(P6) / 未压缩 BMP。要跑 JPEG/PNG，先用任意工具转一下：
-> `python -c "import cv2;cv2.imwrite('photo.bmp',cv2.imread('photo.jpg'))"`
+> CLI 的图像 IO 走 [ImageFacade](https://github.com/sevencat/ImageFacade) 的纯托管软后端：画框与中文标签由它自绘；
+> 图片格式则是**额外引入**的 `Sdcb.SimdCodecs.Jpeg` / `Png` / `Bmp`，在 `ImageHost.RegisterCodecs()` 里显式注册
+> （软后端本身不带任何编解码，要 PPM/WebP 就再加一个格式包）。**不引任何原生库**，产品库仍然「只吃像素」。
+
+OCR（PaddleOCR）用同一套 CLI，直接吃 JPG，并把框画回去：
+
+```powershell
+# 模型从 nuget 模型包解出（PP-OCRv6 tiny 的 det/rec/字典 + 方向分类）
+powershell -File tools\scripts\extract_ocr_models.ps1
+& $cli ocr page.jpg --det .tmp\ocr-models\det.onnx --rec .tmp\ocr-models\rec.onnx `
+                    --dict .tmp\ocr-models\dict.txt --cls .tmp\ocr-models\cls.onnx `
+                    --limit 1600 --out page.ocr.jpg
+```
+
+```
+page.jpg 3200x1800
+  output : F:\...\page.ocr.jpg
+  result : 3 行，849.4 ms
+    浙A ES8381  (0.883)  [1752,199,198x68]
+    浙A：:3M15X  (0.802)  [1769,1482,202x72]
+```
 
 ### 库用法 1：自己管张量
 
@@ -227,6 +248,76 @@ var stretched  = ImagePreprocessor.Stretch(pixels, width, height, 512, 512,
 var kept = DetectionNms.Suppress(candidates, iouThreshold: 0.45f, maxDetections: 300);
 ```
 
+### 库用法 5：OCR 一张图进、文本行出（PaddleOCR）
+
+```csharp
+using OnnxSharp.Ocr.PaddleOCR;
+
+// 模型来自 PP-OCRv6 的 ONNX 导出；也可以直接吃 nuget 模型包的嵌入资源：
+//   PaddleOcrModel.FromStreams(ChineseV6TinyModel.Detection.OpenRead(), ...)
+var model = PaddleOcrModel.FromFiles("det.onnx", "rec.onnx", "ppocr_keys.txt", "cls.onnx");
+
+var ocr = new PaddleOcrPipeline(model, new PaddleOcrOptions
+{
+    DetLimitSide = 960,     // 大图小字调到 1600 能明显提升小字识别
+    BoxThreshold = 0.6f,
+    UnclipRatio = 1.6f,
+});
+
+// pixels 是调用方解码好的交错像素：RGB24 / BGR24 / RGBA32 / BGRA32，rowStride=0 表示紧凑排列
+foreach (OcrLine line in ocr.Run(pixels, width, height, OcrPixelFormat.Bgra32, stride))
+    Console.WriteLine($"{line.Text}  ({line.Score:F3})  [{line.X:F0},{line.Y:F0}]");
+```
+
+内部完成：检测尺寸按 32 对齐（最长边 ≤ `DetLimitSide`）→ DB 概率图 → 8 邻域连通域 + unclip → 逐行裁剪
+→（可选）PP-LCNet 判断是否倒置并旋转 180° → 等比缩到高 48、右侧补 0 → CTC 贪心解码 + 字典。
+
+两个必须知道的点：
+
+- **模型是全动态导出**（`x[N,3,H,W]`），引擎用 `Net.ReadModel(path, 输入形状)` 把输入维**特化**成具体值才能折叠
+  `Shape → Slice → Concat → Reshape` 链。所以每个 `(H,W)` 对应一份特化图：流水线按形状缓存
+  （检测 2 份 / 识别 8 份，见 `PaddleOcrOptions.DetShapeCacheSize` / `RecShapeCacheSize`）。
+- 模型包里**只有 ONNX 与字典、没有推理代码**，所以这里不引入 `Sdcb.SimdPaddleOCR` 的引擎，只借它的模型资源
+  （`tools/scripts/extract_ocr_models.ps1` 把资源原样解出）。
+
+### 库用法 6：语音识别（sherpa-onnx，不在引擎里）
+
+语音**不在**本引擎范围内，原因很具体：sherpa-onnx 的 Paraformer / Zipformer 导出图里带
+`Loop` / `NonZero` / `GatherND` / `Sequence`，并且权重是 **int8**（`MatMulInteger`），
+而本引擎是静态图 + FP32 + 无子图/循环 —— 不是「补两个算子」能解决的。
+
+需要离线 ASR 时直接用 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 的 .NET 包
+（`org.k2fsa.sherpa.onnx`，注意它**自带原生 onnxruntime**，与「纯托管、零原生依赖」冲突）：
+
+```csharp
+using SherpaOnnx;
+
+var config = new OfflineRecognizerConfig
+{
+    FeatConfig = new FeatureConfig { SampleRate = 16000, FeatureDim = 80 },
+    ModelConfig = new OfflineModelConfig
+    {
+        Tokens = @"sherpa\tokens.txt",
+        NumThreads = 2,
+        Provider = "cpu",
+        Paraformer = new OfflineParaformerModelConfig { Model = @"sherpa\model.int8.onnx" },
+        ModelType = "paraformer",
+    },
+    DecodingMethod = "greedy_search",
+};
+
+using var recognizer = new OfflineRecognizer(config);
+using OfflineStream stream = recognizer.CreateStream();
+stream.AcceptWaveform(sampleRate, samples);   // float[]，单声道；sherpa 自己重采样到 16 kHz
+recognizer.Decode(stream);
+Console.WriteLine(stream.Result.Text);
+```
+
+WAV 解析（PCM 8/16/24/32 与 float32、任意声道下混）是纯托管代码，约 100 行，不需要额外依赖；
+本仓库不内置，避免为一个可选能力引入原生运行库。想自己做纯托管 ASR 的话，
+`F:\code\SimdOnnxExt` 的 `docs/PLAN.md`「阶段 6」记录了把 sherpa 的 Paraformer 权重反量化成 fp32、
+再用引擎 kernel 重写 fbank/CIF/decoder 的路线与进度。
+
 ### 命令行
 
 ```powershell
@@ -241,7 +332,8 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | `run <model.onnx> --input in.f32 [--input name=file.bin] [--compare golden.bin] [--repeat N] [--dump dir]` | 跑一次前向，打印输出统计与耗时 |
 | `bench <model.onnx> --input in.f32 [--iters N] [--warmup N]` | 计时迭代，输出 median / min |
 | `profile <model.onnx> --input in.f32 [--iters N] [--top N]` | 逐算子耗时排行（找热点） |
-| `detect <model.onnx> <image.ppm\|bmp> [...]` | 内建预处理 + 解码，直接给出原图坐标的框 |
+| `detect <model.onnx> <image> [--out marked.jpg]` | 内建预处理 + 解码，直接给出原图坐标的框（可画出标注图） |
+| `ocr <image> --det det.onnx --rec rec.onnx --dict keys.txt [--cls cls.onnx] [--out marked.jpg]` | PaddleOCR：DB 检测 → 方向分类 → CTC 识别，给出原图坐标的文本行（可画出标注图） |
 | `gemmbench` / `convbench` / `flopsbench` / `parbench` | 微基准：GEMM、卷积、FLOPS、并行扩展性 |
 
 `detect` 的常用参数：
@@ -282,15 +374,21 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 
 ### 支持算子
 
-42 个，按实现批次排列：
+67 个注册算子（另有 `Constant` 在导入期内联为常量 Arg，`Silu` / `FusedEltwise` 是图融合的产物）：
 
-| 批次 | 算子 |
+| 类别 | 算子 |
 |---|---|
-| 形状/元数据 (9) | `Constant` `Shape` `ConstantOfShape` `Expand` `Tile` `Unsqueeze` `Reshape` `Slice` `Split` |
-| 搬运/类型 (3) | `Concat` `Transpose` `Cast` |
-| 逐元素/比较 (17) | `Add` `Sub` `Mul` `Div` `Sqrt` `Exp` `Erf` `Sin` `Cos` `Sigmoid` `Relu` `Not` `Equal` `Less` `Greater` `And` `Where` |
-| 归约/索引 (5) | `ReduceSum` `ReduceMax` `TopK` `Gather` `GatherElements` |
-| 重算子 (8) | `Conv` `MatMul` `Gemm` `MaxPool` `Softmax` `LayerNormalization` `Resize` `GridSample` |
+| 形状/元数据 (11) | `Shape` `ConstantOfShape` `Expand` `Tile` `Unsqueeze` `Squeeze` `Reshape` `Slice` `Split` `Flatten` `Range` |
+| 搬运/类型 (4) | `Concat` `Transpose` `Cast` `Identity` |
+| 逐元素 (26) | `Add` `Sub` `Mul` `Div` `Mod` `Pow` `Max` `Min` `Abs` `Neg` `Sqrt` `Exp` `Log` `Erf` `Sin` `Cos` `Reciprocal` `Round` `Floor` `Ceil` `Sign` `Clip` `Relu` `HardSigmoid` `Sigmoid` `Tanh` |
+| 比较/逻辑 (6) | `Equal` `Less` `Greater` `And` `Not` `Where` |
+| 归约/索引 (7) | `ReduceSum` `ReduceMax` `ReduceMean` `TopK` `Gather` `GatherElements` `GatherND` |
+| 重算子 (13) | `Conv` `ConvTranspose` `MatMul` `Gemm` `MaxPool` `AveragePool` `GlobalAveragePool` `GlobalMaxPool` `Softmax` `LayerNormalization` `BatchNormalization` `Resize` `GridSample` |
+
+> 与目标模型的关系：YOLO11/v8 用前五类里的大部分；RF-DETR 额外要 `GridSample` / `TopK` / `GatherElements` /
+> `Reduce*` / `Sin` / `Cos` / `Where`；PP-OCRv6 额外要 `HardSigmoid` / `GlobalAveragePool` / `ReduceMean` /
+> `ConvTranspose` / `BatchNormalization` / `Identity`（后三个是本轮为 OCR 补的）。
+> **动态维**不属于算子问题：`Net.ReadModel(path, 输入形状)` 会把全动态图特化成静态图，否则 `Shape` 链折不出常量。
 
 ### 性能
 
@@ -314,16 +412,23 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | yolo11n | 端到端输出与 ONNXRuntime 逐值对齐（回归用例）；检测结果与 SimdYolo 逐框一致（最大 0.005 px） |
 | yolov8n / yolo11s / yolov8s | 跑通并纳入基准 |
 | rfdetr-small / rfdetr-medium | 跑通并纳入基准；解码结果与官方 `rfdetr.export._runtime.decode_detections` 逐框一致（41/41 框，坐标 0.00 px） |
+| PP-OCRv6 tiny（det / rec / cls） | det 与 rec 的**原始输出**与 ONNXRuntime 对齐（64² + 960² 输入：max\|diff\| 1.4e-7 / 7.6e-6）；900×300 合成图两行文字全对（`Hello OnnxSharp 123` 0.957、`第二行文字 PaddleOCR` 0.982） |
 | 单算子微模型 | GEMM / attention / 逐元素链，用于内核定点调优 |
 
 ### 限制
 
 - **只做 CPU**，没有 CUDA / DirectML / OpenVINO 等执行后端。
 - **计算主体是 FP32**；`Cast` 与整数张量只服务于索引/形状路径，未实现 INT8 量化（QDQ）反量化。
-- 动态维只做「最小可用」：以 batch=1 为主，动态 H/W 需要构造时给 `TargetWidth/TargetHeight`。
+- 动态维只做「最小可用」：全动态图（如 PaddleOCR）要用 `Net.ReadModel(path, 输入形状)` **特化**成静态图，
+  每个尺寸一份图；纯运行期动态形状（同一份图换尺寸）不支持。
 - 不针对 WASM / IL2CPP，未验 NativeAOT（但代码保持 AOT 友好）。
-- **库内不做图像解码**（JPEG/PNG），像素由调用方给；CLI 只解 PPM/BMP。
+- **库内不做图像解码**（JPEG/PNG），像素由调用方给；CLI 用 ImageFacade 解 JPEG/PNG/BMP 并负责画框/保存。
 - `OnnxSharp.Vision` 只覆盖**单图、三通道、目标检测**；分割 / 姿态 / OBB / 关键点未实现。
+- `OnnxSharp.Ocr.PaddleOCR` 只覆盖 **PP-OCRv6 系列**（DB 检测 + CTC 识别 + 文本行方向分类）；表格识别、
+  版面分析、SAST 等其它 OCR 结构未实现。检测后处理是**轴对齐框**（不做 pyclipper 的多边形外扩），
+  竖排 / 大角度倾斜文本能框住但框是正的。
+- **不做语音识别**：sherpa-onnx 的模型带 `Loop` / `NonZero` / int8 权重，超出本引擎的静态 FP32 图模型，
+  需要 ASR 请直接用 sherpa-onnx（见 [库用法 6](#库用法-6语音识别sherpa-onnx不在引擎里)）。
 
 ### 目录结构
 
@@ -332,13 +437,17 @@ src/OnnxSharp/
   Core/      Net / NetImpl / Graph / Arg / 解释器 / 内存池 / 融合 / 常量折叠
   Onnx/      手写 protobuf reader、ONNX importer
   Tensors/   Tensor / TensorShape / DType / GEMM / Transpose 内核
-  Ops/       42 个算子的实现
+  Ops/       算子的实现（含 NormOps：BatchNormalization / Identity）
   Kernels/   直接卷积、打包卷积、Winograd、MaxPool
   Threading/ 并行工具（ONNXSHARP_THREADS）
   Vision/    可选门面：ImagePreprocessor / YoloDetector / YoloDecoder
              / RfDetrDetector / RfDetrDecoder / Detection（可整体删除，不影响推理）
-tools/OnnxSharp.Cli/   info / run / bench / profile / detect / 微基准 + 最小 PPM/BMP 解码
-tests/OnnxSharp.Tests/ 零依赖测试运行器（51 用例），直接 dotnet run
+  Ocr/       可选门面（可整体删除，不影响推理）
+    PaddleOCR/  OcrLine / OcrPixelFormat / 像素→NCHW / CTC 解码
+                + PaddleOcrModel / PaddleOcrPipeline / DbPostprocess / PaddleOcrOptions
+tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / 微基准 + ImageFacade 图像 IO
+tools/scripts/         dump_shapes / gen_golden / extract_ocr_models.ps1
+tests/OnnxSharp.Tests/ 零依赖测试运行器（59 用例），直接 dotnet run
 bench/                四引擎 × 6 模型的对照脚本与产物
 ```
 
@@ -416,12 +525,14 @@ A few conventions follow from that:
 | **Backend** | **CPU only** (FP32, AVX2 / AVX-512 + threads); **no** CUDA / TensorRT / Vulkan / OpenCL / DirectML backend |
 | Dependencies | None — protobuf reader, kernels and runtime are all hand-written |
 | Targets | `net8.0` / `net10.0`, AOT-friendly (no reflection, no `dynamic`) |
-| Operators | 42, covering YOLO11/v8 and RF-DETR exports |
+| Operators | 67 registered ops, covering YOLO11/v8, RF-DETR and PP-OCRv6 exports |
 | Graph passes | Constant folding (Shape→Gather→Concat→Reshape chains), operator fusion |
 | Runtime | Static buffer pool (outputs detach), shape inference, `Parallel.For` + AVX2/AVX-512 |
 | Threads | `Environment.ProcessorCount` by default, overridable via `ONNXSHARP_THREADS` |
 | Vision | `OnnxSharp.Vision`: letterbox / stretch preprocessing, YOLO decode + NMS, RF-DETR decode |
-| Image decoding | **Not in the library** (keeps it dependency-free); the CLI ships a minimal PPM/BMP decoder |
+| OCR | `OnnxSharp.Ocr.PaddleOCR`: PP-OCRv6 det + optional cls + rec, DB post-processing, CTC — text lines in source pixels |
+| Dynamic graphs | `Net.ReadModel(path, inputShape)` **specialises** a fully dynamic input (`x[N,3,H,W]`) so shape chains fold at import |
+| Image decoding | **Not in the library** (keeps it dependency-free); the CLI uses the ImageFacade software backend plus opt-in `Sdcb.SimdCodecs.Jpeg/Png/Bmp` format packages (registered explicitly) |
 | Written by | AI coding agents; requirements, references and review by the maintainer (see [The code is AI-written](#the-code-is-ai-written)) |
 
 ### Install
@@ -440,7 +551,7 @@ Requires .NET 8 or .NET 10 SDK.
 
 ```powershell
 dotnet build OnnxSharp.slnx -c Release
-dotnet run --project tests/OnnxSharp.Tests -c Release     # 51 cases, exit code 0 on success
+dotnet run --project tests/OnnxSharp.Tests -c Release     # 59 cases (3 need local models, otherwise skipped)
 ```
 
 Detect objects in one command:
@@ -451,7 +562,26 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 & $cli detect rfdetr-small.onnx photo.bmp --conf 0.3
 ```
 
-The CLI reads PPM(P6) / uncompressed BMP only; convert JPEG/PNG first.
+Detect text lines with PaddleOCR:
+
+```powershell
+powershell -File tools\scripts\extract_ocr_models.ps1   # det/rec/dict + cls from the nuget model packages
+& $cli ocr page.jpg --det .tmp\ocr-models\det.onnx --rec .tmp\ocr-models\rec.onnx `
+                    --dict .tmp\ocr-models\dict.txt --cls .tmp\ocr-models\cls.onnx `
+                    --limit 1600 --out page.ocr.jpg
+```
+
+```
+page.jpg 3200x1800
+  output : F:\...\page.ocr.jpg
+  result : 3 行，849.4 ms
+    浙A ES8381  (0.883)  [1752,199,198x68]
+    浙A：:3M15X  (0.802)  [1769,1482,202x72]
+```
+
+The CLI decodes images with ImageFacade (pure managed software backend): picture formats are **opt-in**
+`Sdcb.SimdCodecs.Jpeg` / `Png` / `Bmp` packages registered in `ImageHost.RegisterCodecs()`, and `--out`
+writes an annotated copy.
 
 ### Library usage
 
@@ -543,6 +673,75 @@ detections = rfdetr.Decode(rfdetr.Net.ForwardAll(), width, height);
 
 Or use the static helpers: `ImagePreprocessor.Letterbox(...)`, `ImagePreprocessor.Stretch(...)` (with `ChannelNormalization.ImageNet`), `DetectionNms.Suppress(...)`.
 
+**OCR — image in, text lines out (PaddleOCR)**
+
+```csharp
+using OnnxSharp.Ocr.PaddleOCR;
+
+// Models come from the PP-OCRv6 ONNX export; the nuget model packages can be fed directly:
+//   PaddleOcrModel.FromStreams(ChineseV6TinyModel.Detection.OpenRead(), ...)
+var model = PaddleOcrModel.FromFiles("det.onnx", "rec.onnx", "ppocr_keys.txt", "cls.onnx");
+
+var ocr = new PaddleOcrPipeline(model, new PaddleOcrOptions
+{
+    DetLimitSide = 960,     // raise to 1600 when the text is small relative to the image
+    BoxThreshold = 0.6f,
+    UnclipRatio = 1.6f,
+});
+
+// pixels are interleaved RGB24 / BGR24 / RGBA32 / BGRA32; rowStride = 0 means packed rows
+foreach (OcrLine line in ocr.Run(pixels, width, height, OcrPixelFormat.Bgra32, stride))
+    Console.WriteLine($"{line.Text}  ({line.Score:F3})  [{line.X:F0},{line.Y:F0}]");
+```
+
+Internally: detection size aligned to 32 (longest side ≤ `DetLimitSide`) → DB probability map → 8-connected
+components + unclip → per-line crop → (optional) PP-LCNet upside-down check with a 180° rotation →
+aspect-preserving resize to height 48 with zero padding → CTC greedy decode + dictionary.
+
+Two things worth knowing:
+
+- **The models are fully dynamic** (`x[N,3,H,W]`); the engine uses `Net.ReadModel(path, inputShape)` to
+  **specialise** the input dimensions so the `Shape → Slice → Concat → Reshape` chains can fold at import.
+  One specialised graph per `(H,W)`, cached per shape (2 for detection, 8 for recognition —
+  `PaddleOcrOptions.DetShapeCacheSize` / `RecShapeCacheSize`).
+- The model packages contain **only ONNX + dictionary, no inference code**, so the pipeline borrows just the
+  model resources (`tools/scripts/extract_ocr_models.ps1` writes them out unchanged).
+
+**Speech (sherpa-onnx) is not in the engine**
+
+sherpa-onnx Paraformer / Zipformer graphs contain `Loop` / `NonZero` / `GatherND` / `Sequence` and quantised
+(**int8**) weights, while this engine is static-graph, FP32, no subgraphs — that is not "add two operators".
+
+For offline ASR use the sherpa-onnx .NET package (`org.k2fsa.sherpa.onnx`; note it **ships a native
+onnxruntime**, which conflicts with "pure managed, zero native dependencies"):
+
+```csharp
+using SherpaOnnx;
+
+var config = new OfflineRecognizerConfig
+{
+    FeatConfig = new FeatureConfig { SampleRate = 16000, FeatureDim = 80 },
+    ModelConfig = new OfflineModelConfig
+    {
+        Tokens = @"sherpa\tokens.txt",
+        NumThreads = 2,
+        Provider = "cpu",
+        Paraformer = new OfflineParaformerModelConfig { Model = @"sherpa\model.int8.onnx" },
+        ModelType = "paraformer",
+    },
+    DecodingMethod = "greedy_search",
+};
+
+using var recognizer = new OfflineRecognizer(config);
+using OfflineStream stream = recognizer.CreateStream();
+stream.AcceptWaveform(sampleRate, samples);   // float[] mono; sherpa resamples to 16 kHz itself
+recognizer.Decode(stream);
+Console.WriteLine(stream.Result.Text);
+```
+
+The WAV reader (PCM 8/16/24/32 and float32, any channel count down-mixed to mono) is ~100 lines of managed
+code; it is deliberately not bundled here so an optional feature does not drag in a native runtime.
+
 ### CLI commands
 
 | Command | Purpose |
@@ -553,7 +752,7 @@ Or use the static helpers: `ImagePreprocessor.Letterbox(...)`, `ImagePreprocesso
 | `run <model.onnx> --input in.f32 [--compare golden.bin] [--repeat N] [--dump dir]` | One forward pass with output statistics |
 | `bench <model.onnx> --input in.f32 [--iters N] [--warmup N]` | Timed iterations (median / min) |
 | `profile <model.onnx> --input in.f32 [--iters N] [--top N]` | Per-operator timing ranking |
-| `detect <model.onnx> <image.ppm\|bmp> [...]` | Preprocess + forward + decode, boxes in source pixels |
+| `detect <model.onnx> <image> [--out marked.jpg]` | Preprocess + forward + decode, boxes in source pixels |
 | `gemmbench` / `convbench` / `flopsbench` / `parbench` | Micro-benchmarks for tuning |
 
 Key `detect` flags: `--family auto|yolo|rfdetr`, `--conf`, `--iou` (YOLO), `--max-det`, `--classes`, `--layout`, `--class-agnostic`, `--background -1|none` and `--norm imagenet|255` (RF-DETR), `--labels`, `--json`, `--input <f32.bin> --shape 1,3,640,640`, `--iters N`, `--size N`.
@@ -590,7 +789,7 @@ Forward pass only, batch=1, FP32, 16 threads, median of 40 frames (Ryzen 7 8845H
 - **FP32 compute**; integer/bool tensors only serve index and shape paths. INT8 quantized (QDQ) graphs are not supported.
 - Dynamic dimensions are minimally supported (batch=1 focus); dynamic H/W needs `TargetWidth/TargetHeight`.
 - WASM / IL2CPP are not targeted; NativeAOT is not validated (code stays AOT-friendly).
-- **No image decoding in the library**; bring your own pixels. The CLI decodes PPM/BMP only.
+- **No image decoding in the library**; bring your own pixels. The CLI decodes JPEG/PNG/BMP through ImageFacade and can draw/save the result.
 - `OnnxSharp.Vision` covers single-image, 3-channel object detection only — no segmentation, pose, OBB or keypoints.
 
 ### Layout

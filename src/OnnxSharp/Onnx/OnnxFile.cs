@@ -86,6 +86,77 @@ internal sealed class OnnxFile
         ValueInfos = Array.Empty<OnnxValueInfo>(),
     };
 
+    /// <summary>
+    /// 返回一份<b>把动态维固定成具体值</b>的副本（ONNX 里 <c>dim_param</c> / 缺失 <c>dim_value</c> 都解析成 -1）。
+    /// <para>
+    /// <b>为什么需要</b>：PaddleOCR 的 det / rec 导出是<b>全动态</b>图（<c>x[N,3,H,W]</c>），
+    /// 引擎的常量折叠与形状推断都依赖静态维 —— <c>Shape → Slice → Concat → Reshape</c> 链在
+    /// 输入维未知时折不出常量，<c>Reshape/Resize</c> 的目标形状就永远是「运行时才知道」，整图卡死。
+    /// 调用方给出实际推理尺寸后，这些链在导入期就能折成常量，等价于「为这个尺寸特化一份图」。
+    /// </para>
+    /// <para>
+    /// <paramref name="shapes"/> 的键是图输入名；值是完整形状（长度必须与模型声明一致，每维 &gt; 0）。
+    /// 传 null / 空字典时原样返回。返回的副本与原对象共享节点与权重（只换输入元信息）。
+    /// </para>
+    /// </summary>
+    public OnnxFile WithInputShapes(IReadOnlyDictionary<string, int[]>? shapes)
+    {
+        if (shapes is null || shapes.Count == 0)
+            return this;
+
+        var inputs = new List<OnnxValueInfo>(Inputs.Count);
+        foreach (var info in Inputs)
+            inputs.Add(shapes.TryGetValue(info.Name, out var wanted) ? Specialize(info, wanted) : info);
+
+        // 有输入没给形状且仍是动态：后面推断必然失败，这里提前说清楚是哪一路、当前是什么。
+        foreach (var info in inputs)
+        {
+            if (!info.HasDynamicDims)
+                continue;
+            throw new OnnxSharpException(
+                $"input '{info.Name}' still has dynamic dims [{string.Join(",", info.Dims)}]; " +
+                $"pass a concrete shape for it (model inputs: {string.Join(", ", Inputs)})");
+        }
+
+        // 少数导出把「图输入」同时写进 value_info；同名条目一起换掉，免得静态形状被旧值覆盖。
+        var valueInfos = new List<OnnxValueInfo>(ValueInfos.Count);
+        foreach (var info in ValueInfos)
+            valueInfos.Add(shapes.TryGetValue(info.Name, out var wanted) ? Specialize(info, wanted) : info);
+
+        return new OnnxFile
+        {
+            Path = Path,
+            BaseDirectory = BaseDirectory,
+            Opset = Opset,
+            Producer = Producer,
+            Nodes = Nodes,
+            Initializers = Initializers,
+            Inputs = inputs,
+            Outputs = Outputs,
+            ValueInfos = valueInfos,
+        };
+    }
+
+    private static OnnxValueInfo Specialize(OnnxValueInfo info, int[] wanted)
+    {
+        if (wanted.Length != info.Dims.Length)
+            throw new OnnxSharpException(
+                $"input '{info.Name}': model declares rank {info.Dims.Length} " +
+                $"[{string.Join(",", info.Dims)}], shape override has rank {wanted.Length} " +
+                $"[{string.Join(",", wanted)}]");
+
+        var dims = new int[wanted.Length];
+        for (int i = 0; i < dims.Length; i++)
+        {
+            if (wanted[i] <= 0)
+                throw new OnnxSharpException(
+                    $"input '{info.Name}': shape override [{string.Join(",", wanted)}] has non-positive dim #{i}");
+            dims[i] = wanted[i];
+        }
+
+        return info with { Dims = dims };
+    }
+
     public static OnnxFile Load(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
@@ -93,8 +164,24 @@ internal sealed class OnnxFile
         var fullPath = System.IO.Path.GetFullPath(path);
         var baseDir = System.IO.Path.GetDirectoryName(fullPath) ?? ".";
 
-        var bytes = File.ReadAllBytes(fullPath);
-        var model = Proto.Parse(bytes.AsMemory());
+        return Parse(File.ReadAllBytes(fullPath).AsMemory(), fullPath, baseDir);
+    }
+
+    /// <summary>
+    /// 从<b>内存</b>里的 ONNX 字节加载模型（例如 nuget 模型包的嵌入资源，不必先落盘成临时文件）。
+    /// <paramref name="baseDirectory"/> 只在模型带外部数据时才会用到。
+    /// </summary>
+    public static OnnxFile Load(ReadOnlyMemory<byte> model, string baseDirectory = ".", string displayName = "<memory>")
+    {
+        if (model.IsEmpty)
+            throw new OnnxSharpException("empty ONNX model");
+
+        return Parse(model, displayName, System.IO.Path.GetFullPath(baseDirectory));
+    }
+
+    private static OnnxFile Parse(ReadOnlyMemory<byte> content, string path, string baseDir)
+    {
+        var model = Proto.Parse(content);
 
         var graphMessage = model.Buffer(7)
             ?? throw new OnnxSharpException($"'{path}' is not an ONNX model (no GraphProto)");
@@ -110,7 +197,7 @@ internal sealed class OnnxFile
 
         var file = new OnnxFile
         {
-            Path = fullPath,
+            Path = path,
             BaseDirectory = baseDir,
             Opset = opset,
             Producer = model.Text(2),
@@ -155,7 +242,7 @@ internal sealed class OnnxFile
 
         return new OnnxFile
         {
-            Path = fullPath,
+            Path = path,
             BaseDirectory = baseDir,
             Opset = opset,
             Producer = file.Producer,

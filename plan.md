@@ -3,12 +3,12 @@
 > 纯 C# 的 ONNX 推理运行时，以 OpenCV 5 dnn 新版 graph 引擎为参考实现。
 > 首版目标：跑通 YOLOv11 检测 与 RF-DETR。
 >
-> **当前状态：M0 + M0.5 + M1 + M2 + M3 已完成，M4 进行中（微内核已定稿，缺并行扩展性）**
-> 已完成：引擎内核（共享缓冲槽 + temp 池 + 动态形状）、ONNX 全链路导入、42 类算子、yolo11n / rfdetr-small / rfdetr-medium 端到端数值对齐
-> 校验：`dotnet build` 0 警告 0 错误；`tests` 29/29 PASS（含 333 张量形状对齐 + ORT golden 对比 + yolo11n 端到端）
+> **当前状态：M0 + M0.5 + M1 + M2 + M3 + M7（OCR）已完成，M4 进行中（微内核已定稿，缺并行扩展性）**
+> 已完成：引擎内核（共享缓冲槽 + temp 池 + 动态形状）、ONNX 全链路导入、67 个注册算子、yolo11n / rfdetr-small / rfdetr-medium / PP-OCRv6（det/rec/cls）端到端数值对齐
+> 校验：`dotnet build` 0 警告 0 错误；`tests` 56/59 PASS（3 个用例需本地模型，缺失则 SKIP）
 > **性能数字只看 `bench.md`**（本节 §9 只留目标与口径，不再重复实测表）
 > 下一步：M4 收尾 —— GEMM 二维 cache blocking（16 线程只跑出 8 核的 45%）
-> 最后更新：2026-11-07
+> 最后更新：2026-11-10
 
 ---
 
@@ -70,7 +70,7 @@ OpenCV 5.2 的 `modules/dnn` 内含两套引擎：
 | **NativeAOT** | **首版不验证、不写进验收**。但编码保持 AOT 友好：不用反射、不用 `dynamic`、不用 `Emit`、protobuf 手写解析、`Dictionary<string, T>` 用显式 comparer。为将来一句话开 AOT 留路。 |
 | **WASM** | **不做**。不写 `browser-wasm` 目标，不为 4GB 线性内存做特殊设计。 |
 | **IL2CPP / Unity** | **不支持，且不在路线图**。不提供 `netstandard2.1` 目标，不为 IL2CPP 做裁剪/反射限制改造。宿主必须是 **.NET 8/10 运行时**（桌面 / 服务端）。 |
-| 图像编解码 | 交给调用方。`tools/OnnxSharp.Cli` 内置最小 PPM(P6)/BMP 解码，仅用于 CLI 演示与跨引擎对照，不进产品库。 |
+| 图像编解码 | 交给调用方。`tools/OnnxSharp.Cli` 用 ImageFacade + `Sdcb.SimdCodecs.Jpeg/Png/Bmp`（格式包额外引入并在 `ImageHost` 注册），只服务 CLI，不进产品库。 |
 | 图像预处理 / 检测后处理 | **`src/OnnxSharp/Vision/` 提供可选门面**：`ImagePreprocessor`（`Letterbox` 等比填边 / `Stretch` 直接拉伸）+ `YoloDetector`/`YoloDecoder` + `RfDetrDetector`/`RfDetrDecoder`。一张图进去、原图坐标的 `Detection` 出来。像素输入统一按 `(pixels, width, height, bgr, rowStride)` 约定：RGB/BGR 可切换，行跨度以字节计（`0` = `width * 3`），OpenCV `Mat`/相机缓冲可直接喂。它只依赖引擎的 `Net`，不参与图的执行，删掉不影响推理核心。 |
 
 ### 1.4 非目标（首版明确不做）
@@ -207,11 +207,12 @@ F:\code\OnnxSharp\
 │        ├─ RfDetrDecoder.cs      逐类 sigmoid + 背景剔除 + Q×C top-k + 归一化框还原
 │        └─ Detection.cs          Detection / IoU / 贪心 NMS
 ├─ tools\
-│  ├─ OnnxSharp.Cli\           info / run / detect / bench / profile / dump-graph / gemmbench / convbench
-│  │  └─ ImageFile.cs          CLI 专用最小解码：PPM(P6) + 未压缩 BMP
-│  └─ scripts\                 dump_shapes.py / gen_golden.py
+│  ├─ OnnxSharp.Cli\           info / run / detect / ocr / bench / profile / dump-graph / gemmbench / convbench
+│  │  ├─ ImageHost.cs          ImageFacade 引擎 + 显式注册 JPEG/PNG/BMP 解码器（格式包额外引入）
+│  │  └─（画框 / 保存都走 ImageFacade：DetectionDrawing + FacadeImage.Save）
+│  └─ scripts\                 dump_shapes.py / gen_golden.py / extract_ocr_models.ps1
 └─ tests\
-   └─ OnnxSharp.Tests\         零依赖测试运行器 + 29 用例
+   └─ OnnxSharp.Tests\         零依赖测试运行器 + 59 用例
 ```
 
 ---
@@ -391,6 +392,43 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 - [ ] FP16 / int8
 - [ ] 图融合（conv+act、matmul 系列）
 
+### M7 — OCR（PaddleOCR / PP-OCRv6）— **已完成（2026-11-10）**
+
+引入方式：模型来自 `Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny` / `TextLineOrientation`
+（**只有 ONNX 流与字典、没有推理代码**），推理走本引擎 —— 与「零第三方依赖」不冲突。
+
+**引擎侧**
+
+- [x] **动态维特化**：`OnnxFile.WithInputShapes` + `Net.ReadModel(path, 输入形状)`（§5.6）
+- [x] `HardSigmoid`（alpha/beta 属性两档）
+- [x] `BatchNormalization`（推理模式，每通道一次仿射）
+- [x] `Identity`（rec 图里 58 个）
+- [x] 复用已有实现：`GlobalAveragePool` / `ReduceMean` / `ConvTranspose`(2×2 s2) / `AveragePool` / `Squeeze`
+- [x] 修 `PackedConv.Multiply` 在**无 bias** 时的空指针（`Conv+BN` 结构）
+- [x] 与 ORT 对齐：det（1×3×960×960）`max|diff|` **1.4e-7**；rec（1×3×48×320）**7.6e-6**
+
+**门面侧（`src/OnnxSharp/Ocr/`）**
+
+- [x] `Ocr/PaddleOCR/`（全部 OCR 代码都在这一层，加别的 OCR 引擎就再开一个 `Ocr/<Engine>/`）：
+      `PaddleOcrModel`（文件/流/内存字节三种来源）、`PaddleOcrPipeline`、`DbPostprocess`、`PaddleOcrOptions`、
+      `OcrLine` / `OcrPixelFormat`（结果与像素排列）、像素→NCHW（裁剪 + 双线性 + 归一化一次完成）、CTC 贪心解码
+- [x] 检测按 32 对齐、识别按 16 分桶，按形状缓存特化图（det 2 份 / rec 8 份）
+- [x] 可选方向分类（PP-LCNet，倒置概率 > 0.9 时旋转 180°）
+
+**工具与验证**
+
+- [x] CLI `ocr`：直接吃 JPG/PNG/BMP（ImageFacade + `Sdcb.SimdCodecs.Jpeg/Png/Bmp`），`--out` 画框存图，`--json` 出结果
+- [x] `tools/scripts/extract_ocr_models.ps1`：从 nuget 模型包解出 det/rec/dict/cls
+- [x] 回归：`OcrTests` 8 个用例（算子 / DB / CTC / 归一化 / 动态图特化 / 端到端链路）
+- [x] 实测：900×300 合成图两行文字全对；`F:\ai\20260828093055568_121.jpg`（3200×1800 车牌，limit 1600）
+      识别 `浙A ES8381` 0.883 / `浙A：:3M15X` 0.802，端到端约 0.85~1.2 s（含 det+rec 前向）
+
+**明确不做**
+
+- [ ] 语音识别（sherpa-onnx）：模型是 int8 + `Loop/NonZero/GatherND`，超出静态 FP32 图模型；README「库用法 6」给接法
+- [ ] 表格识别 / 版面分析 / SAST 等其它 OCR 结构
+- [ ] 多边形（pyclipper）检测框：当前是轴对齐框 + 面积/周长外扩
+
 ---
 
 ## 5. 核心设计
@@ -535,6 +573,13 @@ RF-DETR 有 459 个 `Constant`、25 个 `Shape`、122 个 `Reshape`。`ConstFold
 - 标记为动态的 3 个算子：`Where`、`Expand`、`ConstantOfShape`。
 - 处理方式：**layer 自己 `fit` 输出**（§5.4）。
 - 不做通用符号维度、不做动态 batch。
+- **输入维特化（2026-11-10 新增）**：ONNX 里 `dim_param` / 缺失 `dim_value` 都解析成 -1。
+  图输入带 -1 时，`Shape → Slice → Concat → Reshape` 链在导入期折不出常量，`Reshape/Resize` 的目标形状
+  永远是「运行时才知道」，整图卡死。因此提供
+  `Net.ReadModel(path, 输入形状)` / `Net.ReadModel(path, Dictionary<string,int[]>)`
+  → `OnnxFile.WithInputShapes(...)`：把输入维改写成具体值（**其余节点与权重共享，不重新解析**），
+  再跑常量折叠与形状传播。语义是「为这个尺寸特化一份图」——一个 `(H,W)` 一份 `Net`，
+  调用方按形状缓存。PaddleOCR 的 det / rec 就是靠它跑起来的（`Ocr/PaddleOCR/PaddleOcrPipeline.cs`）。
 
 ### 5.7 内存池（本轮上调优先级）
 
@@ -592,11 +637,17 @@ public static class ParallelRange
 | GridSample | bilinear / zeros / align_corners=0 | 仅 RF-DETR（3 处） |
 | TopK | axis=1 | 仅 RF-DETR（1 处） |
 
-**不需要**：bilinear/cubic Resize、AvgPool、GlobalPool、ConvTranspose、NonMaxSuppression（op）、DetectionOutput、PriorBox、RNN/LSTM/GRU、Einsum、SDPA、Rotary、MatMulNBits、BN（已折叠进 Conv）。
+**不需要**：bilinear/cubic Resize、NonMaxSuppression（op）、DetectionOutput、PriorBox、RNN/LSTM/GRU、Einsum、SDPA、Rotary、MatMulNBits。
+**OCR 追加（2026-11-10）**：`ConvTranspose`（2×2/s2）、`GlobalAveragePool`、`ReduceMean`、`HardSigmoid`、
+`BatchNormalization`（推理模式）、`AveragePool`、`Identity`、`Squeeze` —— 都已实现；BN 在 YOLO/RF-DETR 里仍走折叠，
+OCR 的 rec 图里挂在上激活之后，直接按算子实现（每通道一次仿射）。
 
 ---
 
-## 7. 算子清单（42 个，分批）
+## 7. 算子清单（67 个）
+
+> 早期按「目标模型所需」分批（Batch A~E，42 个）；后续补的算子在 Batch F/G 里，总数已经是
+> `LayerRegistry` 里注册的 67 个（另有 `Constant` 导入期内联，`Silu` / `FusedEltwise` 是融合产物）。
 
 **Batch A — 元数据/形状类（无 kernel，最先做）** (9)
 `Constant` `Shape` `ConstantOfShape` `Expand` `Tile` `Unsqueeze` `Reshape` `Slice` `Split`
@@ -613,8 +664,15 @@ public static class ParallelRange
 **Batch E — 重算子** (8)
 `Conv` `MatMul` `Gemm` `MaxPool` `Softmax` `LayerNormalization` `Resize` `GridSample`
 
-> 42 = 9+3+17+5+8。实现顺序：A → B → C → D → E（先让图能"流动"，再补算力）。
-> 修正记录：原并集列表漏了 `Greater`（模型实测 ×2），Batch E 原标 (7) 实为 8 个。
+**Batch F — OCR（PP-OCRv6，2026-11-10）** (7)
+`HardSigmoid` `BatchNormalization`（推理模式） `Identity` `AveragePool` `GlobalAveragePool` `ReduceMean` `ConvTranspose`(2×2/s2)
+
+**Batch G — 其它导出带出来的** (18)
+`Abs` `Neg` `Log` `Tanh` `Clip` `Pow` `Max` `Min` `Mod` `Ceil` `Floor` `Round` `Sign` `Reciprocal`
+`Flatten` `Squeeze` `Range` `GatherND` `GlobalMaxPool`
+
+> 42 = 9+3+17+5+8 是首版的口径；现在 67 = 上面 A~G 去重后的注册数。
+> 实现顺序：A → B → C → D → E（先让图能"流动"，再补算力），F/G 由 OCR 与其它导出驱动。
 
 ---
 

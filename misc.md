@@ -630,6 +630,16 @@ Tile TopK Transpose Unsqueeze Where
     框坐标最大偏差 **0.005 px**（仅 JSON 两位小数舍入）—— 预处理/解码的语义可以认为已经对齐。
     PPM 与 BMP 两条解码路径输出完全相同，可作为「图像读取没引入色序错误」的回归手段。
 
+> **决策（2026-11-10）：`OnnxSharp.Vision` 不改成基于 ImageFacade 的 Pipeline。**
+> 技术上完全可行（`Letterbox.Apply` / `Tensorizer.ToTensor` / `Nms.Suppress` / `DetectionDrawing.DrawDetections`
+> 与 Vision 现在的 letterbox / NMS / 绘制一一对应，`LetterboxInfo` 也能直接还原坐标），但代价是核心库要多引
+> `Sevencat.ImageFacade` + `Sdcb.SimdCodecs.*` 三个包，直接推翻 README 的头号卖点（零第三方依赖、
+> NuGet 无依赖、AOT 友好）。定位划分因此保持不变：
+> **`OnnxSharp.Vision` = 零依赖的模型侧门面**（letterbox 几何、YOLO/RF-DETR 解码、NMS）；
+> **CLI = 图像 IO 层**（ImageFacade 软后端 + 额外引入的 `Sdcb.SimdCodecs.Jpeg/Png/Bmp`，负责解码 / 画框 / 保存）。
+> 需要 ImageFacade 的调用方照 CLI 的写法把两者接起来即可 —— `Preprocess`/`Decode` 本来就是分开暴露的。
+> 复审条件：如果哪天「零第三方依赖」不再是卖点（例如要同时接 Skia/OpenCV 图像后端），再评估整体迁移。
+
 ### 6.9 RF-DETR 的前后处理（2026-11-07）
 
 54. **RF-DETR 不是 letterbox，是直接拉伸**（`torchvision.resize` 到 512×512，`antialias=False`，半像素中心双线性）。
@@ -651,6 +661,39 @@ Tile TopK Transpose Unsqueeze Where
     `(pixels, width, height, bgr = false, rowStride = 0)` 透传，`rowStride` 以**字节**计、0 表示 `width * 3`。
     验证：persons.jpg 1568×1068，紧凑 RGB 与「BGR + 每行 64 字节填充」两条路径的 yolo11n 结果
     24/24 框、坐标差 **0.000000 px**；rfdetr 41/41 框、top1 分数一致。
+
+### 6.10 OCR（PaddleOCR / PP-OCRv6，2026-11-10）
+
+59. **全动态图不是「多补几个算子」的问题，是「输入维未知 → 形状链折不出来」的问题**。
+    det / rec 的输入都是 `x[N,3,H,W]`（`dim_param`），导入期 `Shape → Slice → Concat → Reshape` 只能看到 -1，
+    `Reshape`/`Resize` 的目标形状永远「运行时才知道」，常量折叠与 `PropagateShapes` 全停。
+    解法不是做符号维度传播，而是**特化成静态图**：`OnnxFile.WithInputShapes` 改写图输入维（节点与权重共享、
+    不重新解析），再走原来的折叠。代价是一个 `(H,W)` 一份 `Net`，所以调用方按形状缓存
+    （det 32 对齐 / rec 16 分桶；实测导入+折叠约 50 ms，缓存后第二次调用零成本）。
+60. **`PackedConv.Multiply` 在无 bias 时是空指针**。原实现只有 `c00` 判了 `bias is null`，
+    `c10/c20/c30` 直接读 `bias[row+i]`；YOLO / RF-DETR 的 Conv 全带 bias（BN 已折进权重），一直没暴露。
+    PaddleOCR 的 `Conv → BatchNormalization` 结构里 Conv 没有 bias，第一次跑 rec 就 NRE（"Object reference not set"，
+    堆栈停在 `PackedConv.Multiply`）。四个累加器都要判空。
+61. **复用缓冲 + `Tensor.FromArray` 会炸**：`Tensor.FromArray(data, shape)` 要求 `data.Length == shape.Total()`，
+    而 OCR 的 `_detBuffer` / `_recBuffer` 是跨调用复用的（这张图更大就重分配，之后不会缩回去），
+    第二次不同尺寸的调用就得到 `ArgumentException: Destination is too short`。
+    传 `data.AsSpan(0, count)` 的精确切片，别指望 FromArray 帮你截断。
+62. **BN 的两种处置**：YOLO / RF-DETR 里 BN 可以折叠进 Conv；OCR 的 rec 图里 BN 挂在 HardSwish 之后、
+    输入是运行时张量，直接实现成算子（每通道预算成一次 `y = a*x + b` 仿射，SIMD 内层）。
+    别为了「省一个算子」去做通用 BN 折叠 pass —— 收益是 4 个节点的 0.1 ms。
+63. **检测后处理不要照抄 pyclipper**：官方 `DBPostProcess` 用多边形外扩（能贴合倾斜文本），
+    本实现是 8 邻域连通域 → 轴对齐框 → 按 `面积 × unclip_ratio / 周长` 外扩。竖排 / 倾斜文本仍能框住，
+    但框是正的；要贴边就得引入多边形近似，暂不做。
+64. **rec 的宽度必须分桶，不能「一行一份图」**：PP-OCRv6 的 rec 是 `[1,3,48,W]`，W 直接决定输出步数 T
+    （`T ≈ W/8`）。按 16 分桶 + 桶外补 0（PaddleOCR 的 padding 就是归一化后补 0，不是 -1），
+    一张图通常只用 1~3 个桶，比每行一份图省一个数量级的导入时间。
+65. **对齐验证口径**：与 ORT 比的是**原始输出张量**（det `[1,1,H,W]`、rec `[1,T,6906]`），不是最终文本。
+    det 1×3×960×960 `max|diff| = 1.4e-7`，rec 1×3×48×320 `7.6e-6`；文本层再对就说明后处理也对。
+    （文本层的实测：900×300 合成图两行全对；3200×1800 车牌 limit 1600 出 `浙A ES8381` / `浙A：:3M15X`，
+    中点分隔符会被识别成冒号，是 tiny 模型 + 65 px 行高的正常表现。）
+66. **图片格式是 CLI 的可选依赖，不是引擎的**：`ImageFacade` 软后端只带渲染（自绘 / 中文标签 / Resize），
+    编解码要额外引 `Sdcb.SimdCodecs.Jpeg / Png / Bmp` 并在 `ImageHost.RegisterCodecs()` 里显式注册；
+    没注册的格式调用时抛 `FeatureNotSupportedException`。产品库 `OnnxSharp` 一行都不引 —— 它只吃像素。
 
 ---
 
@@ -945,6 +988,7 @@ SMOKE TEST: PASS
 | 2026-11-07 | **第七轮全表复测 + 修正「已追平 OpenCV」的错误结论**：rfdetr 231.5 / 299.4 ms，对 OpenCV（191.7 / 243.1）为 **1.21× / 1.23×**，对 ORT 0.60× / 0.66×；yolo 侧 vs ORT 0.58~0.89、vs OpenCV 1.16~1.28、vs SimdYolo 1.06~1.63。上一轮记的 1.12 / 1.06 是 **OpenCV 自身发挥失常**（medium 从 304.4 变到 243.1，-20%）造成的假象。新增坑 #48（比值只在双方都落在各自历史区间时可信；跑全表前先用 `(Get-Process).CPU` 增量确认没有满载进程——本轮 `SC2_x64` 占核导致前两轮作废） |
 | 2026-11-07 | **上一轮：RF-DETR 瓶颈定位到 batched attention GEMM**（结论后被修正）。新增 §6.5 坑 #36~#39（分层编译预热、A/B 必须交替、两个已否决的内核方向、`Parallel.For` 7 µs 阈值）；`gemmbench` 加 `--batch` 并改为按时间预热；新增 `bench/make_micro_models.py` |
 | 2026-11-07 | **本轮：修正上一轮两个错误结论 + 修掉最大单点浪费**。① §3.10 重写：140 个 MatMul 里 MLP（`[257,384]×[384,1536]`）与投影都是真 MatMul，合计 **54.1 GFLOP**（前置 batch 4），in-situ 407 GFLOPS，GEMM 已到顶；② 机器上限用 `fma` 重新量：单线程 91 GFLOPS、16 线程 753 GFLOPS；③ `MatMul` 在 B 不广播时合并 `(batch, m)`（decoder q/k/v 投影是 `[300,1,256]×[256,256]`，权重曾被打包 300 遍，4.06 → 0.13 ms），rfdetr-small **356 → 270 ms（-24%）**、medium -12%；④ `ProfileAll` 加预热与每算子最小耗时（坑 #41）；⑤ 新增 `fma`、`gemmbench --threads`、逐元素带宽与链式 MLP 微模型、`bench` 的 `alloc`/`gc`/`gc pause` 诊断；⑥ 排除 GC（0.7 ms/iter）与降频（长跑不衰减）两个嫌疑，剩下的计时差指向 host 侧每 forward 重算 2064 个算子的形状并分配 113 MB；新增坑 #40（独立内核吞吐无法预测端到端） |
+| 2026-11-10 | **M7 OCR 落地（PP-OCRv6 det/cls/rec 跑在自家引擎上）**：① 引擎新增 `OnnxFile.WithInputShapes` + `Net.ReadModel(path, 输入形状/字典)`，把全动态图（`x[N,3,H,W]`）**特化**成静态图，形状链才能在导入期折叠（`plan.md §5.6`）；② 补 `HardSigmoid` / `BatchNormalization`（推理模式）/ `Identity`，复用 `GlobalAveragePool` / `ReduceMean` / `ConvTranspose` / `AveragePool` / `Squeeze`，注册算子 42 → **67**；③ 修 `PackedConv.Multiply` 无 bias 的空指针（`Conv+BN`）；④ 新门面 `src/OnnxSharp/Ocr/PaddleOCR/`（命名空间 `OnnxSharp.Ocr.PaddleOCR`，全部 OCR 代码都在这一层）：`OcrLine` / `OcrPixelFormat` / 像素→NCHW / CTC 解码 + `PaddleOcrModel` / `PaddleOcrPipeline` / `DbPostprocess` / `PaddleOcrOptions`，检测按 32 对齐、识别按 16 分桶并按形状缓存特化图；⑤ 与 ORT 对齐：det `max|diff|` 1.4e-7、rec 7.6e-6；900×300 合成图两行全对，3200×1800 车牌 `浙A ES8381` / `浙A：:3M15X`；⑥ CLI 新增 `ocr`，图像 IO 改走 **ImageFacade + 额外引入的 `Sdcb.SimdCodecs.Jpeg/Png/Bmp`**（`ImageHost.RegisterCodecs()` 显式注册，`--out` 画框存图），`detect` 也支持 `--out`；⑦ 新增 `tools/scripts/extract_ocr_models.ps1` 与 `OcrTests`（8 用例）；⑧ 坑 #59~#66（动态图特化、无 bias 卷积、缓冲复用与 FromArray、BN 处置、DB 后处理、rec 分桶、对齐口径、格式包边界）；⑨ 语音说明进 README「库用法 6」：sherpa-onnx 模型是 int8 + `Loop/NonZero/GatherND`，不在本引擎范围内 |
 
 ---
 
