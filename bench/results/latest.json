@@ -1,32 +1,80 @@
 {
-  "iters": 40,
+  "iters": 20,
   "warmup": 5,
   "threads": 16,
-  "rounds": 3,
+  "rounds": 1,
   "results": [
     {
       "model": "yolov8n",
       "runtime": "onnxsharp",
-      "median_ms": 31.8,
-      "min_ms": 30.1
+      "median_ms": 27.6,
+      "min_ms": 25.8
     },
     {
       "model": "yolov8n",
       "runtime": "onnxruntime-cpu",
-      "median_ms": 25.64,
-      "min_ms": 22.83
+      "median_ms": 23.38,
+      "min_ms": 21.31
     },
     {
       "model": "yolov8n",
       "runtime": "opencv-dnn",
-      "median_ms": 71.39,
-      "min_ms": 31.83
+      "median_ms": 24.91,
+      "min_ms": 23.96
     },
     {
       "model": "yolov8n",
       "runtime": "simdyolo",
-      "median_ms": 100.15,
-      "min_ms": 19.98
+      "median_ms": 34.71,
+      "min_ms": 18.08
+    },
+    {
+      "model": "yolov8s",
+      "runtime": "onnxsharp",
+      "median_ms": 66.8,
+      "min_ms": 64.4
+    },
+    {
+      "model": "yolov8s",
+      "runtime": "onnxruntime-cpu",
+      "median_ms": 50.74,
+      "min_ms": 49.55
+    },
+    {
+      "model": "yolov8s",
+      "runtime": "opencv-dnn",
+      "median_ms": 54.32,
+      "min_ms": 53.05
+    },
+    {
+      "model": "yolov8s",
+      "runtime": "simdyolo",
+      "median_ms": 44.43,
+      "min_ms": 36.22
+    },
+    {
+      "model": "yolo11s",
+      "runtime": "onnxsharp",
+      "median_ms": 61.6,
+      "min_ms": 59.7
+    },
+    {
+      "model": "yolo11s",
+      "runtime": "onnxruntime-cpu",
+      "median_ms": 44.96,
+      "min_ms": 42.28
+    },
+    {
+      "model": "yolo11s",
+      "runtime": "opencv-dnn",
+      "median_ms": 57.15,
+      "min_ms": 52.87
+    },
+    {
+      "model": "yolo11s",
+      "runtime": "simdyolo",
+      "median_ms": 46.8,
+      "min_ms": 40.05
     }
   ]
 }

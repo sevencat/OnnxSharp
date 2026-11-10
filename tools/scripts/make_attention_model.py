@@ -24,6 +24,11 @@ import onnx
 from onnx import TensorProto as TP, helper as h, numpy_helper as nh
 
 B, T, H, D = 1, 8, 2, 4
+
+if len(sys.argv) > 2:
+    # 可选：python make_attention_model.py <outdir> B,T,H,D
+    B, T, H, D = (int(v) for v in sys.argv[2].split(","))
+
 C = H * D
 
 rng = np.random.default_rng(7)

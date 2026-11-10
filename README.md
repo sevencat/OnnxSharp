@@ -67,7 +67,7 @@
 | 依赖 | 零第三方包（不引用 `Google.Protobuf`、`Microsoft.ML.OnnxRuntime`），全部手写 |
 | 目标框架 | `net8.0` / `net10.0`，AOT 友好（不用反射、不用 `dynamic`） |
 | 算子 | 76 个注册算子，覆盖 YOLO11/v8、RF-DETR、PP-OCRv6 与 sherpa Paraformer 的 encoder 段导出图（清单见 [支持算子](#支持算子)） |
-| 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链、`MatMul+ArgMax`、手写 LayerNorm→`LayerNormalization`、`DQL+MatMulInteger+Cast+Mul+Add`→`DynamicQuantizeMatMul`、整条 multi-head attention→`FusedAttention`、YOLO 的 DFL→`DflSoftmax`）、按输入 shape 签名缓存形状/类型推断、常驻 intra-op 线程池（调用线程参与 + 自旋领任务，不再每次 `Parallel.For`） |
+| 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链、`MatMul+ArgMax`、`MatMul+Add(bias)`→带按列 bias 的 GEMM、手写 LayerNorm→`LayerNormalization`、`DQL+MatMulInteger+Cast+Mul+Add`→`DynamicQuantizeMatMul`、整条 multi-head attention→`FusedAttention`（序列长度 ≤128 时）、YOLO 的 DFL→`DflSoftmax`）、按输入 shape 签名缓存形状/类型推断、常驻 intra-op 线程池（调用线程参与 + 自旋领任务，不再每次 `Parallel.For`） |
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
 | 线程 | 默认 `Environment.ProcessorCount`，可用环境变量 `ONNXSHARP_THREADS` 覆盖 |
 | 视觉门面 | `OnnxSharp.Vision`：letterbox / stretch 预处理、YOLO 解码 + NMS、RF-DETR 解码，返回**原图坐标**的框 |
@@ -542,18 +542,26 @@ OnnxSharp.Cli features sherpa\model.int8.onnx test.wav --out feats.f32
 
 ### 性能
 
-仅模型前向、batch=1、FP32、16 线程、40 帧取 median（Ryzen 7 8845HS，Windows，.NET 10）：
+仅模型前向、batch=1、FP32、16 线程、输入全 0.5（Ryzen 7 8845HS，Windows，.NET 10）。
+`python bench/run_all.py --iters 20 --rounds 2`，四引擎同一会话内轮转跑、各取 median（括号里是 min）：
 
-| 模型 | OnnxSharp | OpenCV 5 dnn | 比值 |
-|---|---|---|---|
-| yolo11n 640² | 36.7 ms | 28.6 ms | 1.28× |
-| yolov8n 640² | 35.8 ms | 30.9 ms | 1.16× |
-| yolo11s 640² | 85.1 ms | 73.1 ms | 1.16× |
-| yolov8s 640² | 92.4 ms | 77.4 ms | 1.19× |
-| rfdetr-small 512² | 231.5 ms | 191.7 ms | 1.21× |
-| rfdetr-medium 576² | 299.4 ms | 243.1 ms | 1.23× |
+| 模型 | OnnxSharp | ONNXRuntime CPU | OpenCV 5 dnn | SimdYolo |
+|---|---|---|---|---|
+| yolo11n 640² | 27.4 ms（24.6） | 23.4 ms（21.1） | 26.5 ms（24.4） | 26.3 ms（21.4） |
+| yolov8n 640² | 27.6 ms（25.8） | 23.4 ms（21.3） | 24.9 ms（24.0） | 34.7 ms（18.1）※ |
+| yolo11s 640² | 61.6 ms（59.7） | 45.0 ms（42.3） | 57.2 ms（52.9） | 46.8 ms（40.1） |
+| yolov8s 640² | 66.8 ms（64.4） | 50.7 ms（49.6） | 54.3 ms（53.1） | 44.4 ms（36.2） |
+| rfdetr-small 512² | 159.8 ms（151.9） | 135.4 ms（125.1） | 440.9 ms（135.0）※ | 跑不了 |
 
-> 唯一事实源是 [bench.md](bench.md)（含四引擎对照、median/min 双指标与复现命令）。上表不含预处理与后处理，且对后台负载敏感，同代码重跑 ±8% 属正常。
+> ※ OpenCV 在 rfdetr-small 上方差极大（median 440 ms / min 135 ms，同一进程内），
+> 估计是它的 `MatMul` 线程切分在这个形状上偶发抢不到核 —— 只作量级参考。
+> SimdYolo 在 yolov8n 上也方差极大（median 34.7 / min 18.1），且不支持 DETR 类模型
+> （报错见 `bench.md`）。
+>
+> 全部数据是 2026-11-11 深夜同一会话重测（`run_all.py` 每轮轮转引擎顺序，避免先跑者吃亏）。
+> 结论没变：**ORT 仍是最快的 CPU 引擎**（我们落后 15~30%），OpenCV 与我们互有胜负，
+> 具体原因与逐项 A/B 见 [bench.md](bench.md) 与 [misc.md](misc.md) §6.20~6.23。
+> 上表不含预处理与后处理，对后台负载敏感，同代码重跑 ±8% 属正常。
 
 ### 已验证的模型
 
@@ -561,7 +569,7 @@ OnnxSharp.Cli features sherpa\model.int8.onnx test.wav --out feats.f32
 |---|---|
 | yolo11n | 端到端输出与 ONNXRuntime 逐值对齐（回归用例）；检测结果与 SimdYolo 逐框一致（最大 0.005 px） |
 | yolov8n / yolo11s / yolov8s | 跑通并纳入基准 |
-| rfdetr-small / rfdetr-medium | 跑通并纳入基准；解码结果与官方 `rfdetr.export._runtime.decode_detections` 逐框一致（41/41 框，坐标 0.00 px） |
+| rfdetr-small | 跑通并纳入基准；解码结果与官方 `rfdetr.export._runtime.decode_detections` 逐框一致（41/41 框，坐标 0.00 px）；原始输出与 ONNXRuntime 对齐（512² 随机输入：dets `2.3e-4`、labels `5.0e-5`）。*（rfdetr-medium 的本地导出已丢失，历史数字见 bench.md，当前无法复测）* |
 | PP-OCRv6 tiny（det / rec / cls） | det 与 rec 的**原始输出**与 ONNXRuntime 对齐（64² + 960² 输入：max\|diff\| 1.4e-7 / 7.6e-6）；900×300 合成图两行文字全对（`Hello OnnxSharp 123` 0.957、`第二行文字 PaddleOCR` 0.982） |
 | 单算子微模型 | GEMM / attention / 逐元素链，用于内核定点调优 |
 | sherpa Paraformer encoder + CIF（int8） | 用手写脚本把 `model.int8.onnx` 在第一个 `Loop`（CIF）前切开，5715 节点的 encoder 子图**直接跑通**（`speech[1,96,560]` → `[1,97,320]`，**104 ms/帧**；同图 ORT 30.9 ms）；`DynamicQuantizeLinear` + `MatMulInteger`(+s8 权重、per-column 零点) 与 ONNXRuntime **逐位一致**（max\|diff\| = 0）。CIF 用 `Speech/Paraformer/ContinuousIntegrateAndFire` 重写（绕开 `Loop`/`Sequence*`），与 ORT 录的 `frames`/`fires`/`frame.7`/`integrate.7` **逐位一致**，token 数 21 = ORT 21 |

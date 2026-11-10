@@ -21,6 +21,8 @@ internal static class GraphFusion
         // 顺序有讲究：先造出 SiLU，再把它吸收进上游卷积。
         total += FuseSilu(net, graph);
         total += FuseActivationIntoProducer(net, graph);
+        if (!Disabled("matmulbias"))
+            total += FuseMatMulBias(net, graph);
         total += FuseMatMulArgMax(net, graph);
         if (!Disabled("dqmm"))
             total += FuseQuantizedMatMul(net, graph);
@@ -50,6 +52,9 @@ internal static class GraphFusion
         string? skip = Environment.GetEnvironmentVariable("ONNXSHARP_NO_FUSE");
         return skip is not null && skip.Contains(name, StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool VerboseFusion =>
+        Environment.GetEnvironmentVariable("ONNXSHARP_DEBUG_FUSE") is not null;
 
     /// <summary>可以进融合链的逐元素算子（都是同形状、无广播的 F32 运算）。</summary>
     private static readonly Dictionary<string, EltwiseKind> FusableEltwise = new()
@@ -325,6 +330,109 @@ internal static class GraphFusion
     /// 且要求 MatMul 的输出<b>只有一个消费者</b>、也不是图输出。
     /// </para>
     /// </summary>
+    /// <summary>
+    /// 把 <c>MatMul → Add(bias)</c> 折成一次带 bias 的 GEMM。
+    /// <code>
+    /// y = MatMul(a, w) ; y = Add(y, bias)      →      y = MatMul(a, w) + bias（内核内完成）
+    /// </code>
+    /// <para>
+    /// 条件：MatMul 的输出只被这个 Add 用；bias 是<b>常量一维</b>张量且长度等于输出最后一维。
+    /// transformer 里每层都有好几个（q/k/v/out 投影、MLP 两层），rf-detr-small 上光是
+    /// MLP 的 fc1/fc2 两个 bias add 就各 0.43 ms（输出 6.3 MB，读一遍写一遍）。
+    /// </para>
+    /// </summary>
+    private static int FuseMatMulBias(NetImpl net, Graph graph)
+    {
+        var prog = graph.Prog;
+        var consumerOf = new Dictionary<int, LayerInfo>();
+        var uses = new Dictionary<int, int>();
+
+        foreach (var op in prog)
+        {
+            foreach (var input in op.Inputs)
+            {
+                // 只有第一次消费记录下来（多用的情况下面用 uses 排除掉）
+                consumerOf.TryAdd(input.Idx, op);
+                uses[input.Idx] = uses.TryGetValue(input.Idx, out int count) ? count + 1 : 1;
+            }
+        }
+
+        var replacements = new Dictionary<LayerInfo, LayerInfo>();
+        var drop = new HashSet<LayerInfo>();
+        int fused = 0;
+
+        foreach (var op in prog)
+        {
+            if (op.Type != "MatMul" || op.Outputs.Count != 1 || op.Inputs.Count != 2)
+                continue;
+
+            int outputIdx = op.Outputs[0].Idx;
+
+            if (uses.TryGetValue(outputIdx, out int useCount) && useCount != 1)
+                continue;
+
+            if (!consumerOf.TryGetValue(outputIdx, out var add) || add.Type != "Add"
+                || add.Inputs.Count != 2 || add.Outputs.Count != 1)
+                continue;
+
+            int biasSlot = add.IsConstInput(0) ? 0 : add.IsConstInput(1) ? 1 : -1;
+            if (biasSlot < 0)
+                continue;
+
+            var bias = add.In(biasSlot);
+            if (bias.Shape.Rank != 1 || bias.Count <= 0)
+                continue;
+
+            // 需要静态知道输出的最后一维（读不出就放弃，宁可不融合）
+            if (!TryGetOutputShape(net, op, out var outShape) || outShape.Rank < 1)
+                continue;
+            if (outShape.Dims[^1] != bias.Count)
+            {
+                if (VerboseFusion)
+                    Console.Error.WriteLine($"[matmulbias] {op.Name}: {outShape} vs bias {bias.Count}");
+                continue;
+            }
+
+            if (LayerRegistry.Create("MatMul", new LayerParams { Type = "MatMul", Name = op.Name })
+                is not Layer fusedLayer)
+                continue;
+            if (fusedLayer is not IBiasAddable addable)
+                continue;
+
+            addable.FusedBias = bias;
+            fusedLayer.Inputs.Add(op.Inputs[0]);
+            fusedLayer.Inputs.Add(op.Inputs[1]);
+            fusedLayer.Outputs.Add(add.Outputs[0]);
+
+            replacements[op] = fusedLayer;
+            drop.Add(add);
+            fused++;
+        }
+
+        if (replacements.Count == 0)
+            return 0;
+
+        if (VerboseFusion)
+            Console.Error.WriteLine($"[matmulbias] fused {replacements.Count} MatMul+Add pair(s)");
+
+        var result = new List<LayerInfo>(prog.Count);
+        foreach (var op in prog)
+        {
+            // 先查替换表：被替换的节点往往也在 drop 里，顺序反了融合层就丢
+            if (replacements.TryGetValue(op, out var replacement))
+            {
+                result.Add(replacement);
+                continue;
+            }
+
+            if (!drop.Contains(op))
+                result.Add(op);
+        }
+
+        graph.Reset(result);
+        return fused;
+    }
+
     private static int FuseMatMulArgMax(NetImpl net, Graph graph)
     {
         var prog = graph.Prog;
@@ -730,6 +838,14 @@ internal static class GraphFusion
     /// 仍然折掉 scores 物化、Softmax、两次 MatMul、输出 Transpose 与 Reshape。
     /// </para>
     /// </summary>
+    /// <summary>
+    /// 融合层支持的最大序列长度。融合内核逐行做点积 / axpy，T 一大每行都要把整个 K/V
+    /// 平面重读一遍；实测 rf-detr 的 T=257 反而比原图的 MatMul+Softmax 慢一倍
+    /// （66 ms vs 33 ms），所以超过这个长度就不融合，交给 GEMM。
+    /// ASR 的 T=76 才是甜点区。
+    /// </summary>
+    private const int AttentionFusionMaxSeq = 128;
+
     private static int FuseAttention(NetImpl net, Graph graph)
     {
         var prog = graph.Prog;
@@ -819,22 +935,36 @@ internal static class GraphFusion
             var ktArg = qk.Inputs[1];
             float scale = 1f;
             LayerInfo? qScale = null;
+            LayerInfo? kScale = null;
 
-            if (producerOf.TryGetValue(qArg.Idx, out var scaleNode)
-                && scaleNode.Type == "Mul" && scaleNode.Inputs.Count == 2 && scaleNode.Outputs.Count == 1
-                && Uses(scaleNode.Outputs[0]) == 1)
+            // Q 侧可能有 Mul(·, 常量标量)（Paraformer 把 1/√d 乘在 Qh 上）；
+            // rf-detr 则是 Mul(·, Sqrt(Shape→…)) —— 运行期算出来的，不是常量，
+            // 这种情况就把 Mul 的输出直接当输入（节点留在图里），scale 保持不变。
+            if (producerOf.TryGetValue(qArg.Idx, out var qScaleNode)
+                && qScaleNode.Type == "Mul" && qScaleNode.Inputs.Count == 2 && qScaleNode.Outputs.Count == 1
+                && Uses(qScaleNode.Outputs[0]) == 1)
             {
-                int scaleSlot = scaleNode.IsConstInput(0) ? 0 : scaleNode.IsConstInput(1) ? 1 : -1;
-                if (scaleSlot < 0)
-                    continue;
+                int scaleSlot = qScaleNode.IsConstInput(0) ? 0 : qScaleNode.IsConstInput(1) ? 1 : -1;
+                if (scaleSlot >= 0 && qScaleNode.In(scaleSlot).Count == 1)
+                {
+                    scale = qScaleNode.In(scaleSlot).AsSpan<float>()[0];
+                    qArg = qScaleNode.Inputs[1 - scaleSlot];
+                    qScale = qScaleNode;
+                }
+            }
 
-                var scaleTensor = scaleNode.In(scaleSlot);
-                if (scaleTensor.Count != 1)
-                    continue;
-
-                scale = scaleTensor.AsSpan<float>()[0];
-                qArg = scaleNode.Inputs[1 - scaleSlot];
-                qScale = scaleNode;
+            // K 侧同理（rf-detr 把 sqrt(1/d) 拆成两半，q 和 k 各乘一个）
+            if (producerOf.TryGetValue(ktArg.Idx, out var kScaleNode)
+                && kScaleNode.Type == "Mul" && kScaleNode.Inputs.Count == 2 && kScaleNode.Outputs.Count == 1
+                && Uses(kScaleNode.Outputs[0]) == 1)
+            {
+                int scaleSlot = kScaleNode.IsConstInput(0) ? 0 : kScaleNode.IsConstInput(1) ? 1 : -1;
+                if (scaleSlot >= 0 && kScaleNode.In(scaleSlot).Count == 1)
+                {
+                    scale *= kScaleNode.In(scaleSlot).AsSpan<float>()[0];
+                    ktArg = kScaleNode.Inputs[1 - scaleSlot];
+                    kScale = kScaleNode;
+                }
             }
 
             if (!producerOf.TryGetValue(qArg.Idx, out var qTranspose)
@@ -875,6 +1005,7 @@ internal static class GraphFusion
             // ---- 建融合层 ----
             // 优先「3 维输入」形态：三个 Transpose 的输入都是 Reshape，且能静态读出 head 数
             int heads = 0;
+            int sequence = 0;
             var qReshape = default(LayerInfo);
             var kReshape = default(LayerInfo);
             var vReshape = default(LayerInfo);
@@ -892,10 +1023,18 @@ internal static class GraphFusion
                 && qhShape.Dims[2] == vhShape.Dims[2] && qhShape.Dims[3] == vhShape.Dims[3])
             {
                 heads = qhShape.Dims[1];
+                sequence = qhShape.Dims[2];
                 qReshape = qr;
                 kReshape = kr;
                 vReshape = vr;
             }
+
+            // 大 T 不融合：融合层用的是「每行一次点积 + 一次 axpy」的标量内核，
+            // T=257（rf-detr）时 12 个块要 66 ms，而原图上这些 MatMul+Softmax 只要 ~33 ms
+            // （GEMM 按缓存块复用 K/V，标量内核每行都要把整个 K/V 平面重读一遍）。
+            // ASR 的 T=76 才是融合的甜点区（那里 40 个块省掉一半以上）。
+            if (sequence > AttentionFusionMaxSeq)
+                continue;
 
             var parameters = new LayerParams { Type = "FusedAttention", Name = softmax.Name + "/fused" };
             parameters.Set("scale", (double)scale);
@@ -939,6 +1078,8 @@ internal static class GraphFusion
                 drop.Add(maskAdd);
             if (qScale is not null)
                 drop.Add(qScale);
+            if (kScale is not null)
+                drop.Add(kScale);
 
             if (heads > 0)
             {

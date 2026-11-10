@@ -371,3 +371,43 @@ sum-of-min 与 `bench` 的 min 之间那 2.5 ms 的缺口。
 **同轮顺手否决的一项**：把微内核从 4 行改成 6 行（SimdYolo 的 6×16 形状）—— `gemmbench` 隔离对比下
 全面更慢 1.3~3.3×（64×576×6400：649 → 195 GFLOPS、64×256×6400：682 → 328）。
 原因：.NET JIT 保不住 12 个活跃 `Vector256` 累加器，主循环 spill。详见 `misc.md §6.22`。
+
+## 2026-11-11 更深夜：RF-DETR（`MatMul+Add(bias)` 融合 + 列切分判据）与四引擎复测
+
+**模型位置更正**：rfdetr 现在在 `F:\code\TinyLabel\train\testrftedr\runs\rfdetr-small.onnx`
+（旧路径 `F:\ai\rfdetr\onnx_model\` 已不存在，`bench/models.json` 已同步；medium 也没有了）。
+
+**逐项 A/B**（`bench` 的 min，交替跑，5 轮取各自最好值；HEAD 用 `git worktree` 单独编译）：
+
+| 版本 | rfdetr-small 512² |
+|---|---|
+| HEAD（2e88cf9） | 170.7 ms |
+| 当前 + 关掉 `MatMul+Add` 融合（`ONNXSHARP_NO_FUSE=matmulbias`） | 183.2 ms |
+| 当前（融合开 + `m≤512` 且列块 ≥4×线程走列切分） | **155.1 ms** |
+
+⇒ 相对 HEAD **−9%**。分解：`Add 155 个 → 46 个`（15.3 → 2.0 ms）、`ops 809 → 700`，
+MLP 的 `257×384×1536` 从行切分 476 GFLOPS 换到列切分 718（gemmbench，n=1536 有 96 个列块）。
+数值：dets `2.3e-4` / labels `5.0e-5`（同输入同会话对 ORT）。
+
+**否决记录**（详情 `misc.md §6.23`）：
+- `SelectRowBlock` 改成「行块数 = 线程数」→ 172.2 vs 156.1 ms（慢 9%），已回退；
+- 大 T 注意力融合（含两段 GEMM 版内核）→ 融合层 66 ms vs 原图 MatMul+Softmax ~33 ms，
+  加 `AttentionFusionMaxSeq=128` 直接不融合（ASR 的 T=76 不受影响）。
+
+**四引擎复测**（`python bench/run_all.py --iters 20 --rounds 1..2`，同会话轮转引擎顺序）：
+
+| 模型 | onnxsharp | onnxruntime-cpu | opencv-dnn | simdyolo |
+|---|---:|---:|---:|---:|
+| yolo11n 640² | 27.4（24.6） | 23.4（21.1） | 26.5（24.4） | 26.3（21.4） |
+| yolov8n 640² | 27.6（25.8） | 23.4（21.3） | 24.9（24.0） | 34.7（18.1） |
+| yolo11s 640² | 61.6（59.7） | 45.0（42.3） | 57.2（52.9） | 46.8（40.1） |
+| yolov8s 640² | 66.8（64.4） | 50.7（49.6） | 54.3（53.1） | 44.4（36.2） |
+| rfdetr-small 512² | 159.8（151.9） | 135.4（125.1） | 440.9（135.0）※ | 跑不了 |
+
+格式是 `median（min）`。※ OpenCV 在 rfdetr-small 上 median 440 ms 而 min 135 ms，
+同一进程内抖了 3 倍（`MatMul` 在这个形状上疑似线程切分不均），只作量级参考；
+SimdYolo 在 yolov8n 上也抖（34.7 / 18.1），遇到 DETR 模型直接抛异常。
+
+**结论**：ORT 仍是 CPU 上最快的（我们落后 15~30%）；OpenCV 与我们互有胜负；
+RF-DETR 与 ORT 的比值从 1.21× 收到 1.18×（按 min 是 1.21×），剩下差距几乎全在
+transformer 的小 GEMM（MLP 的 m=257、24 个 head-batch 的 QK/PV）。

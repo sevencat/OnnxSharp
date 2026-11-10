@@ -45,6 +45,12 @@ internal static class GemmKernel
     /// <para>
     /// <paramref name="parallel"/> = false 供调用方自己控制并行（避免嵌套并行把线程池打爆）。
     /// </para>
+    /// <para>
+    /// 两种 bias：<paramref name="bias"/> 是<b>每行</b>一个标量（长度 m；Conv 的 per-channel bias
+    /// 走这条，因为它的行就是输出通道）；<paramref name="columnBias"/> 是<b>每列</b>一个
+    /// （长度 n，对应图上 <c>MatMul → Add(·, [n])</c> 的 bias add）。两者都直接做进累加器初值，
+    /// 不额外多一遍 C 的读写。
+    /// </para>
     /// </summary>
     public static unsafe void Multiply(
         ReadOnlySpan<float> a,
@@ -55,7 +61,8 @@ internal static class GemmKernel
         int n,
         int ldc = 0,
         bool parallel = true,
-        ReadOnlySpan<float> bias = default)
+        ReadOnlySpan<float> bias = default,
+        ReadOnlySpan<float> columnBias = default)
     {
         if (m <= 0 || n <= 0)
             return;
@@ -64,15 +71,23 @@ internal static class GemmKernel
             ldc = n;
 
         bool hasBias = bias.Length >= m;
+        bool hasColumnBias = columnBias.Length >= n;
 
         if (k <= 0)
         {
             for (int row = 0; row < m; row++)
             {
+                var target = c.Slice(row * ldc, n);
                 if (hasBias)
-                    c.Slice(row * ldc, n).Fill(bias[row]);
+                    target.Fill(bias[row]);
                 else
-                    c.Slice(row * ldc, n).Clear();
+                    target.Clear();
+
+                if (hasColumnBias)
+                {
+                    for (int j = 0; j < n; j++)
+                        target[j] += columnBias[j];
+                }
             }
 
             return;
@@ -93,6 +108,7 @@ internal static class GemmKernel
         fixed (float* pb = b)
         fixed (float* pc = c)
         fixed (float* pbias = hasBias ? bias : ReadOnlySpan<float>.Empty)
+        fixed (float* pcbias = hasColumnBias ? columnBias : ReadOnlySpan<float>.Empty)
         {
             var popts = ParallelOptions();
 
@@ -101,12 +117,22 @@ internal static class GemmKernel
             // 被放大得越厉害 —— 1×1 conv 上实测并行后和串行一样快（各自 16 份 B）。
             // 按列切分时每个线程只打包自己那段列，B 总共只搬一遍，A 虽被每个线程
             // 重读一次，但 A 只有 m×k 且留在 L1/L2。
-            if (useParallel && m <= 256 && columnBlocks >= threads)
+            //
+            // m 的上限分两档：≤256 无条件走列切分（点卷积的常态）；257~512 只在列块
+            // 足够多（每线程 ≥4 块）时才走 —— rf-detr 的 MLP 是 m=257、n=1536（96 个列块，
+            // gemmbench 1211 GFLOPS vs 行切分 476），而 n 小的形状（300×300×256）列块只有
+            // 16 个、每线程重读一整份 A，走列切分反而更慢，仍旧按行。
+            bool columnSplit = m <= 256
+                ? columnBlocks >= threads
+                : m <= 512 && columnBlocks >= threads * 4;
+
+            if (useParallel && columnSplit)
             {
                 float* a0 = pa;
                 float* b0 = pb;
                 float* c0 = pc;
                 float* bias0 = pbias;
+                float* columnBias0 = pcbias;
 
                 // 列块数一般不是线程数的整数倍，余数摊给前 rem 个线程，
                 // 否则最后一批线程空跑（20×20 这种小空间层尤其明显）。
@@ -128,7 +154,7 @@ internal static class GemmKernel
                             fixed (float* pp = pack)
                             {
                                 MultiplyColumnRange(a0, b0, c0, m, k, n, ldc, nb,
-                                    cb0 * nb, Math.Min(cb1 * nb, n), pp, bias0);
+                                    cb0 * nb, Math.Min(cb1 * nb, n), pp, bias0, columnBias0);
                             }
                         }
                         finally
@@ -147,17 +173,18 @@ internal static class GemmKernel
                 float* b0 = pb;
                 float* c0 = pc;
                 float* bias0 = pbias;
+                float* columnBias0 = pcbias;
 
                 ParallelRange.ForEach(rowBlocks, ib =>
                 {
                     int row0 = ib * mb;
                     int row1 = Math.Min(row0 + mb, m);
-                    MultiplyRowBlock(a0, b0, c0, row0, row1, k, n, ldc, nb, bias0);
+                    MultiplyRowBlock(a0, b0, c0, row0, row1, k, n, ldc, nb, bias0, columnBias0);
                 });
             }
             else
             {
-                MultiplyRowBlock(pa, pb, pc, 0, m, k, n, ldc, nb, pbias);
+                MultiplyRowBlock(pa, pb, pc, 0, m, k, n, ldc, nb, pbias, pcbias);
             }
         }
     }
@@ -178,24 +205,26 @@ internal static class GemmKernel
         int jBegin,
         int jEnd,
         float* pack,
-        float* bias)
+        float* bias,
+        float* columnBias)
     {
         for (int j0 = jBegin; j0 < jEnd; j0 += nb)
         {
             int width = Math.Min(nb, jEnd - j0);
             PackColumns(b + j0, k, n, width, pack);
+            float* colBias = columnBias is null ? null : columnBias + j0;
 
             int row = 0;
             for (; row + 4 <= m; row += 4)
             {
                 Multiply4Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
-                    bias is null ? null : bias + row);
+                    bias is null ? null : bias + row, colBias);
             }
 
             for (; row < m; row++)
             {
                 MultiplyRow(a + (long)row * k, pack, c + (long)row * ldc + j0, k, width, width,
-                    bias is null ? 0f : bias[row]);
+                    bias is null ? 0f : bias[row], colBias);
             }
         }
     }
@@ -219,14 +248,15 @@ internal static class GemmKernel
         int n,
         int ldc,
         int nb,
-        float* bias)
+        float* bias,
+        float* columnBias)
     {
         if (nb >= n)
         {
             // 只有一块：B 的行内已经连续（n ≤ nb 时步长最多 nb 个 float），直接算。
             for (int row = row0; row < row1; row++)
                 MultiplyRow(a + (long)row * k, b, c + (long)row * ldc, k, n, n,
-                    bias is null ? 0f : bias[row]);
+                    bias is null ? 0f : bias[row], columnBias);
             return;
         }
 
@@ -249,13 +279,13 @@ internal static class GemmKernel
                     for (; row + 4 <= row1; row += 4)
                     {
                         Multiply4Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
-                            bias is null ? null : bias + row);
+                            bias is null ? null : bias + row, columnBias is null ? null : columnBias + j0);
                     }
 
                     for (; row < row1; row++)
                     {
                         MultiplyRow(a + (long)row * k, pack, c + (long)row * ldc + j0, k, width, width,
-                            bias is null ? 0f : bias[row]);
+                            bias is null ? 0f : bias[row], columnBias is null ? null : columnBias + j0);
                     }
                 }
             }
@@ -307,7 +337,8 @@ internal static class GemmKernel
         int width,
         int bStride,
         int ldc,
-        float* bias = null)
+        float* bias = null,
+        float* columnBias = null)
     {
         float* a1 = a + aStride;
         float* a2 = a + 2 * aStride;
@@ -319,6 +350,8 @@ internal static class GemmKernel
 
         // 累加器直接以 bias 起头：微内核最后是整块 store（不是 +=），
         // 所以 bias 只能在这里融进去，写完再补一遍就是多一遍 C 的读写。
+        // bias 按行（每行一个标量，Conv 用）；columnBias 按列（MatMul 的 Add 用，每列不同，
+        // 所以每 16 列要各自 load 一次）。
         var b0v = Vector256.Create(bias is null ? 0f : bias[0]);
         var b1v = Vector256.Create(bias is null ? 0f : bias[1]);
         var b2v = Vector256.Create(bias is null ? 0f : bias[2]);
@@ -328,14 +361,14 @@ internal static class GemmKernel
 
         for (; j + 16 <= width; j += 16)
         {
-            var c00 = b0v;
-            var c01 = b0v;
-            var c10 = b1v;
-            var c11 = b1v;
-            var c20 = b2v;
-            var c21 = b2v;
-            var c30 = b3v;
-            var c31 = b3v;
+            var c00 = columnBias is null ? b0v : Avx.LoadVector256(columnBias + j);
+            var c01 = columnBias is null ? b0v : Avx.LoadVector256(columnBias + j + 8);
+            var c10 = columnBias is null ? b1v : c00;
+            var c11 = columnBias is null ? b1v : c01;
+            var c20 = columnBias is null ? b2v : c00;
+            var c21 = columnBias is null ? b2v : c01;
+            var c30 = columnBias is null ? b3v : c00;
+            var c31 = columnBias is null ? b3v : c01;
 
             float* brow = b + j;
             for (int t = 0; t < k; t++, brow += bStride)
@@ -375,10 +408,10 @@ internal static class GemmKernel
         if (rest <= 0)
             return;
 
-        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0]);
-        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1]);
-        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2]);
-        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3]);
+        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j);
     }
 
 
@@ -391,6 +424,11 @@ internal static class GemmKernel
     private static int SelectColumnBlock(int n) => n < 16 ? n : 16;
 
     /// <summary>行块高度：任务数至少是线程数的 2 倍，块高不小于 8 行且对齐到 8。</summary>
+    /// <remarks>
+    /// 试过「行块数正好等于线程数」（m=257 → 16 块 × 17 行，打包次数减半）：
+    /// rf-detr 实测反而慢 9%（172.2 vs 156.1 ms）。块太大时 A 的每块工作集（17×384×4 = 26 KB）
+    /// 和 B 面板一起挤出 L1，而块数多一点时负载也更好摊。
+    /// </remarks>
     private static int SelectRowBlock(int m, int threads)
     {
         if (threads < 1)
@@ -412,14 +450,14 @@ internal static class GemmKernel
     /// </para>
     /// </summary>
     private static unsafe void MultiplyRow(
-        float* a, float* b, float* c, int k, int width, int bStride, float bias = 0f)
+        float* a, float* b, float* c, int k, int width, int bStride, float bias = 0f, float* columnBias = null)
     {
         int j = 0;
 
         // AVX2+FMA：256 位、8 路 F32，显式 FMA 融合。
         // Vector<float> 不保证被 JIT 融成 FMA，浮点语义上也不能随便融，所以这里手写。
         if (Avx2.IsSupported && Fma.IsSupported)
-            j = MultiplyRowAvx2(a, b, c, k, width, bStride, bias);
+            j = MultiplyRowAvx2(a, b, c, k, width, bStride, bias, columnBias);
 
         int vw = Vector<float>.Count;
 
@@ -428,7 +466,9 @@ internal static class GemmKernel
 
         for (; j <= vectorEnd; j += vw)
         {
-            var acc = new Vector<float>(bias);
+            var acc = columnBias is null
+                ? new Vector<float>(bias)
+                : Unsafe.ReadUnaligned<Vector<float>>(columnBias + j);
 
             for (int t = 0; t < k; t++)
                 acc += new Vector<float>(a[t]) * Unsafe.ReadUnaligned<Vector<float>>(b + (long)t * bStride + j);
@@ -438,7 +478,7 @@ internal static class GemmKernel
 
         for (; j < width; j++)
         {
-            float sum = bias;
+            float sum = columnBias is null ? bias : columnBias[j];
             for (int t = 0; t < k; t++)
                 sum += a[t] * b[(long)t * bStride + j];
             c[j] = sum;
@@ -449,24 +489,25 @@ internal static class GemmKernel
     /// AVX2+FMA 主循环：一次算 4 个 <see cref="Vector256{T}"/>（32 个 float），
     /// 累加器全在 ymm 寄存器里，k 轮下来 C 只写一次。返回已处理的列数。
     /// </summary>
-    private static unsafe int MultiplyRowAvx2(float* a, float* b, float* c, int k, int width, int bStride, float bias = 0f)
+    private static unsafe int MultiplyRowAvx2(float* a, float* b, float* c, int k, int width, int bStride, float bias = 0f, float* columnBias = null)
     {
         const int vw = 8;   // Vector256<float>
         int j = 0;
 
         var bv = Vector256.Create(bias);
+        Vector256<float> Init(int jj) => columnBias is null ? bv : Avx.LoadVector256(columnBias + jj);
 
         // 8 条累加器链（64 列）：FMA 延迟 4~5 拍、每拍 2 条，4 条链只够填一半。
         for (; j + 8 * vw <= width; j += 8 * vw)
         {
-            var c0 = bv;
-            var c1 = bv;
-            var c2 = bv;
-            var c3 = bv;
-            var c4 = bv;
-            var c5 = bv;
-            var c6 = bv;
-            var c7 = bv;
+            var c0 = Init(j);
+            var c1 = Init(j + vw);
+            var c2 = Init(j + 2 * vw);
+            var c3 = Init(j + 3 * vw);
+            var c4 = Init(j + 4 * vw);
+            var c5 = Init(j + 5 * vw);
+            var c6 = Init(j + 6 * vw);
+            var c7 = Init(j + 7 * vw);
 
             for (int t = 0; t < k; t++)
             {
@@ -496,10 +537,10 @@ internal static class GemmKernel
         // 余下不足 8 个向量的部分：4 个向量一组
         for (; j + 4 * vw <= width; j += 4 * vw)
         {
-            var c0 = bv;
-            var c1 = bv;
-            var c2 = bv;
-            var c3 = bv;
+            var c0 = Init(j);
+            var c1 = Init(j + vw);
+            var c2 = Init(j + 2 * vw);
+            var c3 = Init(j + 3 * vw);
 
             for (int t = 0; t < k; t++)
             {
@@ -521,8 +562,8 @@ internal static class GemmKernel
         // 列块宽度 16 时只会走到这里（2 个向量一组）
         for (; j + 2 * vw <= width; j += 2 * vw)
         {
-            var c0 = bv;
-            var c1 = bv;
+            var c0 = Init(j);
+            var c1 = Init(j + vw);
 
             for (int t = 0; t < k; t++)
             {
@@ -539,7 +580,7 @@ internal static class GemmKernel
 
         for (; j + vw <= width; j += vw)
         {
-            var c0 = bv;
+            var c0 = Init(j);
 
             for (int t = 0; t < k; t++)
                 c0 = Fma.MultiplyAdd(Vector256.Create(a[t]), Avx.LoadVector256(b + (long)t * bStride + j), c0);

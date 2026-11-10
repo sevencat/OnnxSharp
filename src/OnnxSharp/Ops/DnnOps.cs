@@ -1498,13 +1498,16 @@ internal static class DnnOps
 
     // ---------------- MatMul ----------------
 
-    private sealed class MatMulLayer : Layer
+    private sealed class MatMulLayer : Layer, IBiasAddable
     {
         public MatMulLayer(LayerParams parameters)
         {
             Type = parameters.Type;
             Name = parameters.Name;
         }
+
+        /// <summary>由 <see cref="GraphFusion"/> 折进来的 bias add（见 <see cref="IBiasAddable"/>）。</summary>
+        public Tensor? FusedBias { get; set; }
 
         public override void GetMemoryShapes(
             IReadOnlyList<TensorShape> inShapes,
@@ -1597,6 +1600,11 @@ internal static class DnnOps
             var srcB = b.AsSpan<float>();
             var dst = output.AsSpan<float>();
 
+            // 折进来的 bias add：图上 Add(·, [n]) 是**按列**加的，长度必须正好是 n
+            var columnBias = FusedBias is { } fusedBias && fusedBias.Count == n && n > 0
+                ? fusedBias.AsSpan<float>()
+                : default;
+
             // B 没有 batch 维、A 也不做广播时，(batch, m) 可以合并成一个大 GEMM：
             // 两者拼起来正好是 [batches*m, k] × [k, n]，A/C 本来就是连续存放的。
             // 典型例子是 DETR decoder 的 q/k/v 投影，运行时形状 [300,1,256] × [256,256]：
@@ -1632,7 +1640,8 @@ internal static class DnnOps
                     srcA.Slice(0, rows * k),
                     srcB.Slice(0, k * n),
                     dst.Slice(0, rows * n),
-                    rows, k, n);
+                    rows, k, n,
+                    columnBias: columnBias);
                 return;
             }
 
@@ -1653,7 +1662,8 @@ internal static class DnnOps
                     srcA.Slice((int)aOffset, m * k),
                     srcB.Slice((int)bOffset, k * n),
                     dst.Slice((int)(batch * m * n), m * n),
-                    m, k, n);
+                    m, k, n,
+                    columnBias: columnBias);
 
                 for (int i = batchRank - 1; i >= 0; i--)
                 {

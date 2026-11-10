@@ -133,6 +133,20 @@ internal interface IActivationFusable
 }
 
 /// <summary>
+/// 允许把紧随其后的 <c>Add(常量一维 bias)</c> 吸收进自己的输出端。
+/// <para>
+/// transformer 的 <c>MatMul</c> 后面几乎总跟着一个 bias add（rf-detr 的 MLP 是
+/// <c>[257,384]×[384,1536] + [1536]</c>，单独做要 0.43 ms）。GEMM 内核本来就能在
+/// 写出结果时带一行 bias，融合后这 6.3 MB 的输出只写一遍、也只读一遍。
+/// </para>
+/// </summary>
+internal interface IBiasAddable
+{
+    /// <summary>融合的 bias（一维、长度等于输出最后一维）；null 表示不融合。</summary>
+    Tensor? FusedBias { get; set; }
+}
+
+/// <summary>
 /// 可执行算子。CPU 路径下与 <see cref="LayerInfo"/> 为同一对象
 /// （对齐 OpenCV 中 <c>Layer : LayerInfo</c> 的设计）。
 /// </summary>

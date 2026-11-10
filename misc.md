@@ -695,6 +695,97 @@ Tile TopK Transpose Unsqueeze Where
     编解码要额外引 `Sdcb.SimdCodecs.Jpeg / Png / Bmp` 并在 `ImageHost.RegisterCodecs()` 里显式注册；
     没注册的格式调用时抛 `FeatureNotSupportedException`。产品库 `OnnxSharp` 一行都不引 —— 它只吃像素。
 
+### 6.23 RF-DETR 优化：MatMul+bias 融合与两个「想当然」的否决（2026-11-11 深夜）
+
+模型在 `F:\code\TinyLabel\train\testrftedr\runs\rfdetr-small.onnx`（不是之前记的 `F:\ai\rfdetr\...`，
+那个目录已经没了，`bench/models.json` 已改正）。输入 `[1,3,512,512]`，输出 `dets [1,300,4]` +
+`labels [1,300,3]`，1537 节点 / 140 MatMul / 113 Transpose。它是 Deformable-DETR 家族：
+backbone 只有 9 个 Conv（13 ms），其余全是 transformer（12 层 encoder + 6 层 decoder）。
+
+起手 profile（sum-of-min 173 ms）：`MatMul 139 个 98~180 ms（56~61%）` 一家独大，
+后面 `Transpose 111 / 22.9`、`Add 155 / 27.5`、`LayerNormalization 49 / 14.1`、`Softmax 18 / 8.6`。
+新写了 `tools/scripts/matmul_flops.py`（profile 的逐层耗时 × ONNX 形状 → 按节点名分类算有效 GFLOPS），
+拆出来：**MLP 24 个（`[257,384]×[384,1536]`）33.7 ms 只有 216 GFLOPS**，attention 的 q/k/v/out 投影 353。
+
+#### 收获 1：`MatMul → Add(bias)` 融合（−11 ms）
+
+MLP 的 `fc1/Add`、`fc2/Add` 单个 0.43 ms，输出 6.3 MB —— 光读一遍写一遍就 12.6 MB。
+`GemmKernel` 本来就能在累加器初值里带 bias，但**它的 bias 是「按行」的**（`bias[row]`、
+长度 m），因为 Conv 的 GEMM 布局里行就是输出通道；而图上 `Add(·, [n])` 是**按列**的。
+所以这次给内核加了第二条 bias 通道 `columnBias`（长度 n），三个微内核的累加器初值从
+`Vector256.Create(bias)` 改成 `Init(j)`（有 columnBias 就 load 一段，否则还是 splat）。
+
+- `LayerInfo.cs` 加 `IBiasAddable`（`Tensor? FusedBias`），`MatMulLayer` 实现它，
+  两条 GEMM 调用都传 `columnBias:`。
+- `GraphFusion.FuseMatMulBias`：`MatMul` 输出只被一个 `Add` 用、且另一边是**常量一维**、
+  长度等于输出最后一维才折。`ONNXSHARP_NO_FUSE=matmulbias` 可关。
+- 实测：`ops 809 → 700`，`Add 155 → 46`（15.3 → 2.0 ms），rf-detr **185 → 172 ms**（交替 5 轮最好值）。
+- 坑：融合遍历里**要用「消费者」表而不是「生产者」表** —— 第一版拿 `producerOf[matmul输出]`
+  去查，永远查到自己这个 MatMul，`next=MatMul`，一条都没融合（`ONNXSHARP_DEBUG_FUSE=1` 打出来才看见）。
+
+#### 收获 2：`m=257` 掉在「按列切分」的 256 边界外（−10 ms）
+
+MLP 的 m 是 257（256 个 patch + 1 个 cls token），刚好越过 `m <= 256` 的列切分门槛，
+于是走按行切分：每块都要重新打包一整份 B，gemmbench 只有 476 GFLOPS，而列切分 1211。
+但直接把门槛提到 512 会坑别的形状（`300×300×256` 列块只有 16 个，每线程重读一整份 A，
+544 → 120 GFLOPS）。最后分两档：
+
+```csharp
+bool columnSplit = m <= 256
+    ? columnBlocks >= threads
+    : m <= 512 && columnBlocks >= threads * 4;
+```
+
+`257×384×1536` 拿到 718 GFLOPS（n=1536 → 96 个列块），`300×300×256` 与 conv 形状保持原样。
+模型层面 172 → **155 ms**，yolo11n 不变（它的层最多 256 通道，走的还是第一档）。
+
+#### 否决 1：「行块数正好等于线程数」反而更慢
+
+看到 `m=257 → 17 块分给 16 线程` 就以为是负载不均，把 `SelectRowBlock` 改成
+`mb = ceil(m/threads)`（16 块 × 17 行，打包次数也减半）。rf-detr 实测 **172.2 vs 156.1 ms，慢 9%**。
+回退，并在注释里写明原因：块太大时 A 的每块工作集（17×384×4 = 26 KB）会和 B 面板一起
+被挤出 L1，块数多一点反而好摊。**教训**：gemmbench 里 `m=256` 与 `m=257` 的「1060 vs 476」
+根本不是块数造成的，是「列切分 vs 行切分」的差别 —— 差点归因错。
+
+#### 否决 2：大 T 的注意力融合是负收益（`AttentionFusionMaxSeq = 128`）
+
+`FuseAttention` 的匹配器原本只认 Q 侧一个 `Mul(·, 常量)`；rf-detr 把 1/√d 拆成两半、
+q 和 k 各乘一个**运行期** `Sqrt(Shape→Slice→Cast)` 链。扩展成「K 侧也能容忍一层 Mul
+（常量折进 scale，非常量就把 Mul 的输出直接当输入）」，12 层 encoder 全部融合成功
+（`Softmax 18 → 6`、`Transpose 111 → 63`）。但**融合层慢一倍**：逐行点积 + 逐行 axpy，
+T=257 时每行都要把整个 K/V 平面（66 KB）重读一遍，12 块 66 ms，而原图的
+`MatMul+Softmax` 只要 ~33 ms（GEMM 会按缓存块复用 K/V）。
+
+试过两条补救：
+1. 每任务 8 行（让平面在任务内命中 L1）—— 单行点积的量级没变，无效；
+2. 把两段改成 GEMM（`scores = Q·Kᵀ`、`out = P·V`，`ldc` 直接写进 NCHW）——
+   逐层与 numpy 复核一致（6.3e-6）、12 层输出逐层对拍也只差 1e-5，但**整模型输出错**
+   （dets 0.47 / labels 0.54，ORT 是 2e-4），最后定位到 `Multiply` 在 `PackColumns` 里
+   抛 `AccessViolationException`（B 面板是按「恰好大小」的池化缓冲传进去的）。
+
+结论：这条路要动的是 GEMM 的 B 复用和边界，收益上限却只有 ~30 ms 且融合本身是负的，
+**直接不融合**更划算。加 `AttentionFusionMaxSeq = 128`（ASR 的 T=76 仍走融合，那里
+40 个块省一半以上，encoder 数值与基线逐位一致）。12 个融合层的 Q/K/V/out dump 与
+numpy 复算用来确认「融合语义对、只是内核不够快」的调试代码已按项目习惯删掉。
+
+#### 现在的样子
+
+`profile`（16 线程，sum-of-min 157 ms）：`MatMul 98.5（61.5%）` > `Transpose 12.7` >
+`Softmax 6.5` > `LayerNormalization 6.2` > `Conv 5.9` > `Mul 5.7` > `Reshape 4.7` >
+`GridSample 3.2` > `Where 2.7` > `FusedEltwise 2.2` > `Add 2.0`。
+`bench` 交替 5 轮最好值：**HEAD 170.7 → 155.1 ms（−9%）**；同机 ORT 大致 90~120 ms 量级，
+差距主要在 transformer 的小 GEMM（m=257 的 MLP、24 个 head-batch 的 QK/PV）。
+对齐：dets `2.3e-4`、labels `5.0e-5`（ORT 同输入同会话）。
+
+#### 本次的坑
+
+- **别用 PowerShell `Set-Content` 改带中文的源文件**：`Get-Content`（PS 5.1 默认按 ANSI）
+  读 UTF-8 后 `Set-Content -Encoding UTF8` 写回，整个文件的注释会变成乱码。
+  已经踩过一次（`GemmKernel.cs`，最后用 `git checkout` 还原 + 编辑器工具重做）。
+  终端里 `Get-Content` 显示乱码不代表文件坏了（可能只是控制台解码），用 `read_files` 确认。
+- `GemmKernel.Multiply` 的 `bias` 语义是**按行**，不是按列；数值不对时先看这条，
+  别怀疑 GEMM 本身（`GemmKernelTests` 已经把 257×64×257 / 257×257×64 / ldc=384 都覆盖了）。
+
 ### 6.22 对标 SimdYolo：YOLO 还能优化哪里（2026-11-11 深夜）
 
 先拿到干净基线（`profile --iters 25` 的 sum-of-min 与 `bench` 的 min 对得上：25.7 / 28.2 ms）：

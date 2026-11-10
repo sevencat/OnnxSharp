@@ -10,6 +10,7 @@ cases.AddRange(EngineTests.Cases());
 cases.AddRange(OnnxReaderTests.Cases());
 cases.AddRange(OnnxShapeTests.Cases());
 cases.AddRange(TransposeKernelTests.Cases());
+cases.AddRange(GemmKernelTests.Cases());
 cases.AddRange(VisionTests.Cases());
 cases.AddRange(ImagingTests.Cases());
 cases.AddRange(Int8Tests.Cases());
