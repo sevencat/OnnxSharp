@@ -32,6 +32,10 @@ internal static class PackedConv
     /// <summary>调试开关：<c>0</c> 关闭本路径，交回 im2col（用于 A/B 对比）。</summary>
     private static readonly bool Enabled = Environment.GetEnvironmentVariable("ONNXSHARP_PACKED_CONV") != "0";
 
+    /// <summary>调试开关：<c>1</c> 让「s1 且空间 ≥ 4096」的层也走面板式（用于复核上面那条经验）。</summary>
+    private static readonly bool ForcePackedLargeSpatial =
+        Environment.GetEnvironmentVariable("ONNXSHARP_PACKED_S1") is { Length: > 0 };
+
     /// <summary>K 方向切片深度，0 表示不分片（调参用）。</summary>
     private static readonly int SliceDepth =
         int.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_PACKED_DEPTH"), out int depth) ? depth : 128;
@@ -119,9 +123,11 @@ internal static class PackedConv
         long spatial = (long)outH * outW;
         int panels = (int)((spatial + Panel - 1) / Panel);
 
-        // 大步长、大空间图的 s1 卷积上 im2col 的整幅 col 复用更好（实测 80²/160² 快 5~12%），
-        // 这类层留给 im2col；面板路径专治「K 大而空间小」和「通道少、被 col 搬运拖死」的层
-        if (strideH == 1 && strideW == 1 && spatial >= 4096)
+        // 大步长、大空间图的 s1 卷积上 im2col 的整幅 col 复用更好（历史实测 80²/160² 快 5~12%），
+        // 这类层留给 im2col；面板路径专治「K 大而空间小」和「通道少、被 col 搬运拖死」的层。
+        // ONNXSHARP_PACKED_S1=1 强制也走面板式：im2col 会物化 K×pixels 的 col
+        // （160²/64→64 那层就是 576×25600×4 = 59 MB），值得定期复核这条经验。
+        if (strideH == 1 && strideW == 1 && spatial >= 4096 && !ForcePackedLargeSpatial)
             return false;
 
         // 面板数不够喂满线程时，交回 im2col（它会把输出宽度也切开）

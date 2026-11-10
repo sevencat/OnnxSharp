@@ -340,3 +340,34 @@ yolov8n / yolov8s 本轮被后台负载污染（我们 236 ms、ORT 126 ms），
 
 **YuNet（新增模型，单引擎数字）**：`bench --iters 40 --warmup 10 --threads 16`，
 `yunet.onnx`（0.22 MB，91 个执行算子，640×640）：**median 19.0 ms / min 15.8 ms**。本轮没有跨引擎对照。
+## 2026-11-11 深夜：常驻 intra-op 线程池（降逐 op 开销）
+
+**问题**：`parbench` 显示一次 `ParallelRange.For` 空调用 = **14.4 µs**（TPL 的 `Parallel.For`）。
+yolo11n 一次前向有 200+ 个并行区（88 个卷积 × 2 个派发点），累计 2~3 ms —— 正好是 `profile` 的
+sum-of-min 与 `bench` 的 min 之间那 2.5 ms 的缺口。
+
+**做法**：`ParallelRange` 换成常驻线程池（对齐 ONNXRuntime 的 intra-op pool）：调用线程自己也参与、
+工作线程用 `Interlocked` 动态领任务；错误经 `ExceptionDispatchInfo` 回传；已经在并行区里的线程再调用时
+降级为串行（防死锁）。`ONNXSHARP_THREADPOOL=0` 可回退到旧 TPL 路径（A/B 与排障用）。
+同时把 `GemmKernel` 里两处直接调 TPL 的并行区也接到这个池上。
+
+**同会话 A/B**（旧版用 `git worktree` 从 HEAD 单独编译，两个二进制交替跑）：
+
+| 版本 | min（3 次） | best |
+|---|---|---|
+| HEAD（TPL） | 39.8 / 37.1 / 52.3 | 37.1 ms |
+| 常驻线程池 | 23.0 / 23.4 / 23.7 | **23.0 ms** |
+
+⇒ **−38%**，而且方差从 37.1~52.3 收到 23.0~23.7（负载下 TPL 的调度抖动一并消失）。
+数值不受影响：yolo11n golden、ASR encoder、attention 的对拍 diff 与改动前一模一样。
+
+**线程数复扫**（池化后 16 线程不再是瓶颈）：4 → 36.5 ms、**8 → 21.6 ms**、12 → 22.1、16 → 23.4。
+这台 8 核 16 线程 APU 上 **8 线程最优**（超线程争用同一 FP 单元），和代码里原有注释一致。
+`bench.md` 的对外口径仍固定 16 线程，保证和历史数据可比。
+
+**坑**：第一版工作线程用 `SpinWait.SpinOnce()`，它 ~10 次之后就 `Thread.Sleep(1)`，
+而 Windows 默认计时器粒度 15.6 ms —— 一次派发能等到 15~30 ms（`parbench` 直接飙到 30 ms/次）。
+改成「紧凑自旋 `Thread.SpinWait` → `Thread.Yield` → 最后才 `Sleep(1)`」后恢复正常。
+**同轮顺手否决的一项**：把微内核从 4 行改成 6 行（SimdYolo 的 6×16 形状）—— `gemmbench` 隔离对比下
+全面更慢 1.3~3.3×（64×576×6400：649 → 195 GFLOPS、64×256×6400：682 → 328）。
+原因：.NET JIT 保不住 12 个活跃 `Vector256` 累加器，主循环 spill。详见 `misc.md §6.22`。

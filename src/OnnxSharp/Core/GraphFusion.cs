@@ -29,6 +29,11 @@ internal static class GraphFusion
         if (!Disabled("layernorm"))
             total += FuseLayerNorm(net, graph);
 
+        // DFL 解码（yolo 的 head）：Reshape→Transpose→Softmax→Conv(arange)→Reshape 折成一层。
+        // 放在最后：它前面的算子结构不受其它融合影响，但 SiLU 融合可能已经改过上游。
+        if (!Disabled("dfl"))
+            total += FuseDflSoftmax(net, graph);
+
         // 逐元素链融合放最后：前面两步可能已经把 Sigmoid+Mul 变成单个 Silu，
         // 那样链里就少一个节点，融合结果的寄存器也更省。
         total += FuseElementWiseChains(net, graph);
@@ -574,6 +579,135 @@ internal static class GraphFusion
                 continue;
 
             result.Add(replacements.TryGetValue(op, out var replacement) ? replacement : op);
+        }
+
+        graph.Reset(result);
+        return fused;
+    }
+
+    /// <summary>
+    /// YOLO 的 DFL（分布焦点损失解码）折成一层 <c>DflSoftmax</c>：
+    /// <code>
+    /// x[S·bins, N] → Reshape[B,S,bins,N] → Transpose[0,2,1,3] → Softmax(axis=1)
+    ///              → Conv(1×1, 权重 = arange(bins)) → Reshape[B,S,N]
+    /// </code>
+    /// <para>
+    /// 「乘 arange」被导出成了一个权重为 <c>[0,1,…,bins-1]</c> 的 1×1 卷积 ——
+    /// <b>这条正好是 DFL 的指纹</b>：形状对但权重不是 arange 的卷积一律不碰。
+    /// </para>
+    /// </summary>
+    private static int FuseDflSoftmax(NetImpl net, Graph graph)
+    {
+        var prog = graph.Prog;
+        if (prog.Count < 5)
+            return 0;
+
+        var producerOf = new Dictionary<int, LayerInfo>();
+        var consumerOf = new Dictionary<int, LayerInfo>();
+        var uses = new Dictionary<int, int>();
+
+        foreach (var op in prog)
+        {
+            foreach (var arg in op.Outputs)
+            {
+                if (!arg.IsEmpty)
+                    producerOf[arg.Idx] = op;
+            }
+
+            foreach (var arg in op.Inputs)
+            {
+                if (arg.IsEmpty)
+                    continue;
+
+                uses[arg.Idx] = uses.TryGetValue(arg.Idx, out int count) ? count + 1 : 1;
+                consumerOf.TryAdd(arg.Idx, op);
+            }
+        }
+
+        int Uses(Arg arg) => arg.IsEmpty ? 0 : uses.GetValueOrDefault(arg.Idx);
+
+        var replacements = new Dictionary<LayerInfo, LayerInfo>();
+        var drop = new HashSet<LayerInfo>();
+        int fused = 0;
+
+        foreach (var conv in prog)
+        {
+            if (conv.Type != "Conv" || conv is not Ops.DnnOps.IPointwiseConv { IsPointwiseUngrouped: true })
+                continue;
+            if (conv.Inputs.Count < 2 || conv.Outputs.Count != 1 || !conv.IsConstInput(1))
+                continue;
+
+            // 权重必须正好是 [0, 1, …, bins-1]（cout = 1，kernel 1×1）
+            var weight = conv.In(1);
+            if (weight.Shape.Rank != 4 || weight.Shape[0] != 1 || weight.Shape[2] != 1 || weight.Shape[3] != 1)
+                continue;
+
+            int bins = weight.Shape[1];
+            if (bins < 2)
+                continue;
+
+            var values = weight.AsSpan<float>();
+            bool isArange = values.Length >= bins;
+            for (int i = 0; isArange && i < bins; i++)
+                isArange = values[i] == i;
+
+            if (!isArange)
+                continue;
+
+            // Softmax(axis=1) ← Transpose[0,2,1,3] ← Reshape ← x
+            if (!producerOf.TryGetValue(conv.Inputs[0].Idx, out var softmax)
+                || softmax.Type != "Softmax" || softmax is not Ops.DnnOps.ISoftmaxAxis { Axis: 1 }
+                || softmax.Inputs.Count != 1 || softmax.Outputs.Count != 1 || Uses(softmax.Outputs[0]) != 1)
+                continue;
+
+            if (!producerOf.TryGetValue(softmax.Inputs[0].Idx, out var transpose)
+                || transpose is not Ops.ShapeOps.ITransposePerm { Perm: [0, 2, 1, 3] }
+                || transpose.Outputs.Count != 1 || Uses(transpose.Outputs[0]) != 1)
+                continue;
+
+            if (!producerOf.TryGetValue(transpose.Inputs[0].Idx, out var reshape)
+                || reshape.Type != "Reshape" || reshape.Outputs.Count != 1 || Uses(reshape.Outputs[0]) != 1)
+                continue;
+
+            // 输出侧：[1,1,S,N] → Reshape [1,S,N]，把这个 Reshape 一起折掉
+            if (Uses(conv.Outputs[0]) != 1
+                || !consumerOf.TryGetValue(conv.Outputs[0].Idx, out var tail)
+                || tail.Type != "Reshape" || tail.Outputs.Count != 1)
+                continue;
+
+            var parameters = new LayerParams { Type = "DflSoftmax", Name = conv.Name + "/dfl_fused" };
+            parameters.Set("bins", (long)bins);
+
+            if (LayerRegistry.Create("DflSoftmax", parameters) is not Layer fusedLayer)
+                continue;
+
+            fusedLayer.Inputs.Add(reshape.Inputs[0]);
+            fusedLayer.Outputs.Add(tail.Outputs[0]);
+
+            replacements[conv] = fusedLayer;
+            drop.Add(reshape);
+            drop.Add(transpose);
+            drop.Add(softmax);
+            drop.Add(tail);
+            fused++;
+        }
+
+        if (replacements.Count == 0)
+            return 0;
+
+        var result = new List<LayerInfo>(prog.Count);
+        foreach (var op in prog)
+        {
+            if (replacements.TryGetValue(op, out var replacement))
+            {
+                result.Add(replacement);
+                continue;
+            }
+
+            if (drop.Contains(op))
+                continue;
+
+            result.Add(op);
         }
 
         graph.Reset(result);

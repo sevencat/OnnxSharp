@@ -75,10 +75,27 @@ internal static class DnnOps
 
     // ---------------- Conv ----------------
 
-    private sealed class ConvLayer : Layer, IActivationFusable
+    /// <summary>
+    /// 图融合用：这个卷积是不是「1×1、s1、pad 0、dilation 1、group 1」。
+    /// </summary>
+    internal interface IPointwiseConv
+    {
+        bool IsPointwiseUngrouped { get; }
+    }
+
+    private sealed class ConvLayer : Layer, IActivationFusable, IPointwiseConv
     {
         /// <inheritdoc />
         public UnaryOpKind? FusedActivation { get; set; }
+
+        /// <inheritdoc />
+        public bool IsPointwiseUngrouped
+            => _group == 1
+               && _autoPad is "NOTSET"
+               && _kernelShape is [1, 1]
+               && (_strides is [] or [1, 1])
+               && (_pads is [] or [0, 0] or [0, 0, 0, 0])
+               && (_dilations is [] or [1, 1]);
 
         private readonly int _group;
         private readonly int[] _kernelShape;

@@ -113,25 +113,28 @@ internal static class GemmKernel
                 int basePer = columnBlocks / threads;
                 int rem = columnBlocks % threads;
 
-                Parallel.For(0, threads, popts, t =>
+                ParallelRange.For(threads, (begin, end) =>
                 {
-                    int cb0 = t * basePer + Math.Min(t, rem);
-                    int cb1 = cb0 + basePer + (t < rem ? 1 : 0);
-                    if (cb0 >= cb1)
-                        return;
+                    for (int t = begin; t < end; t++)
+                    {
+                        int cb0 = t * basePer + Math.Min(t, rem);
+                        int cb1 = cb0 + basePer + (t < rem ? 1 : 0);
+                        if (cb0 >= cb1)
+                            continue;
 
-                    var pack = ArrayPool<float>.Shared.Rent(k * nb);
-                    try
-                    {
-                        fixed (float* pp = pack)
+                        var pack = ArrayPool<float>.Shared.Rent(k * nb);
+                        try
                         {
-                            MultiplyColumnRange(a0, b0, c0, m, k, n, ldc, nb,
-                                cb0 * nb, Math.Min(cb1 * nb, n), pp, bias0);
+                            fixed (float* pp = pack)
+                            {
+                                MultiplyColumnRange(a0, b0, c0, m, k, n, ldc, nb,
+                                    cb0 * nb, Math.Min(cb1 * nb, n), pp, bias0);
+                            }
                         }
-                    }
-                    finally
-                    {
-                        ArrayPool<float>.Shared.Return(pack);
+                        finally
+                        {
+                            ArrayPool<float>.Shared.Return(pack);
+                        }
                     }
                 });
             }
@@ -145,7 +148,7 @@ internal static class GemmKernel
                 float* c0 = pc;
                 float* bias0 = pbias;
 
-                Parallel.For(0, rowBlocks, popts, ib =>
+                ParallelRange.ForEach(rowBlocks, ib =>
                 {
                     int row0 = ib * mb;
                     int row1 = Math.Min(row0 + mb, m);
@@ -287,7 +290,6 @@ internal static class GemmKernel
         }
     }
 
-    /// <summary>
     /// 4 行共享一次 B 加载的微内核（一次 2 个 <see cref="Vector256{T}"/>，即 16 列）。
     /// <para>
     /// 单行 8 向量版本每个 k 需要 8 条 B load + 1 条 A 广播 = 9 条 load，而 Zen 4 每拍只发 2 条 load，
