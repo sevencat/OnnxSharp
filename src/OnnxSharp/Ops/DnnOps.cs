@@ -2035,7 +2035,8 @@ internal static class DnnOps
 
                 if (trace)
                     Console.Error.WriteLine(
-                        $"MMv m={vm} k={vk} n={vn} bat={outer * inner} ms={swTrace!.Elapsed.TotalMilliseconds:F3} {Name}");
+                        $"MMv m={vm} k={vk} n={vn} bat={outer * inner} aRow={aRow} aBs={aBatchStride} " +
+                        $"bRow={bRow} bCol={bCol} bBs={bBatchStride} ms={swTrace!.Elapsed.TotalMilliseconds:F3} {Name}");
                 return;
             }
 

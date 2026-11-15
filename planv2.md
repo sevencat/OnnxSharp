@@ -356,15 +356,34 @@ yolo 系 attention 是 `[B,H,T,D]` 内的矩阵转置（`perm=[0,1,3,2]`），A 
 | A | **去掉面板物化**：`singleRow && strideW==1 && 面板在界内` 时，在内核 K 步里现取 16 像素（2 个 ymm），跳过 `PackPanel` | `Kernels/PackedConv.cs` | yolo 专用 | −10~20%（省 36 KB 写+读往返） |
 | B | **行块 4→8**，用 AVX-512VL 的 ymm16~31（16 累加器 + 2 B + 广播 = 19 ymm），照搬 `GemmKernel.UseMr12` 的 ISA 分派 | `Kernels/PackedConv.cs` | yolo 专用 | −5~15% |
 | C | **输入通道块外提 + 输出行累积**（一行输出常驻 L1，输入行被整条 K 复用） | `Kernels/PackedConv.cs` | yolo 专用 | 与 A 合并做才有意义 |
-| D | **降低 GEMM 并行阈值**：MLAS 是 `M·N·K / 65536 + 1`，我们是 `GemmKernel.ParallelThreshold = 1<<22`（**高 64 倍**） | `Tensors/GemmKernel.cs:29` | **rfdetr 主线** | 待测，成本最低 |
+| D | **降低 GEMM 并行阈值**：MLAS 是 `M·N·K / 65536 + 1`，我们是 `GemmKernel.ParallelThreshold = 1<<22`（**高 64 倍**） | `Tensors/GemmKernel.cs` | **rfdetr 主线** | **已测：0，关闭**（`bench.md §17`） |
 
 A+B+C 对 yolo11n 的上限：Conv 30.7 ms 若降到 23 ms（−25%），端到端 37.2 → 29.5，
 对 ORT 从 1.59× 拉到 **1.26×**。**对 rfdetr 一点用都没有**（Conv 只占 5.1%，见 §P7.4）。
 
-D 是这份源码里**唯一**可能推动 rfdetr ≤210 的东西：`MatMul 139 个占 77.1%`，其中 attention 的
-`k` 只有 32/64，按现在的阈值很可能全程单线程。验证方式：把阈值改成可配置
-（`ONNXSHARP_GEMM_THRESHOLD`），在 `gemmbench` 的 6 类主形状上扫 1<<16 / 1<<18 / 1<<22，
-再对 rfdetr 做交替 A/B。**先微基准、后端到端**，否则又是一次「微基准变快、端到端为 0」。
+**D 已关闭**（2026-11-16，`bench.md §17`）：阈值现在可配（`ONNXSHARP_GEMM_THRESHOLD`，
+支持 `65536` / `1<<16` / `64K`），但 rfdetr 全部 139 个 MatMul 的 `m·n·k` 最小也有 19.6 M
+（decoder `300×256×256`），QKV 151 M、QK 101 M、fc1 606 M —— **全都远高于 `1<<22`（4.19 M）**，
+降阈值不改变任何一层的并行决策。端到端交替 A/B：217.8 vs 237.4（噪声内）。默认值不变。
+
+#### P7.6 顺带查出来的新缺口：attention 的 QK/PV 在图里慢 1.8×（未排期）
+
+用 `gemmbench --attn 1`（复刻真实形状 + `aRow/bCol` 视图 + `outer×inner` 派发）对比同参数 profile：
+
+| 算子 | 图里 | 探针（数据全热） | 差距 |
+|---|---:|---:|---:|
+| QK^T（`257×64×257` × 24） | 1.73 ms / 117 GFLOPS | 0.95 ms / 213 GFLOPS | 1.8× |
+| PV（`257×257×64` × 24） | 1.03 ms / 197 GFLOPS | 0.54 ms / 377 GFLOPS | 1.9× |
+
+12 层合计 33.1 ms。不是打包也不是派发（probe 里 batch=6/12/24 都是 245~249 GFLOPS），
+而是**每层 6.3 MB 的 attention 矩阵往返**（QK 写、Softmax 读+写、PV 再读，25 MB/层，
+L2 只有 1 MB/核）。可行的只有「QK→Softmax→PV 分块融合、不落地矩阵」，
+上限约 **−4%**（33.1 → 23 ms），工程量大于 P6'。**列为候选 P8，未排期。**
+
+同时否决了一条「看起来该做」的微优化：把 `PackColumns` 的 `bColStride != 1` 分支改成
+「按行优先」（cache line 利用率 6% → 100%）。微基准（`bColStride == k`）确实 5.314 → 0.728 ms，
+但真实参数 `bColStride=384` 下两版完全一样（0.958 vs 0.952 ms）—— 原顺序的内层循环
+已经在复用那 16 条 line。**已回退，不留代码。**
 
 #### P7.3 已经持平或领先、不用抄
 
@@ -408,7 +427,8 @@ D 是这份源码里**唯一**可能推动 rfdetr ≤210 的东西：`MatMul 139
 #### P7.5 一句话
 
 **GEMM 侧我们已超过 ORT（B 预打包常驻），Conv 侧的差距是「物化 im2col + 窄行块」，
-只对 yolo 系有意义；rfdetr 主线要从 GEMM 阈值（§P7.2 D）里找那 3.5%。**
+只对 yolo 系有意义。阈值（D）已实测为 0；rfdetr 剩下的 3.5% 不在「更快的 GEMM 内核」，
+而在「少搬 6.3 MB 的 attention 矩阵」（§P7.6）与 P6' 的 10 ms。**
 
 ---
 

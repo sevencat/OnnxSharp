@@ -25,8 +25,50 @@ namespace OnnxSharp.Tensors;
 /// </summary>
 internal static class GemmKernel
 {
-    /// <summary>低于这个乘加次数就不值得开线程（小算子开线程反而更慢）。</summary>
-    private const long ParallelThreshold = 1L << 22;
+    /// <summary>默认并行阈值：低于这个乘加次数就不值得开线程（小算子开线程反而更慢）。</summary>
+    private const long DefaultParallelThreshold = 1L << 22;
+
+    /// <summary>
+    /// 并行阈值（<c>m·n·k</c> 次乘加）。低于它就不开线程。
+    /// <para>
+    /// 可被环境变量 <c>ONNXSHARP_GEMM_THRESHOLD</c> 覆盖（<c>65536</c> 或 <c>1&lt;&lt;16</c> 两种写法都认），
+    /// 也可由 <c>gemmbench --threshold</c> 直接赋值做扫描。MLAS 的口径是
+    /// <c>(M·N·K &gt;&gt; 16) + 1</c>，即按 <b>M·N·K / 65536</b> 折算并行任务数；
+    /// 我们原来是固定的 1&lt;&lt;22（等效要求 64 个 MLAS 任务才开线程）。
+    /// </para>
+    /// </summary>
+    internal static long ParallelThreshold { get; set; } = ReadThresholdFromEnv();
+
+    private static long ReadThresholdFromEnv()
+    {
+        string? text = Environment.GetEnvironmentVariable("ONNXSHARP_GEMM_THRESHOLD");
+        return !string.IsNullOrWhiteSpace(text) && TryParseThreshold(text, out long value) && value > 0
+            ? value
+            : DefaultParallelThreshold;
+    }
+
+    /// <summary>解析阈值文本：<c>1&lt;&lt;16</c> / <c>65536</c> / <c>64K</c>。</summary>
+    internal static bool TryParseThreshold(string text, out long value)
+    {
+        value = 0;
+        text = text.Trim();
+        if (text.Length == 0)
+            return false;
+
+        int shift = text.IndexOf("<<", StringComparison.Ordinal);
+        if (shift > 0)
+            return long.TryParse(text[..shift].Trim(), out long lhs)
+                && int.TryParse(text[(shift + 2)..].Trim(), out int rhs)
+                && (value = lhs << rhs) > 0;
+
+        if (text.EndsWith("K", StringComparison.OrdinalIgnoreCase)
+            && long.TryParse(text[..^1], out long kilos))
+            value = kilos << 10;
+        else if (!long.TryParse(text, out value))
+            return false;
+
+        return value > 0;
+    }
 
     /// <summary>
     /// 并行度必须跟 <see cref="ParallelRange.Threads"/> 一致：行块是按它算的，

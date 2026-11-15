@@ -330,6 +330,18 @@ v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→
 
 ### 2026-11-16
 
+- **P7-D 验证：GEMM 并行阈值不是瓶颈（`bench.md §17`）**。阈值改为可配
+  （`ONNXSHARP_GEMM_THRESHOLD` / `gemmbench --threshold`，默认仍是 `1<<22`），
+  但 rfdetr 的 139 个 MatMul 最小 `m·n·k` = 19.6 M ≫ 4.19 M，降阈值不改变任何一层的
+  并行决策，端到端交替 A/B 217.8 vs 237.4（噪声内）→ **D 关闭，默认值不变**。
+  顺带加了 `gemmbench --attn 1`（复刻 QK/PV 的真实形状+视图+派发序列）和
+  `--btrans`（K^T 视图 B）、`MMv` trace 补 stride。
+- **新缺口：QK/PV 在图里比同参数探针慢 1.8×**（1.73 vs 0.95 ms、1.03 vs 0.54 ms，
+  12 层 33.1 ms）。不是打包/派发，而是每层 6.3 MB attention 矩阵往返（25 MB/层，L2 1 MB）。
+  候选 P8「QK→Softmax→PV 分块融合」，上限 −4%，未排期。
+- **否决并用回退的微优化**：`PackColumns` 的 `bColStride != 1` 分支改「按行优先」，
+  微基准 5.314 → 0.728 ms（`bColStride==k`），真实 `bColStride=384` 下 0.958 vs 0.952 无差 ——
+  已回退，`--btrans` 留作探针。回归：单测 116/118（2 skipped，0 失败）、rfdetr 端到端 min 212.2。
 - **通读 ORT 1.32 源码，产出参照清单（`planv2.md §P7`）**：三个假设被证伪 —— CPU EP 里
   **没有 oneDNN**、MLAS 里**没有 Winograd/FFT**、AMX 只接 int8。ORT 的 Conv 优势全在
   「NCHWc(16) + 图优化期权重 `OIHWBiBo` 重排 + **不物化 im2col** + 输入通道块外提 + 24 累加器

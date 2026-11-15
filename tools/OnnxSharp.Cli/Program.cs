@@ -78,8 +78,8 @@ static int Usage()
     Console.WriteLine("  OnnxSharp.Cli sam3 <image> --models <fp32 dir> --box x1,y1,x2,y2 [--box ...]");
     Console.WriteLine("                     [--out marked.jpg] [--conf 0.3] [--format cxcywh|xyxy|px] [--json]");
     Console.WriteLine("                                      # SAM3：图像 + 框提示 → 掩码（模型需先 FP16→FP32）");
-    Console.WriteLine("  OnnxSharp.Cli gemmbench [--iters N] [--shape m,k,n]");
-    Console.WriteLine("                                      # GEMM 微内核吞吐（GFLOPS），调优用");
+    Console.WriteLine("  OnnxSharp.Cli gemmbench [--iters N] [--shape m,k,n] [--threads T] [--threshold V]");
+    Console.WriteLine("                                      # GEMM 微内核吞吐（GFLOPS），调优用；--threshold 扫并行阈值");
     Console.WriteLine("  OnnxSharp.Cli eltwisebench [--iters N] [--shape d1,d2,...]");
     Console.WriteLine("                                      # 逐元素算子 ms/GB/s，带 copy 作带宽参考");
     return 2;
@@ -423,6 +423,17 @@ static int GemmBench(string[] args)
     if (threads > 0)
         OnnxSharp.Threading.ParallelRange.MaxDegreeOfParallelism = threads;
 
+    // --threshold：扫描「多大工作量才值得开线程」。MLAS 的口径是 M·N·K/65536，
+    // 我们默认 1<<22（等效要求 64 个任务），rfdetr 的 attention 小 k 很可能因此全程单线程。
+    string? thresholdText = options.GetString("--threshold");
+    if (thresholdText is not null)
+    {
+        if (!OnnxSharp.Tensors.GemmKernel.TryParseThreshold(thresholdText, out long parsed))
+            throw new ArgumentException($"--threshold 无法解析：{thresholdText}");
+
+        OnnxSharp.Tensors.GemmKernel.ParallelThreshold = parsed;
+    }
+
     var shapes = new List<(int M, int K, int N)>();
     string? single = options.GetString("--shape");
 
@@ -458,8 +469,9 @@ static int GemmBench(string[] args)
     Console.WriteLine($"threads : {OnnxSharp.Threading.ParallelRange.Threads}");
     Console.WriteLine($"iters   : {iters}");
     Console.WriteLine($"batch   : {batches}");
+    Console.WriteLine($"thresh  : {OnnxSharp.Tensors.GemmKernel.ParallelThreshold}（m·n·k 低于此值走单线程）");
     Console.WriteLine();
-    Console.WriteLine("     m       k       n    batch    per-batch ms    GFLOPS   packed ms   speedup");
+    Console.WriteLine("     m       k       n    batch    per-batch ms    GFLOPS   packed ms   speedup  bview ms");
 
     foreach (var (m, k, n) in shapes)
     {
@@ -474,6 +486,25 @@ static int GemmBench(string[] args)
         var rng = new Random(12345);
         for (int i = 0; i < a.Length; i++) a[i] = (float)rng.NextDouble();
         for (int i = 0; i < b.Length; i++) b[i] = (float)rng.NextDouble();
+
+        // --btrans 1：把 B 物化成 [n,k] 布局，等价于 attention 里折进 GEMM 的 K^T 视图
+        // （bColStride = k、bStride = 1）。用来量「视图 B」相对紧密 B 掉多少 ——
+        // rfdetr 的 QK^T 走的就是视图路径（MMv），图里实测只有 gemmbench 的一半。
+        float[]? bt = null;
+        if (options.GetInt("--btrans", 0) == 1)
+        {
+            bt = new float[off + batches * n * k];
+            for (int bi = 0; bi < batches; bi++)
+            {
+                int src = off + bi * k * n;
+                int dst0 = off + bi * n * k;
+                for (int i = 0; i < k; i++)
+                {
+                    for (int j = 0; j < n; j++)
+                        bt[dst0 + j * k + i] = b[src + i * n + j];
+                }
+            }
+        }
 
         double Best(Action body)
         {
@@ -527,7 +558,89 @@ static int GemmBench(string[] args)
             speedupText = $"{best / mergedBest,10:F2}x";
         }
 
-        Console.WriteLine($"{m,6}  {k,6}  {n,6}  {batches,6}   {perBatch,12:F3}  {gflops,8:F1} {packedText} {speedupText}");
+        // 视图 B（K^T 布局）同口径对照
+        string viewText = "        -";
+        if (bt is not null)
+        {
+            double viewBest = Best(() => GemmKernel.MultiplyBatched(
+                a.AsSpan(off, batches * m * k),
+                bt.AsSpan(off, batches * n * k),
+                c.AsSpan(off, batches * m * n),
+                batches, m, k, n, bColStride: k, bStride: 1, bBatchStride: k * n));
+            viewText = $"{viewBest,10:F3}";
+        }
+
+        Console.WriteLine($"{m,6}  {k,6}  {n,6}  {batches,6}   {perBatch,12:F3}  {gflops,8:F1} {packedText} {speedupText} {viewText}");
+    }
+
+    // --attn 1：复刻 rfdetr 的 attention 形状与视图（4 样本 × 6 head，T=257，D=64），
+    // 参数取自 ONNXSHARP_MM_TRACE 的实际输出（aRow=384 aBs=64 bRow/bCol=1/384 …），
+    // outer=4 × inner=6 的派发序列也和 MMv 一致。用来把「端到端 ±10% 噪声」隔离掉。
+    if (options.GetInt("--attn", 0) == 1)
+    {
+        const int outer = 4, inner = 6, T = 257, D = 64;
+        int qPlane = T * inner * D;          // [T][6][64]
+        int pPlane = T * inner * T;          // [T][6][T]
+        int qcbs = T * T, pcbs = T * D;
+
+        var probe = new Random(11);
+        float[] q = new float[outer * qPlane], kt = new float[outer * qPlane];
+        float[] p = new float[outer * pPlane], v = new float[outer * qPlane];
+        foreach (var span in new[] { q, kt, p, v })
+        {
+            for (int i = 0; i < span.Length; i++) span[i] = (float)probe.NextDouble();
+        }
+
+        float[] qc = new float[outer * inner * qcbs];
+        float[] pc = new float[outer * inner * pcbs];
+
+        double qkBest = Probe(() =>
+        {
+            for (int o = 0; o < outer; o++)
+            {
+                GemmKernel.MultiplyBatched(
+                    q.AsSpan(o * qPlane, qPlane), kt.AsSpan(o * qPlane, qPlane),
+                    qc.AsSpan(o * inner * qcbs, inner * qcbs),
+                    inner, T, D, T,
+                    aStride: inner * D, aBatchStride: D,
+                    bColStride: inner * D, bStride: 1, bBatchStride: D);
+            }
+        });
+
+        double pvBest = Probe(() =>
+        {
+            for (int o = 0; o < outer; o++)
+            {
+                GemmKernel.MultiplyBatched(
+                    p.AsSpan(o * pPlane, pPlane), v.AsSpan(o * qPlane, qPlane),
+                    pc.AsSpan(o * inner * pcbs, inner * pcbs),
+                    inner, T, T, D,
+                    aStride: T, aBatchStride: T * T,
+                    bColStride: 1, bStride: inner * D, bBatchStride: D);
+            }
+        });
+
+        double flops = 2.0 * outer * inner * T * D * T;
+        Console.WriteLine($"attn QK : {qkBest,7:F3} ms  {flops / qkBest / 1e6,7:F1} GFLOPS");
+        Console.WriteLine($"attn PV : {pvBest,7:F3} ms  {flops / pvBest / 1e6,7:F1} GFLOPS");
+
+        double Probe(Action action)
+        {
+            action();
+            action();
+            double best = double.MaxValue;
+            for (int r = 0; r < 30; r++)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                action();
+                double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0
+                    / System.Diagnostics.Stopwatch.Frequency;
+                if (ms < best)
+                    best = ms;
+            }
+
+            return best;
+        }
     }
 
     return 0;
