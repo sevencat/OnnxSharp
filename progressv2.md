@@ -6,7 +6,7 @@
 > `(Get-Counter '\Processor Information(_Total)\% Processor Performance') > 80%`。
 
 - 立项：2026-11-15
-- 当前阶段：**测量与逐元素/内存两轮清理完成，下一个做 P6'（GEMM 微内核）**
+- 当前阶段：**P6' / P4 / P3 / P5 全部完成（rfdetr 246 → ~208 ms），下一个做 GEMM 的 C 写面板（0.6%）或测量工具**
 
 ---
 
@@ -18,17 +18,20 @@
 | P1 | Conv 低线程效率 | **已否决**（实测 11.2 ms） | ~~-6~7%~~ | 上限 -3~4% |
 | P1' | 逐元素 32 ms 为什么贵 | **已关闭**（实测 12 ms） | ~~-8%~~ | 上限 -1% |
 | P2 | Conv+SiLU/ReLU 融合 | **已否决**（激活只有 0.4 ms） | ~~-2.8%~~ | 0 |
-| P3 | `Where` 逐元素搬移 + 折叠漏网 | 待启动（随手项） | -1% | 2.6 ms → ≤0.2 |
-| P4 | Transpose 折进 GEMM A 面板 | 待启动 | -2.4% | 10.5 ms |
-| P5 | Reshape / GatherElements / 小算子 | 随手做 | -1% | Reshape 4.4 ms 可疑 |
+| P3 | `Where` 逐元素搬移 + 折叠漏网 | **完成** | -1% | **2.6 → 0.1 ms**（按行选择） |
+| P4 | Transpose 折进 GEMM 读面板 | **完成** | -2.4% | **-4.5%**（234.1→223.7），Transpose 111→75 |
+| P5 | Reshape / GatherElements / 小算子 | **完成**（只做 Reshape） | -1% | **Reshape 4.4 → 0.2 ms**（槽位复用）；GatherElements 1.2 不做 |
 | P6 | 并行粒度按线程数自适应 | **前提证伪**，降为观察项 | ~~结构性~~ | 1→2→4 近线性 |
 | P6' | GEMM 微内核 70~74% → 85% | **完成**（MR=6 + MR=12） | ~~-13%~~ 上限 -10% | 打包路径 **92.2%**，端到端 **-9.8%**（246.0→221.8） |
 | — | 内存复用（ORT memory pattern 对应项） | **完成**（修 `Fit` 缩容 bug） | 0（隐患消除） | 54.8→1.4 MB/帧 |
 
 目标线（4 线程 median）：rfdetr-small **262.5 → ≤ 210**、yolo11n **39.1 → ≤ 27**。
 
-当前（同一套交替 A/B 口径，min）：rfdetr-small **221.8 ms**（-9.8% vs P6' 起点 246.0）、
-yolo11n **36.4 ms**（-4%）。距离目标线还差约 5%。
+当前：**profile sum-of-min 208.5 ms**（rfdetr-small，P6' 起点 246.0 → −15.2%）、
+yolo11n **36.5 ms**（39.1 → −6.7%）。阶段 A 目标 ≤228 已达成。
+最终目标 ≤210 是 **median** 口径，而 sum-of-min 天然比 median 低 3~5% ——
+换算下来 median 约 215~220，**还差 3~5%**。
+bench 的 median/min 因顺序偏差（后跑者慢 4.7%）不再用于 5% 以下的判定，见 `bench.md §15.3`。
 
 ---
 
@@ -56,11 +59,11 @@ yolo11n **36.4 ms**（-4%）。距离目标线还差约 5%。
 | GEMM 类 | ~180（实测 6 类 157） | 150 | +30 | **P6'（微内核 70~74% → 85%）** |
 | Conv | **11.2（实测）** | 8 | +3 | 原 P1 **已否决**，只剩 epilogue 融合（P2） |
 | 逐元素 + 激活 | ~32 | 4.5 | +27 | **P1'**、P2、P3 |
-| Transpose | ~11 | 5 | +6 | P4 |
-| Where | ~5 | 0 | +5 | P3 |
-| GatherElements | ~2.5 | 0.6 | +2 | P5 |
-| LN/Softmax/GridSample/Reshape | ~20 | 14 | +6 | 暂不动 |
-| 合计 | ~262 | 189 | +73 | |
+| Transpose | ~11 → **7.5**（111 → 75 个） | 5 | +6 → +2.5 | P4 **已完成**；余项在 C 写面板 |
+| Where | **0.1** | 0 | — | P3 **已完成** |
+| GatherElements | ~2.5 | 0.6 | +2 | P5 判定不做 |
+| LN/Softmax/GridSample/Reshape | ~16（Reshape 4.4 → **0.2**） | 14 | +2 | Reshape **已完成**，其余暂不动 |
+| 合计 | ~245 | 189 | +56 | |
 
 结论一句话：**GEMM 占 69% 且只跑到 70~74% 峰值；Conv 只占 4.3%（原 27 ms 是折算错误）。
 真正的低成本机会在逐元素 32 ms，真正的上限在 GEMM 微内核。**
@@ -211,6 +214,56 @@ GEMM 满载 6 s 内 `% Processor Performance` 恒定 137.8（≈3.45 GHz）→ *
 
 详见 `bench.md §13`。
 
+### 4.9 P4：Transpose 折进 GEMM 的读面板，端到端 -4.5%
+
+先探针确认结构（原来想当然的 `Transpose[0,2,1,3] → MatMul` 并不存在）：
+
+```
+q[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─Mul(·,s)→ A ┐
+k[B,T,H,D] ─T[0,2,3,1]→ [B,H,D,T] ─Mul(·,s)→ B ┴→ MatMul      (QK^T)
+P[B,H,T,T]（Softmax）──────────────────────────→ A ┐
+v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→ B ┴→ MatMul  (PV)
+```
+
+- **做法**：`FuseTransposeIntoMatMul` 把转置换成 GEMM 的读 stride（A 行距 `H*D`、B 行距 1 或列距 `H*D`），
+  `gemm_view` 12 个整数驱动 `MatMulLayer` 的视图分支。
+- **`Mul(·, 1/√8)` 不折数值**：`s` 不是 2 的幂，`(q·s)·(k·s) ≠ s²(q·k)`，折进 B 打包就破坏逐位一致；
+  正确做法是把 `Mul` 的**输入**从转置输出改接到转置的源（乘标量与转置可交换，元素值逐个不变）。
+- **踩坑**：B 侧是裸 Transpose（PV）时，`matmul.Inputs[1]` 指向已被 drop 的层输出 → rfdetr 输出全错
+  （max|diff| 0.99），而 QK^T 单独折却完全正确、yolo 系 0 命中看起来「也一致」。
+  二分办法：临时用环境变量分别只折 `bTransposed==true/false`。修法是
+  `Inputs.Add(bScale?.Outputs[0] ?? bSource)`。
+- **结果**：Transpose 111 → 75（-36），命中 24 处；交替 A/B 有效 7 轮中位 **-4.5%**（234.1 → 223.7 ms），
+  最好 221.4 ms；5 模型 dump 逐位一致；yolo11n 持平（0 命中）。
+- **判定**：节点数 -32.4%（未到 40% 的初版线，剩下的在写面板/无 MatMul 消费者），端到端 -4.5% → **通过**。
+- **pass 顺序**：必须排在 `FuseAttention` 之后，否则合成 MHA 图被提前拆散
+  （单测 `attention: fused MHA matches onnxruntime` 直接失败）—— rfdetr 上两者不冲突（它 0 命中整块 MHA）。
+- **余项**：PV 输出 `Transpose[0,2,1,3] → Reshape` 可折进 **C 写面板**（12 个，约 1.4 ms）；
+  yolo 系的 attention 是 `[B,H,T,D]` 内的矩阵转置（A 列主序），要 A 双 stride，收益 0.5 ms，不做。
+
+详见 `bench.md §14`。
+
+### 4.10 P3/P5：Where 按行选择 + Reshape 零拷贝，合计 -2.0%
+
+两项都是「本来不该花这个时间」的开销：
+
+- **Where 2.6 → 0.1 ms**。形状 `cond[1,1024,1] + 标量 + [1,1024,256]`，每行 256 个元素共享一个
+  布尔值，原实现却逐元素 `CopyBytes`（每元素 3 次 `Span` 构造，10 ns/元素）。
+  新增 `ForwardRows`：尾维「条件广播 + 源连续或广播」时按行整段 memcpy / 按等宽整数 `Fill`。
+  填充用 `Span<short/int/long>.Fill` 而不是按 dtype 分派 —— float 的位模式按 int 填完全一样。
+- **Reshape 4.4 → 0.2 ms**（119 个，平均每次 3.6 MB 的整块 memcpy，纯浪费）。
+  `LayerInfo.InPlaceInput`（默认 -1）+ `BufferAllocator` 槽位共享：Reshape 的输出 arg 与输入 arg
+  共用一个槽（= 同一个 `Tensor` 对象），`Forward` 里 `ReferenceEquals` 直接 return。
+  两条安全前提缺一不可 —— **输入必须是中间结果**（图输入/常量改形状会污染调用方）、
+  **本 op 必须是该输入的最后读者**（否则下游读到被改过的形状）。`ONNXSHARP_NO_INPLACE=1` 可关闭。
+
+**测量教训（重要）**：端到端 bench 已经测不出这个量级的改动了。同一配置下「后跑的那个进程」
+平均慢 **11 ms（4.7%）**，比本轮收益还大；交替顺序反演（new 先跑 3 对 −15.6 ms、base 先跑 3 对
++6.4 ms）得 Δ ≈ −4.6 ms（−2.0%），与单项 profile 的 −2.5…−6.6 ms 吻合。
+**以后端到端只认 profile 的 sum-of-min（211.0 → 208.5 ms）**，bench 当粗筛。
+
+详见 `bench.md §15`。
+
 ---
 
 ## 5. 下一步（按 planv2 §4 执行）
@@ -227,8 +280,20 @@ GEMM 满载 6 s 内 `% Processor Performance` 恒定 137.8（≈3.45 GHz）→ *
 4. ~~P6'（GEMM 微内核）~~ **已完成两步**：MR=6（752 → 83.5%）与 MR=12（→ **92.2%**），
    端到端累计 **-9.8%**（246.0 → 221.8），逐位一致。**剩余上限约 4%**，只有 BLIS 式
    A 打包 + k 分块能把未打包路径（81.7%）拉平，暂不启动。
-5. **P3 / P5（随手项）**：`Where` 2.6 ms（逐元素 4 字节搬移 → 按行 memcpy）、
-   `Reshape` 4.4 ms（119 个 reshape 若是 view 应归零，先查为什么不是）。
+5. ~~P4（Transpose 折进 GEMM）~~ **已完成**：`bench.md §14`，rfdetr -4.5%（中位 234.1 → 223.7），
+   Transpose 111 → 75，5 模型逐位一致。
+6. ~~P3 / P5（Where + Reshape）~~ **已完成**：`bench.md §15`，Where 2.6 → 0.1 ms、Reshape 4.4 → 0.2 ms，
+   profile sum-of-min 211.0 → 208.5 ms（−2.0%），6 模型逐位一致。GatherElements（1.2 ms）
+   与 Softmax / FusedEltwise / GridSample 都已在访存上限，不做。
+7. **下一步候选**（按性价比排）：
+   - **P4 余项：C 写面板**。PV 输出的 `Transpose[0,2,1,3] → Reshape` 属于「写侧布局」，
+     让 GEMM 直接把 C 写到 `[B,T,H,D]` 布局，12 个节点约 1.4 ms（0.6%）。
+     代价是所有 MR×NR 微内核的 C 写要支持 stride，需新增一组写路径。
+   - **P6' 余项（BLIS 式 A 打包 + k 分块）**：上限约 4%，工程量最大，最后考虑。
+   - **`Operators.md` 的 dtype 矩阵自动生成**：把规范的 `T` 约束接进 `GetMemoryShapes` 的校验，
+     不做性能、只减少「某 dtype 悄悄走错分支」这类 bug（不排期）。
+   - **测量工具**：给 `bench` 加同进程交替 A/B（两次 `Bind` 换配置跑同一份输入），
+     否则 5% 以下的收益在本机永远测不准。
 
 ---
 
@@ -236,6 +301,26 @@ GEMM 满载 6 s 内 `% Processor Performance` 恒定 137.8（≈3.45 GHz）→ *
 
 ### 2026-11-15
 
+- **P3/P5：Where 按行选择 + Reshape 槽位复用**。Where（`cond[1,1024,1]` + 标量 + `[1,1024,256]`）
+  逐元素搬移 10 ns/元素 → 按行整段 memcpy / 等宽整数 `Fill`，**2.6 → 0.1 ms**；
+  Reshape 119 个整块 memcpy → `LayerInfo.InPlaceInput` + allocator 槽位共享（输出与输入同一个
+  Tensor，Forward 直接 return），**4.4 → 0.2 ms**。前提：输入是中间结果 + 本 op 是最后读者。
+  合计 profile sum-of-min 211.0 → 208.5（−2.0%）、yolo11n 36.9 → 36.5，6 模型逐位一致。
+  **教训**：本机端到端 A/B 的顺序偏差达 11 ms（后跑者慢 4.7%），5% 以下的收益只能靠
+  profile 的逐算子 min 求和判断。
+- **`Operators.md` 纳入文档体系**（`planv2.md §7`）。它是 ONNX 官方 `gen_doc.py` 生成的算子 schema
+  全文（默认域 210 个 + preview 2 + preview.training 8），**只读镜像、不手改**。
+  写清三条纪律：算子的语义/属性默认值/负数 axis 以它为准（不拿 ORT 当规范）、opset 差异查它的
+  changelog 段（`Slice`/`Squeeze`/`Softmax`/`Resize` 都改过语义）、形状推断差异先回它确认是否规范允许。
+  附实现覆盖：`LayerRegistry` 注册 88 个，命中规范表 **80** 个（8 个是别名/融合产物/ORT 贡献算子），
+  未实现 130 个以训练·序列·量化·控制流为主 —— 不做，等真实模型跑不通再说。
+- **P4：Transpose 折进 GEMM 读面板**。探针先推翻原设想（attention 的 A/B 各自还套着一个
+  `Mul(·, 1/√8)`），改为「折转置、留乘法、只把 Mul 的输入改接到源张量」；
+  `gemm_view` 12 元组 + `PackColumns(srcColStride)` 吃转置读。
+  Transpose **111 → 75**，命中 24 处，交替 A/B 中位 **-4.5%**（234.1 → 223.7 ms，7 轮有效），
+  最好 221.4 ms；5 模型 dump 逐位一致；yolo11n 0 命中（`[B,H,T,D]` 内的矩阵转置，需 A 双 stride，收益 0.5 ms 不做）。
+  教训：B 侧是裸 Transpose 时必须把输入换成源张量，否则视图层读到已删层留下的空槽 ——
+  **且这个 bug 只在 PV 上现形，QK^T 和 yolo 全是对的**，靠环境变量二分才定位到。
 - **P6' 第 2 步：微内核 MR 6→12**。新增 `Multiply12Rows`（24 累加器 = 27 ymm，按 `Avx512F.VL` 分派），
   打包路径 356.6 → **393.8 GFLOPS（92.2%）**，微基准 +11.2%；端到端 6 对交替 A/B 中位 **-5.4%**，
   最好 **221.8 ms**；与 MR=6 逐位一致。教训：12 个 bias 向量做成持久局部变量会溢出（只快 2%），

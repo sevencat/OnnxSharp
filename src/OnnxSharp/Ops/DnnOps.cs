@@ -1863,10 +1863,22 @@ internal static class DnnOps
         private static readonly bool TraceEnabled =
             Environment.GetEnvironmentVariable("ONNXSHARP_MM_TRACE") == "1";
 
+        /// <summary>
+        /// 转置视图（<c>gemm_view</c>，由 <see cref="GraphFusion"/> 折进来）：12 个整数
+        /// <c>[outer, inner, m, k, n, aOuter, aRow, aBatch, bOuter, bRow, bCol, bBatch]</c>。
+        /// <para>
+        /// attention 的 <c>[B,T,H,D] → Transpose[0,2,1,3] → [B,H,T,D]</c> 折进 GEMM 后，
+        /// 层拿到的仍然是<b>未转置</b>的源张量：A 的每行仍是 D 个连续 float，只是行距变成 H*D；
+        /// B（K^T）则是「行距 1、列距 H*D」的转置读法。省掉每层 3 次 65 KB 的整块搬运。
+        /// </para>
+        /// </summary>
+        private readonly long[] _view;
+
         public MatMulLayer(LayerParams parameters)
         {
             Type = parameters.Type;
             Name = parameters.Name;
+            _view = parameters.GetInts("gemm_view") ?? Array.Empty<long>();
         }
 
         /// <summary>由 <see cref="GraphFusion"/> 折进来的 bias add（见 <see cref="IBiasAddable"/>）。</summary>
@@ -1895,6 +1907,16 @@ internal static class DnnOps
         {
             var a = inShapes[0];
             var b = inShapes[1];
+
+            // 转置视图：输入是未转置的 [B,T,H,D]，逻辑上是 [B,H,T,D] × [B,H,D,T]。
+            if (_view.Length == 12)
+            {
+                outShapes.Add(new TensorShape(new[]
+                {
+                    (int)_view[0], (int)_view[1], (int)_view[2], (int)_view[4],
+                }));
+                return;
+            }
 
             if (a.Rank < 1 || b.Rank < 1)
                 throw new OnnxSharpException($"MatMul '{Name}': inputs must have rank >= 1");
@@ -1985,6 +2007,37 @@ internal static class DnnOps
             var columnBias = FusedBias is { } fusedBias && fusedBias.Count == n && n > 0
                 ? fusedBias.AsSpan<float>()
                 : default;
+
+            // 转置视图：源张量没被物化，按 stride 直接读（见构造函数注释）。
+            // 外层 batch（图像/样本那维）逐次派发，内层 head 一次摊平给批量内核。
+            if (_view.Length == 12)
+            {
+                int outer = (int)_view[0];
+                int inner = (int)_view[1];
+                int vm = (int)_view[2];
+                int vk = (int)_view[3];
+                int vn = (int)_view[4];
+                long aOuter = _view[5], aRow = _view[6], aBatchStride = _view[7];
+                long bOuter = _view[8], bRow = _view[9], bCol = _view[10], bBatchStride = _view[11];
+                int cBatch = vm * vn;
+
+                for (int o = 0; o < outer; o++)
+                {
+                    GemmKernel.MultiplyBatched(
+                        srcA.Slice((int)(o * aOuter)),
+                        srcB.Slice((int)(o * bOuter)),
+                        dst.Slice(o * inner * cBatch, inner * cBatch),
+                        inner, vm, vk, vn,
+                        columnBias: columnBias,
+                        aStride: (int)aRow, aBatchStride: (int)aBatchStride,
+                        bColStride: (int)bCol, bBatchStride: (int)bBatchStride, bStride: (int)bRow);
+                }
+
+                if (trace)
+                    Console.Error.WriteLine(
+                        $"MMv m={vm} k={vk} n={vn} bat={outer * inner} ms={swTrace!.Elapsed.TotalMilliseconds:F3} {Name}");
+                return;
+            }
 
             // B 没有 batch 维、A 也不做广播时，(batch, m) 可以合并成一个大 GEMM：
             // 两者拼起来正好是 [batches*m, k] × [k, n]，A/C 本来就是连续存放的。

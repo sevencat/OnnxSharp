@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 
@@ -280,6 +281,22 @@ internal static class BroadcastOps
             var stridesX = OpUtil.BroadcastStrides(x.Shape, dims);
             var stridesY = OpUtil.BroadcastStrides(y.Shape, dims);
 
+            // 按行快路径：条件在尾维上是广播的（一行共享一个 bool），而 x/y 在尾维上要么连续、
+            // 要么也是广播（标量/整行同值）—— 于是每行只需一次判定 + 一次 memcpy 或填充。
+            // rfdetr 的 Where 是 cond[1,1024,1] + 标量 + [1,1024,256]：逐元素要 2.6 ms，按行约 0.05 ms。
+            if (dims.Length > 0)
+            {
+                int last = dims.Length - 1;
+                if (dims[last] > 1
+                    && stridesC[last] == 0
+                    && (stridesX[last] == 0 || stridesX[last] == 1)
+                    && (stridesY[last] == 0 || stridesY[last] == 1))
+                {
+                    ForwardRows(condition, x, y, output, dims, stridesC, stridesX, stridesY, dims[last]);
+                    return;
+                }
+            }
+
             var mask = OpUtil.ReadBools(condition);
             var cursor = new int[dims.Length];
             long offsetC = 0, offsetX = 0, offsetY = 0;
@@ -305,6 +322,100 @@ internal static class BroadcastOps
                     offsetY -= (long)stridesY[axis] * dims[axis];
                     cursor[axis] = 0;
                 }
+            }
+        }
+
+        /// <summary>
+        /// 尾维整段同条件的循环：外层走 dims[0..^1]，内层一次写 <paramref name="inner"/> 个元素。
+        /// </summary>
+        private static void ForwardRows(
+            Tensor condition,
+            Tensor x,
+            Tensor y,
+            Tensor output,
+            int[] dims,
+            int[] stridesC,
+            int[] stridesX,
+            int[] stridesY,
+            int inner)
+        {
+            var mask = OpUtil.ReadBools(condition);
+            int es = output.DType.SizeOf();
+            var xBytes = x.Buffer.AsSpan(x.ByteOffset, x.ByteLength);
+            var yBytes = y.Buffer.AsSpan(y.ByteOffset, y.ByteLength);
+            var outBytes = output.Buffer.AsSpan(output.ByteOffset, output.ByteLength);
+
+            int colX = stridesX[^1];
+            int colY = stridesY[^1];
+            int outerRank = dims.Length - 1;
+            var cursor = new int[outerRank];
+            long outer = output.Count / inner;
+            long offsetC = 0, offsetX = 0, offsetY = 0, offsetOut = 0;
+
+            for (long row = 0; row < outer; row++)
+            {
+                var dst = outBytes.Slice((int)(offsetOut * es), inner * es);
+                if (mask[(int)offsetC])
+                    WriteRun(xBytes, (int)(offsetX * es), colX, dst, inner, es);
+                else
+                    WriteRun(yBytes, (int)(offsetY * es), colY, dst, inner, es);
+
+                offsetOut += inner;
+
+                for (int axis = outerRank - 1; axis >= 0; axis--)
+                {
+                    cursor[axis]++;
+                    offsetC += stridesC[axis];
+                    offsetX += stridesX[axis];
+                    offsetY += stridesY[axis];
+                    if (cursor[axis] < dims[axis])
+                        break;
+
+                    offsetC -= (long)stridesC[axis] * dims[axis];
+                    offsetX -= (long)stridesX[axis] * dims[axis];
+                    offsetY -= (long)stridesY[axis] * dims[axis];
+                    cursor[axis] = 0;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 写一行：<paramref name="colStride"/> 为 1 时整块拷贝，为 0 时把单个元素重复填满。
+        /// 填充按「等宽整数」做，位模式与 float/int64 一致，省掉按 dtype 分派。
+        /// </summary>
+        private static void WriteRun(
+            ReadOnlySpan<byte> src,
+            int byteOffset,
+            int colStride,
+            Span<byte> dst,
+            int count,
+            int es)
+        {
+            if (colStride != 0)
+            {
+                src.Slice(byteOffset, count * es).CopyTo(dst);
+                return;
+            }
+
+            var one = src.Slice(byteOffset, es);
+            switch (es)
+            {
+                case 1:
+                    dst.Fill(one[0]);
+                    return;
+                case 2:
+                    MemoryMarshal.Cast<byte, short>(dst).Fill(MemoryMarshal.Read<short>(one));
+                    return;
+                case 4:
+                    MemoryMarshal.Cast<byte, int>(dst).Fill(MemoryMarshal.Read<int>(one));
+                    return;
+                case 8:
+                    MemoryMarshal.Cast<byte, long>(dst).Fill(MemoryMarshal.Read<long>(one));
+                    return;
+                default:
+                    for (int i = 0; i < count; i++)
+                        one.CopyTo(dst.Slice(i * es, es));
+                    return;
             }
         }
     }

@@ -28,6 +28,9 @@ internal static class GraphFusion
             total += FuseQuantizedMatMul(net, graph);
         if (!Disabled("attention"))
             total += FuseAttention(net, graph);
+        // 放在 attention 之后：整块 MHA 先被 FuseAttention 吃掉，剩下的单点转置才轮到读面板。
+        if (!Disabled("attnview"))
+            total += FuseTransposeIntoMatMul(net, graph);
         if (!Disabled("layernorm"))
             total += FuseLayerNorm(net, graph);
 
@@ -1116,6 +1119,294 @@ internal static class GraphFusion
 
         graph.Reset(result);
         return fused;
+    }
+
+    /// <summary>
+    /// 把「转置后立刻喂给 MatMul」折成 GEMM 的**转置读视图**（planv2 的 P4）：
+    /// <code>
+    /// QK^T ：q[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─┐
+    ///        k[B,T,H,D] ─T[0,2,3,1]→ [B,H,D,T] ─┴→ MatMul   （B 行距 1、列距 H*D）
+    /// PV   ：P[B,H,T,T]（Softmax 输出，连续）───┐
+    ///        v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─┴→ MatMul   （B 行距 H*D、列距 1）
+    /// </code>
+    /// 折掉后 MatMul 直接吃未转置的源：A 的行距变成 H*D（行内仍是 D 个连续 float），
+    /// B 按对应的 stride 打包。rf-detr 每层少 3 个 1.5 MB 的整块转置。
+    /// <para>
+    /// <b>为什么逐位一致</b>：转置只改寻址不改元素，GEMM 用同样的 k 递推顺序读同样的值；
+    /// 外层 <c>Mul(·, 标量)</c> 只把输入改接到转置的源上（逐元素乘标量与转置可交换），
+    /// 每个元素的乘法与结果都不变。
+    /// </para>
+    /// <para>
+    /// 判据与 <see cref="FuseAttention"/> 一致：每条 Transpose 输出的**消费者唯一**
+    /// 且不是图输出，源张量是 4D 且 k/v 与 q 同形。
+    /// </para>
+    /// </summary>
+    private static int FuseTransposeIntoMatMul(NetImpl net, Graph graph)
+    {
+        var prog = graph.Prog;
+        var producerOf = new Dictionary<int, LayerInfo>();
+        var uses = new Dictionary<int, int>();
+
+        foreach (var op in prog)
+        {
+            foreach (var arg in op.Outputs)
+            {
+                if (!arg.IsEmpty)
+                    producerOf[arg.Idx] = op;
+            }
+
+            foreach (var arg in op.Inputs)
+            {
+                if (arg.IsEmpty)
+                    continue;
+                uses[arg.Idx] = uses.TryGetValue(arg.Idx, out int count) ? count + 1 : 1;
+            }
+        }
+
+        int Uses(Arg arg) => arg.IsEmpty ? 0 : uses.GetValueOrDefault(arg.Idx);
+        var graphOutputs = CollectOutputs(graph);
+
+        var replacements = new Dictionary<LayerInfo, LayerInfo>();
+        var drop = new HashSet<LayerInfo>();
+        int fused = 0;
+
+        // [B,T,H,D] → [B,H,T,D]（Q/K/V 的 head 重排）；[B,T,H,D] → [B,H,D,T]（K^T）
+        int[] permBhtd = { 0, 2, 1, 3 };
+        int[] permBhtdT = { 0, 2, 3, 1 };
+
+        // 可折的节点：单输出、唯一消费者、不是图输出
+        bool Foldable(LayerInfo op) =>
+            op.Outputs.Count == 1 && Uses(op.Outputs[0]) == 1 && !graphOutputs.Contains(op.Outputs[0].Idx);
+
+        // 剥一层「Transpose[perm]」或「Mul(Transpose[perm], 标量常量)」。
+        // 返回被折掉的 Transpose 与外层 Mul（若有），以及 Mul 里 Transpose 占的输入位。
+        bool TryPeel(Arg arg, int[] perm, out LayerInfo? trans, out LayerInfo? scale, out int slot)
+        {
+            trans = null;
+            scale = null;
+            slot = 0;
+
+            if (!producerOf.TryGetValue(arg.Idx, out var op) || !Foldable(op))
+                return false;
+
+            if (HasPerm(op, perm))
+            {
+                if (op.Inputs.Count != 1)
+                    return false;
+                trans = op;
+                return true;
+            }
+
+            if (op.Type != "Mul" || op.Inputs.Count != 2 || op.Outputs.Count != 1)
+                return false;
+
+            for (int i = 0; i < 2; i++)
+            {
+                if (!producerOf.TryGetValue(op.Inputs[i].Idx, out var inner)
+                    || !Foldable(inner)
+                    || inner.Inputs.Count != 1
+                    || !HasPerm(inner, perm))
+                    continue;
+                // 另一侧必须是标量常量，折掉转置后广播语义不变
+                if (net.GetArgData(op.Inputs[1 - i]).Const is not { Count: 1 })
+                    continue;
+                trans = inner;
+                scale = op;
+                slot = i;
+                return true;
+            }
+
+            return false;
+        }
+
+        // Transpose 的输出不是行主序连续；Mul 只要有一侧不连续，结果就不连续。
+        // 其余算子（逐元素 / Softmax / MatMul / Reshape …）都按连续行主序写。
+        bool IsRowMajor(Arg arg, int depth = 0)
+        {
+            if (depth > 4 || !producerOf.TryGetValue(arg.Idx, out var op))
+                return true;
+            if (op.Type == "Transpose")
+                return false;
+            if (op.Type == "Mul" && op.Inputs.Count == 2)
+                return IsRowMajor(op.Inputs[0], depth + 1) && IsRowMajor(op.Inputs[1], depth + 1);
+            return true;
+        }
+
+        bool TryShapeOfArg(Arg arg, out TensorShape shape)
+        {
+            if (producerOf.TryGetValue(arg.Idx, out var op))
+                return TryGetOutputShape(net, op, out shape);
+
+            var data = net.GetArgData(arg);
+            shape = data.Shape;
+            return data.HasShape && data.DType == DType.F32;
+        }
+
+        foreach (var matmul in prog)
+        {
+            if (matmul.Type != "MatMul" || matmul.Inputs.Count != 2 || matmul.Outputs.Count != 1)
+                continue;
+
+            // A：QK^T 的 q（Transpose[0,2,1,3]），或 PV 的 softmax 输出（本来就连续）。
+            // 外面可能还包一层 Mul(·, 标量常量)：把 Mul 的输入改接到转置的源上即可
+            // （逐元素乘标量与转置可交换，每个元素的乘法与结果逐位不变），Transpose 随之消失。
+            bool aFolded = TryPeel(matmul.Inputs[0], permBhtd, out var aTrans, out var aScale, out int aSlot);
+            if (!aFolded && !IsRowMajor(matmul.Inputs[0]))
+                continue;
+
+            // B：必须是转置视图 —— [B,T,H,D]→[B,H,D,T]（K^T，行距 1）
+            // 或 [B,T,H,D]→[B,H,T,D]（PV 的 V：行距 H*D、列距 1）
+            bool bTransposed;
+            LayerInfo? bTrans;
+            LayerInfo? bScale;
+            int bSlot;
+
+            if (TryPeel(matmul.Inputs[1], permBhtdT, out bTrans, out bScale, out bSlot))
+                bTransposed = true;
+            else if (TryPeel(matmul.Inputs[1], permBhtd, out bTrans, out bScale, out bSlot))
+                bTransposed = false;
+            else
+                continue;
+
+            Arg aSource = aFolded ? aTrans!.Inputs[0] : matmul.Inputs[0];
+            Arg bSource = bTrans!.Inputs[0];
+
+            if (!TryShapeOfArg(aFolded ? aTrans!.Outputs[0] : matmul.Inputs[0], out var aOut) || aOut.Rank != 4)
+                continue;
+            if (!TryShapeOfArg(bTrans.Outputs[0], out var bOut) || bOut.Rank != 4)
+                continue;
+            // A 的逻辑形状 [B,H,T,K] 与 B 的逻辑形状 [B,H,K,N] 必须是一套 B/H/T/K/N
+            if (aOut[0] != bOut[0] || aOut[1] != bOut[1] || aOut[3] != bOut[2])
+                continue;
+
+            if (!TryShapeOfArg(aSource, out var aSrcShape) || aSrcShape.Rank != 4)
+                continue;
+            if (!TryShapeOfArg(bSource, out var bSrcShape) || bSrcShape.Rank != 4)
+                continue;
+
+            // 源形状必须和 perm 对得上（[B,T,H,D]），否则 stride 会读错位置
+            if (aFolded
+                && (aSrcShape[0] != aOut[0] || aSrcShape[1] != aOut[2]
+                    || aSrcShape[2] != aOut[1] || aSrcShape[3] != aOut[3]))
+                continue;
+
+            if (bTransposed
+                ? bSrcShape[0] != bOut[0] || bSrcShape[1] != bOut[3] || bSrcShape[2] != bOut[1]
+                    || bSrcShape[3] != bOut[2]
+                : bSrcShape[0] != bOut[0] || bSrcShape[1] != bOut[2] || bSrcShape[2] != bOut[1]
+                    || bSrcShape[3] != bOut[3])
+                continue;
+
+            int outer = aOut[0];
+            int head = aOut[1];
+            int m = aOut[2];
+            int k = aOut[3];
+            int n = bOut[3];
+
+            int aOuter, aRow, aBatch;
+            if (aFolded)
+            {
+                // 源 [B,T,H,D]：T 方向 = H*D、head = D（A 的每行仍是 D 个连续 float）
+                aOuter = aSrcShape[1] * aSrcShape[2] * aSrcShape[3];
+                aRow = aSrcShape[2] * aSrcShape[3];
+                aBatch = aSrcShape[3];
+            }
+            else
+            {
+                // 连续 [B,H,T,K]
+                aOuter = aOut[1] * aOut[2] * aOut[3];
+                aRow = aOut[3];
+                aBatch = aOut[2] * aOut[3];
+            }
+
+            int bHeadStride = bSrcShape[2] * bSrcShape[3];                 // H*D
+            int bOuter = bSrcShape[1] * bHeadStride;                       // T*H*D
+            int bRow = bTransposed ? 1 : bHeadStride;                      // 沿 k 的步长
+            int bCol = bTransposed ? bHeadStride : 1;                      // 沿 n 的步长
+
+            var parameters = new LayerParams { Type = "MatMul", Name = matmul.Name };
+            parameters.Set("gemm_view", new long[]
+            {
+                outer, head, m, k, n,
+                aOuter, aRow, aBatch,
+                bOuter, bRow, bCol, bSrcShape[3],
+            });
+
+            if (LayerRegistry.Create("MatMul", parameters) is not Layer viewLayer)
+                continue;
+
+            // FuseMatMulBias 可能已经给这个 MatMul 挂上了按列 bias，必须带过去
+            if (matmul is IBiasAddable srcBias && viewLayer is IBiasAddable dstBias)
+                dstBias.FusedBias = srcBias.FusedBias;
+
+            // 外层 Mul 保留（它负责逐元素缩放），只有纯 Transpose 才把输入直接换成源张量
+            viewLayer.Inputs.Add(aScale?.Outputs[0] ?? aSource);
+            viewLayer.Inputs.Add(bScale?.Outputs[0] ?? bSource);
+            viewLayer.Outputs.Add(matmul.Outputs[0]);
+
+            // Transpose 的消费者改接到源张量：Mul 层的输入换掉，形状元数据随之更新
+            if (aScale is not null)
+            {
+                aScale.Inputs[aSlot] = aSource;
+                net.GetArgData(aScale.Outputs[0]).Shape = aSrcShape;
+            }
+
+            if (bScale is not null)
+            {
+                bScale.Inputs[bSlot] = bSource;
+                net.GetArgData(bScale.Outputs[0]).Shape = bSrcShape;
+            }
+
+            replacements[matmul] = viewLayer;
+            if (aTrans is not null)
+                drop.Add(aTrans);
+            drop.Add(bTrans);
+
+            if (VerboseFusion)
+                Console.Error.WriteLine($"[attnview] {matmul.Name}: {aOut} x {bOut} view m={m} k={k} n={n} bat={outer * head}");
+
+            fused++;
+        }
+
+        if (replacements.Count == 0)
+            return 0;
+
+        var result = new List<LayerInfo>(prog.Count);
+        foreach (var op in prog)
+        {
+            if (replacements.TryGetValue(op, out var replacement))
+            {
+                result.Add(replacement);
+                continue;
+            }
+
+            if (drop.Contains(op))
+                continue;
+
+            result.Add(op);
+        }
+
+        graph.Reset(result);
+        return fused;
+    }
+
+    /// <summary>读节点的 <c>perm</c> 属性（Transpose 专用）。</summary>
+    private static bool HasPerm(LayerInfo op, params int[] expected)
+    {
+        if (op.Type != "Transpose" || op.Parameters is null)
+            return false;
+
+        var perm = op.Parameters.GetInts("perm");
+        if (perm is null || perm.Length != expected.Length)
+            return false;
+
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (perm[i] != expected[i])
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>

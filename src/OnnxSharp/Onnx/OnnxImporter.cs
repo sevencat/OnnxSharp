@@ -56,6 +56,7 @@ internal static class OnnxImporter
 
             var parameters = BuildParameters(node);
             var layer = LayerRegistry.Create(node.OpType, parameters);
+            layer.Parameters = parameters;
 
             foreach (var name in node.Inputs)
                 layer.Inputs.Add(name.Length == 0 ? default : net.Require(name));

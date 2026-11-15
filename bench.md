@@ -1005,3 +1005,178 @@ $env:ONNXSHARP_GEMM_MR='6'                               # 退回 6 行内核
 打包路径 92.2%、未打包 81.7%（差 10 个点仍是「每帧重新打包动态 B」）。GEMM 总量按
 83.5% → 92% 折算还剩约 12 ms（端到端 ~5%），已经没有「两位数」的空间：
 再往上要靠 BLIS 式 A 打包 + k 分块把未打包路径也拉平，收益上限 10 ms 量级。
+
+---
+
+## 14. 2026-11-15 P4：把 attention 的 Transpose 折进 GEMM 的读面板（rfdetr −4.5%）
+
+### 14.1 结构（探针实测，不是猜的）
+
+`ONNXSHARP_DEBUG_FUSE=1` 打出 rf-detr 每层 encoder 的原始链：
+
+```
+q = Reshape(qproj)  [B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─Mul(·,s)→ A ┐
+k = Reshape(kproj)  [B,T,H,D] ─T[0,2,3,1]→ [B,H,D,T] ─Mul(·,s)→ B ┴→ MatMul     (QK^T)
+
+P = Softmax(QK^T)   [B,H,T,T] ───────────────────────────────────→ A ┐
+v = Reshape(vproj)  [B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→ B ┴→ MatMul  (PV)
+```
+
+`[B,T,H,D]` = `[4,257,6,64]`，每个转置都是 1.58 MB 的纯搬运（layer.3 的 2× 分辨率那层是
+`[1,1028,6,64]`；`B=4` 的层实际是 `[4,257,6,64]`）。全模型 111 个 Transpose，这条链占 48 个
+（每层 4 个：QK^T 的 A、B，PV 的 B，以及 PV 输出回 `[B,T,H,D]` 的那个）。
+
+### 14.2 做法
+
+`GraphFusion.FuseTransposeIntoMatMul`（`ONNXSHARP_NO_FUSE=attnview` 可单项关闭）：
+把 MatMul 的 A/B 换成「转置的源张量 + 一套 stride」，GEMM 直接按 stride 读，转置层删掉。
+放在 `FuseAttention` **之后** —— 否则合成 MHA 图会先被本 pass 拆散，`attention: fused MHA
+matches onnxruntime` 那个单测立刻失败（整块融合比单点折叠更值）。
+
+| 位置 | 折掉的转置 | `gemm_view` 里的读法 |
+|---|---|---|
+| QK^T 的 A | `[0,2,1,3]` | 行距 `H*D=384`、head 步长 `D=64`、outer 步长 `T*H*D`（每行仍是 64 个连续 float） |
+| QK^T 的 B | `[0,2,3,1]` | 行距 `1`、列距 `H*D=384`、head 步长 `D`（列方向 gather） |
+| PV 的 B | `[0,2,1,3]` | 行距 `H*D=384`、列距 `1`、head 步长 `D`（每行仍是 64 个连续 float） |
+| PV 的 A | 无需折 | Softmax 输出本来就连续，`aRow=K`、`aBatch=T*K` |
+
+内核侧的改动（上一轮已落地，本轮只是接上视图）：`PackColumns` 增加 `srcColStride`，
+`MultiplyColumnRange` / `MultiplyBatched` 增加 `aStride` / `bColStride` / `bStride`，
+`MatMulLayer` 读 `gemm_view`（12 个整数）走视图分支。默认参数下这些分支一条指令都不会多执行。
+
+**`Mul(·, s)` 保留，只换输入源。** `s = 1/√8 = 0.3536` 是常量，但
+`(q·s)·(k·s) ≠ s²·(q·k)` 在浮点上（`s` 不是 2 的幂，两次舍入 vs 一次），
+折进 B 打包就破坏了「逐位一致」。所以策略是：转置折掉、乘法留下 —— 把 `Mul` 的输入从
+「转置输出」改接到「转置的源」（逐元素乘标量与转置可交换，每个元素的乘法与结果逐个不变）。
+`Mul` 输出的物理布局随之从 `[B,H,T,D]` 变成 `[B,T,H,D]`，而视图层的 stride 正是按源布局写的。
+
+### 14.3 结果
+
+节点数：Transpose **111 → 75**（−36，即 12 层 × 3），融合命中 24 处（12 层 × 2 个 MatMul）。
+
+交替 A/B（同一个 exe，`ONNXSHARP_NO_FUSE=attnview` 关这条 pass；`--warmup 4 --iters 10`，12 轮）：
+
+| 轮 | 基线 min | 融合 min | 差 |
+|---:|---:|---:|---:|
+| 1 | 247.7 | 224.3 | −9.4% |
+| 2 | 254.3 | 223.2 | −12.2% |
+| 3 | 675.5 | 224.7 | 基线整轮降频，作废 |
+| 4 | 233.7 | 223.7 | −4.3% |
+| 5 | 254.6 | 368.0 | 融合整轮降频，作废 |
+| 6 | 233.8 | 223.2 | −4.5% |
+| 7 | 228.6 | 223.7 | −2.1% |
+| 8 | 446.3 | 221.4 | 基线整轮降频，作废 |
+| 9 | 1217.1 | 222.3 | 基线整轮降频，作废 |
+| 10 | 248.3 | 227.8 | −8.3% |
+| 11 | 234.1 | 247.4 | +5.7% |
+| 12 | 1056.3 | 247.9 | 基线整轮降频，作废 |
+
+有效 7 轮：配对中位 **−4.5%**（6/7 轮更快），中位耗时 234.1 → 223.7 ms，
+最好读数 228.6 → 221.4 ms（−3.1%）。
+
+yolo11n 持平（37.5/36.9、36.8/36.5、36.8/37.3，中位 36.8 → 36.9）—— 它 0 命中，见 14.7。
+
+> 环境：本机 `PROCTHROTTLEMIN=100`，`% Processor Performance` 在 137%（冷）与 35%（热）之间跳，
+> 12 轮里有 5 轮整轮不可用。判定用中位 + 最好读数，单轮数值不要单独引用。
+
+### 14.4 等价性
+
+5 个模型 `--dump` + MD5 与 `bench/ab/mr12_*` 逐位一致（rfdetr 的两个输出
+`359D8BA3…` / `687A1986…`；yolo11n / yolov8n / yolov8s / yolo11s 关/开融合同一 exe 比对）。
+
+### 14.5 踩到的坑：B 没有外层 Mul 时必须换输入源
+
+第一版把视图层的输入直接写成 `matmul.Inputs[1]`，对 QK^T 是对的（那里 `Inputs[1]` 是新的 `Mul` 输出，
+`Mul` 还活着），但对 PV 是错的：PV 的 B 是**裸的 Transpose**，融合时被 `drop` 掉，
+`matmul.Inputs[1]` 指向一个已经没有生产者的 arg —— 读到的是一块没人写的槽。
+
+症状很有欺骗性：**QK^T 单独折没问题，只有 PV 折了之后输出全错**（max |diff| ≈ 0.99，
+1200 个 float 全变），而 yolo 系 0 命中、看起来「也一致」。二分方式是加临时环境变量只启用
+`bTransposed==true` / `==false` 各跑一次。修正后：
+
+```csharp
+viewLayer.Inputs.Add(aScale?.Outputs[0] ?? aSource);   // 有外层 Mul 就用 Mul 的输出
+viewLayer.Inputs.Add(bScale?.Outputs[0] ?? bSource);   // 裸 Transpose 才直接用源张量
+```
+
+### 14.6 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'
+$cli='tools/OnnxSharp.Cli/bin/Release/net10.0/OnnxSharp.Cli.dll'
+$m='F:/code/TinyLabel/train/testrftedr/runs/rfdetr-small.onnx'
+$i='bench/inputs/i1x3x512x512.f32'
+
+# 命中数 / 命中详情
+$env:ONNXSHARP_DEBUG_FUSE='1'; dotnet $cli run $m --input $i      # 期望 24 行 [attnview]
+
+# 等价性
+$env:ONNXSHARP_NO_FUSE='attnview'; dotnet $cli run $m --input $i --dump bench/ab/dump-base
+Remove-Item Env:ONNXSHARP_NO_FUSE; dotnet $cli run $m --input $i --dump bench/ab/dump-new
+Get-FileHash bench/ab/dump-base/*.f32, bench/ab/dump-new/*.f32 -Algorithm MD5
+
+# A/B
+$env:ONNXSHARP_NO_FUSE='attnview'; dotnet $cli bench $m --input $i --warmup 4 --iters 10
+Remove-Item Env:ONNXSHARP_NO_FUSE; dotnet $cli bench $m --input $i --warmup 4 --iters 10
+```
+
+### 14.7 还剩什么
+
+- **attention 链里还剩 1 个/层**：PV 输出 `[B,H,T,D] → Transpose[0,2,1,3] → [B,T,H,D] → Reshape`
+  回 `[B,T,H*D]`。要折它得让 GEMM 的 **C 写面板**也带 stride（写 `[B,T,H,D]` 布局），
+  12 个节点约 1.4 ms（0.6%）。属于「输出侧折叠」，可以接着做。
+- **yolo 系 0 命中的原因**：ultralytics 的 attention 是 `[B,H,T,D]` 布局下的**矩阵转置**
+  （`perm=[0,1,3,2]`），它的 A 是列主序（行距 1、列距 T），当前内核的 A 只支持单一 `aRow`
+  （列步长固定 1）。要吃得下得给 12/6/4/1 行内核都加 A 的双 stride。但 yolo11n 里这 2 个
+  MatMul 一共占 1.4%（约 0.5 ms），**不值得**。
+- backbone / decoder 里剩下的 63 个 Transpose 没有 MatMul 消费者（是 `Reshape` 前的布局调整、
+  decoder 的 permute 等），不在 P4 范围。
+
+---
+
+## 15. 2026-11-15 P3/P5：Where 按行选择 + Reshape 零拷贝（合计 -2.0%）
+
+### 15.1 Where：2.6 ms → 0.1 ms
+
+rfdetr 里只有一个 Where，形状是 `cond Bool[1,1024,1]` + `x F32[]`（**标量**）+ `y F32[1,1024,256]`，
+即「每行 256 个元素共享一个条件值」。原实现是纯逐元素：每个元素一次 `OpUtil.CopyBytes`
+（内部两次 `Buffer.AsSpan` + `CopyTo`），1024×256 = 262144 次 → 2.6 ms，折合 4 GB/s。
+
+按行快路径（`WhereLayer.ForwardRows`）：尾维上「条件广播（stride 0）+ 两个源各自连续（1）或广播（0）」
+时，外层走 `dims[0..^1]`、内层一次写 256 个元素 —— 每行一次判定，然后整块 memcpy 或整行填充。
+填充用「等宽整数」`Span<short/int/long>.Fill`，位模式与 float/int64 完全一致，省掉按 dtype 分派。
+不满足条件的形状退回原逐元素路径（行为不变）。
+
+### 15.2 Reshape：4.3 ms → 0.2 ms（槽位复用，零拷贝）
+
+Reshape 只改形状标签，原实现却做整块 memcpy（119 个 reshape 共 4.3 ms，平均每次 3.6 MB）。
+
+新增 `LayerInfo.InPlaceInput`（默认 `-1`），`ReshapeLayer` 返回 `0`，`BufferAllocator` 让输出 arg
+与输入 arg **共用同一个槽**（槽 → Tensor 是一对一，于是两者是**同一个 Tensor 对象**），
+`ReshapeLayer.Forward` 里检测 `ReferenceEquals(inputs[0], outputs[0])` 直接 return。
+
+两条前提在 allocator 内检查，缺一就退回独立槽位：
+
+1. 输入必须是**中间结果**（`firstWrite != NeverWritten`）。图输入/常量有自己的存储，
+   改它们的形状会污染调用方的张量（同一份 buffer 被下一次 `Run` 复用）。
+2. 本算子必须是该输入的**最后读者**（`lastRead == i`）。否则下游读到的是被 Reshape 改过的形状
+   （数据没变、形状标签变了），形状推断会错位。
+
+动态形状的 Reshape 不复用（要 `Fit` 成不同大小）。`ONNXSHARP_NO_INPLACE=1` 可整体关闭。
+
+### 15.3 结果
+
+| 项 | 前 | 后 |
+|---|---:|---:|
+| Where ×1 | 2.6 ms | 0.1 ms |
+| Reshape ×119 | 4.3 ms | 0.2 ms |
+| profile sum-of-min | 211.0 ms | 208.5 ms |
+| yolo11n sum-of-min | 36.9 ms | 36.5 ms（Reshape 6 个 0.3 → 0.0） |
+
+**端到端 bench 已经测不动了**：本机同一配置下「后跑的那个进程」平均慢 11 ms（4.7%），
+比本轮收益还大。用 6 对交替顺序反演（new 先跑的 3 对合计 −15.6 ms、base 先跑的 3 对 +6.4 ms）
+得到 Δ ≈ **−4.6 ms（−2.0%）**，与单项 profile 的 −2.5…−6.6 ms 一致。
+**以后端到端结论以 profile 的 sum-of-min 为准**，bench 只用来做「有没有大回归」的粗筛。
+
+一致性：rfdetr 两个输出 + 4 个 yolo 模型（`ONNXSHARP_NO_INPLACE` 关/开）逐位一致；
+单测 116/118 passed, 0 failed。

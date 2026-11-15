@@ -14,6 +14,10 @@ internal static class ShapeOps
     /// <summary>Concat 低于该元素数时不开线程（拷贝太小，调度开销盖过收益）。</summary>
     private const int ParallelConcatThreshold = 1 << 16;
 
+    /// <summary><c>ONNXSHARP_NO_INPLACE=1</c> 关掉 Reshape 的槽位复用（A/B 与排查用）。</summary>
+    internal static readonly bool NoInPlace =
+        Environment.GetEnvironmentVariable("ONNXSHARP_NO_INPLACE") is { Length: > 0 };
+
     public static void Register()
     {
         LayerRegistry.Register("Reshape", p => new ReshapeLayer(p));
@@ -124,13 +128,30 @@ internal static class ShapeOps
         public override bool DynamicOutputShapes()
             => Inputs.Count > 1 && Inputs[1].Idx != 0 && !IsConstInput(1);
 
+        /// <summary>
+        /// Reshape 只改形状标签、不动数据，所以让输出直接复用输入的槽位 ——
+        /// 省掉每帧那次「元素数完全一样」的整块 memcpy（rfdetr 119 个共 4.3 ms）。
+        /// 动态形状时要 <c>Fit</c> 成不同大小，不能复用。
+        /// <c>ONNXSHARP_NO_INPLACE=1</c> 可关掉，用来做 A/B 或排查。
+        /// </summary>
+        public override int InPlaceInput => NoInPlace || DynamicOutputShapes() ? -1 : 0;
+
         public override void Forward(
             IReadOnlyList<Tensor> inputs,
             IReadOnlyList<Tensor> outputs,
             IReadOnlyList<Tensor> temps)
         {
             if (DynamicOutputShapes())
+            {
                 outputs[0].Fit(Resolve(inputs[0].Shape, OpUtil.ReadInts(inputs[1])), inputs[0].DType);
+                OpUtil.CopyBytes(inputs[0], 0, outputs[0], 0, inputs[0].Count);
+                return;
+            }
+
+            // 同槽位（in-place）：输出与输入是同一个 Tensor，形状已在 BindArgTensor 里 Fit 好，
+            // 数据一个字节都不用动。
+            if (ReferenceEquals(inputs[0], outputs[0]))
+                return;
 
             OpUtil.CopyBytes(inputs[0], 0, outputs[0], 0, inputs[0].Count);
         }

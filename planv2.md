@@ -202,7 +202,7 @@ MatMul 几百层、Conv 只有 9 层，被放大倍数不同，占比必然失�
 而三条 Conv 路径（`PackedConv`/`Winograd`/`Im2Col`）都要改 —— 投入产出比为负。
 **不做。**
 
-### P3 逐元素碎片与折叠漏网（预期 -2.5 ms，rfdetr -1%）
+### P3 逐元素碎片与折叠漏网（**已完成**，Where 2.6 → 0.1 ms）
 
 **事实**（`bench.md §11` 复测后）：`Where 1 个 2.6 ms`、`Div 7 个 0.7 ms`、`Mul 4.9 ms`（已贴带宽）、
 `Add 1.2 ms`（106 GB/s，无可优化）。
@@ -214,34 +214,54 @@ MatMul 几百层、Conv 只有 9 层，被放大倍数不同，占比必然失�
 - `Mul/Add` 已无空间：`Add` 106 GB/s 就是这台机器的带宽上限，`Mul` 的 31 GB/s 是缓存不命中导致，
   要改只能改调度顺序，收益不可预期。
 
-**判定**：`Where` 从 2.6 ms 降到 ≤ 0.2 ms，逐位一致。
+**实测**（`bench.md §15.1`）：`WhereLayer.ForwardRows` —— 尾维「条件广播 + 源连续或广播」时，
+外层走 `dims[0..^1]`、内层整段 memcpy 或按等宽整数 `Fill`。**2.6 → 0.1 ms**，逐位一致。
+（常量折叠那条没查：收益已经在手，ORT 的 0 另有原因 —— 它把这条链整体优化掉了，属于另一个话题。）
 
-### P4 Transpose 合并进 GEMM 的读面板（预期 -6 ms，rfdetr -2.4%）
+**判定**：≤ 0.2 ms 达标。
+
+### P4 Transpose 合并进 GEMM 的读面板（**已完成**，实测 rfdetr -4.5%，好于预期）
 
 **事实**：111 个 Transpose 共 11 ms（0.1 ms/个），ORT 5 ms。已是 8×8 向量分块 + 同布局
 memcpy 快路径，单算子再优化空间小。
 
-**做法**：attention 的 `[B,H,T,D] ↔ [B,T,H,D]` 转置后面紧跟 GEMM。把转置**折进**
-`MultiplyPacked` 的 A 面板打包（读的时候就按目标布局 gather），省掉一次完整读写。
-只对"转置的唯一消费者是 GEMM"的模式生效。
+**做法**（已落地，`bench.md §14`）：`GraphFusion.FuseTransposeIntoMatMul` 把 attention 的
+`[B,H,T,D] ↔ [B,T,H,D]` 转置折成 GEMM 的读 stride（A 行距 `H*D`、B 行距 1 / 列距 `H*D`），
+转置层直接删掉。外层的 `Mul(·, 1/√8)` **不折数值**（`(q·s)·(k·s) ≠ s²(q·k)`，会破坏逐位一致），
+只把它的输入从「转置输出」改接到「转置的源」。
 
-**判定**：Transpose 节点数减少 ≥ 40%，端到端 ≥ -1.5%。
+**实测**：Transpose **111 → 75**（−32.4%，12 层 × 3），命中 24 处；交替 A/B 有效 7 轮
+中位 **−4.5%**（234.1 → 223.7 ms），最好读数 221.4 ms（−3.1%）；5 模型逐位一致。
 
-### P5 小算子批量化（随手项，合计上限 -1%）
+**判定**：节点数 32.4% 未达 40%，但端到端 −4.5% 远超 −1.5% 的门槛，**通过**。
+没到 40% 的原因：剩下的 36 个里 12 个是 PV 输出回 `[B,T,H,D]` 的转置（属于**写**面板，
+不在本项范围），其余 63 个没有 MatMul 消费者。
+
+**新识别出的余项**（可并入 P5 随手项）：PV 输出的 `Transpose[0,2,1,3] → Reshape`
+可以折进 GEMM 的 **C 写面板**（12 个节点，约 1.4 ms，0.6%）。
+yolo 系 attention 是 `[B,H,T,D]` 内的矩阵转置（`perm=[0,1,3,2]`），A 列主序，
+需要内核支持 A 的双 stride —— 收益只有 0.5 ms，**不做**。
+
+### P5 小算子批量化（**Reshape 已完成**，其余不做）
 
 `bench.md §11` 复测后剩下的都是小项：
 
-| 算子 | ops | ms | 备注 |
-|---|---:|---:|---|
-| Transpose | 111 | 10.5 | 见 P4，单算子 0.09 ms 已是分块 + memcpy 快路径 |
-| Softmax | 18 | 7.9 | 36.3 M 元素 / 415 MB → 52 GB/s，已接近带宽 |
-| Reshape | 119 | 4.4 | **可疑**：119 个 reshape 若都是 view 应该 ~0，实测 37 µs/个 |
-| FusedEltwise | 12 | 4.2 | — |
-| GridSample | 3 | 3.5 | — |
-| Where | 1 | 2.6 | 见 P3 |
-| GatherElements | 24 | 1.2 | 逐元素搬移，和 `Where` 同源 |
+| 算子 | ops | ms（前） | ms（后） | 备注 |
+|---|---:|---:|---:|---|
+| Transpose | 111→75 | 10.5 | 7.5 | 见 P4，单算子 0.09 ms 已是分块 + memcpy 快路径 |
+| Softmax | 18 | 7.9 | 7.9 | 36.3 M 元素 / 415 MB → 52 GB/s，已接近带宽 |
+| Reshape | 119 | 4.4 | **0.2** | **已完成**：槽位复用，见 `bench.md §15.2` |
+| FusedEltwise | 12 | 4.2 | 4.2 | 无对应 ORT 项，但已是按行算子的直写，空间不大 |
+| GridSample | 3 | 3.5 | 3.5 | 双线性插值的 gather，改不动 |
+| Where | 1 | 2.6 | **0.1** | 见 P3 |
+| GatherElements | 24 | 1.2 | 1.2 | 76800 次 gather；idx 任意排列，没有向量化空间，**不做** |
 
-`Reshape` 那 4.4 ms 最值得顺手看一眼（view 化后应该归零）。除此之外单项都不超过 2%。
+**Reshape 的做法**（这是本项唯一值得做的）：`LayerInfo.InPlaceInput` + `BufferAllocator` 的槽位共享，
+让 Reshape 的输出与输入是同一个 Tensor，Forward 直接 return —— 4.4 → 0.2 ms。
+安全前提（输入是中间结果、本 op 是最后读者）见 `bench.md §15.2`。
+
+剩下的 Softmax / FusedEltwise / GridSample / GatherElements 单项都 < 2%，且都已在带宽或访存模式的上限，
+**不再做**。
 
 ### P6' GEMM 微内核（唯一大项，进行中）
 
@@ -305,8 +325,8 @@ memcpy 快路径，单算子再优化空间小。
 ```
 P0（测量）──┬─→ P6'（GEMM 微内核）── MR=6（-5.0%）+ MR=12（-5.4%）已完成，累计 -9.8%
             │                        └→ 余项：BLIS 式 A 打包（上限 ~4%）
-            ├─→ P4（Transpose 折进 GEMM，-2.4%）
-            └─→ P3 / P5（Where + Reshape，随手项，合计 -2%）
+            ├─→ P4（Transpose 折进 GEMM）**已完成 -4.5%**；余项：C 写面板 12 个转置（~0.6%）
+            └─→ P3 / P5（Where 2.6→0.1 + Reshape 4.4→0.2）**已完成 -2.0%**
 已关闭：P1（Conv，11.2 ms）、P1'（逐元素，12 ms）、P2（Relu/Silu 融合，0.4 ms）、
         P6（并行粒度，线性）、内存复用（Fit bug 已修）
 ```
@@ -326,3 +346,54 @@ P2 只改卷积 epilogue，与 Conv 内核本身无关（内核已 79% 效率，
 3. 4 模型 `max|diff| = 0` 的比对结果
 4. `progressv2.md` 追加一条日志
 5. 若被否决，写进 `bench.md` 的「否决记录」并说明测量方式 —— 否决本身也是资产
+
+---
+
+## 7. 算子语义参考：`Operators.md`
+
+根目录 `Operators.md`（1.4 MB / 48834 行）是 **ONNX 官方 `onnx/defs/gen_doc.py` 自动生成的算子
+schema 全文镜像**，不是本项目写的文档。因此 **只看不改**：要改请回 onnx 仓库改 `defs/` 里的算子
+定义后重新生成，否则下次同步就被覆盖。
+
+覆盖范围：
+
+| 域 | 算子数 | 与本项目的关系 |
+|---|---:|---|
+| `ai.onnx`（默认） | **210** | 唯一实际导入的域 |
+| `ai.onnx.preview` | 2 | `FlexAttention`（experimental），不导入 |
+| `ai.onnx.preview.training` | 8 | Adagrad / Adam / Gradient / Momentum 等，训练用，不导入 |
+
+每个条目给出：输入输出（含可选输入与变长输入）、全部属性（名字 / 类型 / 默认值 / 允许值）、
+类型约束（`T` 绑定的元素类型集合）、shape inference 说明，以及**逐 opset 的差异**
+（`since_version` 列表 + `Changelog.md#Op-13` 形式的链接）。
+
+### 7.1 三条使用纪律
+
+1. **语义的唯一裁决者**。实现/修某个算子前先读它的条目：输入顺序、属性默认值、`axis` 的负数含义、
+   广播规则、`ceil_mode`/`count_include_pad` 这类细节，**以本文档为准**，不去猜、也不把 ORT 的
+   实现当规范（ORT 有偏离规范的历史 bug）。与本文档冲突的「优化」一律当成 bug。
+2. **版本差异查表**。同一个算子在不同 opset 下语义会变，典型：`Slice` 10 起 `starts/ends/axes/steps`
+   从属性变输入；`Squeeze`/`Unsqueeze` 13 起 `axes` 变输入；`Softmax`/`LogSoftmax` 13 起从
+   「按 axis 展平后归一」改成「只沿 axis 归一」；`Resize` 11/13/18 三次改坐标变换；
+   `LayerNormalization` 17 才进规范。导入器里每个 `IsSince(op, n)` 分支都应对着 changelog 写，
+   不要凭印象。
+3. **形状推断的对照物**。`dump-graph` 的 Arg shape 与 `onnx.shape_inference` 不一致时，先回本文档
+   确认是规范允许的不确定性（`Reshape` 的 `-1`/`0`、`NonZero`/`Compress` 的动态维、`If` 分支形状）
+   还是我们的 bug。
+
+### 7.2 实现覆盖（210 → 80）
+
+`LayerRegistry` 当前注册 **88** 个名字，与默认域规范表对比如下：
+
+| 项 | 个数 | 说明 |
+|---|---:|---|
+| 命中规范表 | **80** | 真正实现了的 ONNX 算子 |
+| 不在规范表内 | 8 | `Silu`（导出器别名，规范里叫 `Swish`）、`FusedEltwise` / `FusedAttention` / `DflSoftmax`（融合产物，无 ONNX 对应）、`DynamicQuantizeMatMul` / `QLinearAdd` / `QLinearSigmoid` / `MatMulArgMax`（ORT 贡献算子或融合标记） |
+| 未实现 | 130 | 训练/序列/量化/字符串/随机/控制流为主：`GRU` `LSTM` `RNN` `Loop` `If` `Scan` `NonMaxSuppression` `QLinearMatMul` `StringSplit` `RandomUniform` `Sequence*` `Optional*` …；另有少量可拼出来的激活（`Gelu` `LeakyRelu` `HardSwish` `PRelu` `Elu` `Mish`） |
+
+- **未实现算子的行为**：`LayerRegistry.Create` 直接抛 `op type 'X' is not registered`，fail-fast，
+  不静默退化成一个「大概对」的参考实现。
+- **为什么不追全 210 个**：主战场是检测/分割模型导出的算子集，剩下 130 个里绝大多数在推理图里
+  根本不会出现；新增算子的触发条件永远是「有真实的 onnx 跑不通」，而不是「规范里还有 130 个没写」。
+- **待办（不排期）**：用 `Operators.md` 的 `T` 类型约束自动生成 dtype 支持矩阵，比手写表可靠；
+  也顺带能校验 `GetMemoryShapes` 的边界条件与规范一致。

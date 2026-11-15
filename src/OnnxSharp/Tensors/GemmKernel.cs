@@ -230,7 +230,8 @@ internal static class GemmKernel
         if (bBatchStride <= 0)
             bBatchStride = k * n;
 
-        if (k <= 0 || (batches == 1 && aStride == k && bColStride == 1))
+        // 快速路径只在「A、B 都是紧密行主序」时成立（视图路径的 bStride 可能是 H*D ≠ n）
+        if (k <= 0 || (batches == 1 && aStride == k && bColStride == 1 && bStride == n))
         {
             for (int bi = 0; bi < batches; bi++)
             {
@@ -737,8 +738,8 @@ internal static class GemmKernel
             {
                 float* src = b + (long)t * srcStride;
                 float* dst = pack + (long)t * packStride;
-                for (int j = 0; j < width; j++)
-                    dst[j] = src[(long)j * srcColStride];
+                for (int c = 0; c < width; c++)
+                    dst[c] = src[(long)c * srcColStride];
             }
 
             return;
@@ -746,6 +747,7 @@ internal static class GemmKernel
 
         int j = 0;
 
+        // 常见路径（常量权重 / 行距连续）：保持原样，一点额外开销都不加
         for (; j + 8 <= width; j += 8)
         {
             for (int t = 0; t < k; t++)

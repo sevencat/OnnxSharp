@@ -58,6 +58,28 @@ public static class BufferAllocator
 
         var (firstWrite, lastRead) = Analyze(prog, graphOutputs, argCount);
 
+        // in-place 标注：输出 arg → 可复用的输入 arg（只给「不写数据」的算子，见 LayerInfo.InPlaceInput）。
+        // 两条硬性前提缺一不可：输入是中间结果（图输入/常量有自己的存储，改了会污染调用方），
+        // 且本算子是它的最后读者（否则下游会读到被改过的形状）。
+        var inPlaceOf = new int[argCount];
+        Array.Fill(inPlaceOf, -1);
+        for (int i = 0; i < prog.Count; i++)
+        {
+            var op = prog[i];
+            int which = op.InPlaceInput;
+            if (which < 0 || which >= op.Inputs.Count || op.Outputs.Count != 1)
+                continue;
+
+            int src = op.Inputs[which].Idx;
+            int dst = op.Outputs[0].Idx;
+            if ((uint)src >= (uint)argCount || (uint)dst >= (uint)argCount || src == dst)
+                continue;
+            if (firstWrite[src] == NeverWritten || lastRead[src] != i)
+                continue;
+
+            inPlaceOf[dst] = src;
+        }
+
         // 收集需要槽的 Arg，按首次写入顺序排序（同序号按 idx，保证确定性）。
         var order = new List<int>();
         for (int i = 0; i < argCount; i++)
@@ -75,6 +97,16 @@ public static class BufferAllocator
         {
             int start = firstWrite[idx];
             int end = Math.Max(lastRead[idx], start);
+
+            // in-place：直接挂在源 arg 的槽上，并把槽的释放时间延到本 arg 的最后一次读。
+            if (inPlaceOf[idx] >= 0 && slotOf[inPlaceOf[idx]] >= 0)
+            {
+                int shared = slotOf[inPlaceOf[idx]];
+                slotOf[idx] = shared;
+                if (slotFreeAt[shared] < end)
+                    slotFreeAt[shared] = end;
+                continue;
+            }
 
             int chosen = NoSlot;
             int bestFree = int.MinValue;

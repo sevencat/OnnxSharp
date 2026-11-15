@@ -15,6 +15,13 @@ public class LayerInfo
     /// <summary>权重（ONNX initializer）。</summary>
     public List<Tensor> Blobs = new();
 
+    /// <summary>
+    /// 导入时的节点属性（<c>perm</c> / <c>axis</c> / <c>eps</c> 等）。
+    /// 只在图级融合里用：融合 pass 需要判断「这个 Transpose 到底是哪个 perm」，
+    /// 而 <see cref="Layer"/> 实例里这些值已经被拆成私有字段了。
+    /// </summary>
+    public LayerParams? Parameters { get; internal set; }
+
     public List<Arg> Inputs = new();
 
     public List<Arg> Outputs = new();
@@ -98,6 +105,21 @@ public class LayerInfo
 
     /// <summary>输出形状依赖运行时数值（如 Where/Expand/ConstantOfShape）。</summary>
     public virtual bool DynamicOutputShapes() => false;
+
+    /// <summary>
+    /// 允许「输出直接复用第 N 个输入的缓冲」的算子在这里返回 N，其他返回 -1。
+    /// <para>
+    /// 只给**不写数据**的纯布局变换用（目前只有 <c>Reshape</c>）：输出 arg 与输入 arg 共用同一个槽，
+    /// 于是 <c>Forward</c> 里那次「形状没变、只是搬一遍」的整块 memcpy 直接消失。
+    /// rfdetr-small 有 119 个 Reshape，合计 4.3 ms（1.8%）。
+    /// </para>
+    /// <para>
+    /// 安全前提由 <see cref="Engine.BufferAllocator"/> 检查：输入必须是中间结果（不是图输入/常量，
+    /// 否则会改掉调用方的张量形状）、且本算子必须是该输入的**最后读者**（否则下游会读到被改过的形状）。
+    /// 任何一条不满足就退回独立槽位，行为与原来一致。
+    /// </para>
+    /// </summary>
+    public virtual int InPlaceInput => -1;
 
     /// <summary>
     /// 只凭输入<b>形状</b>（不需要输入数值）就能算出常量结果的算子在这里实现。
