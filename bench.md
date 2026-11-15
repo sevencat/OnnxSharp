@@ -1180,3 +1180,71 @@ Reshape 只改形状标签，原实现却做整块 memcpy（119 个 reshape 共 
 
 一致性：rfdetr 两个输出 + 4 个 yolo 模型（`ONNXSHARP_NO_INPLACE` 关/开）逐位一致；
 单测 116/118 passed, 0 failed。
+
+---
+
+## 16. 2026-11-16 全引擎对比（P6' + P4 + P3 + P5 汇总成绩）
+
+四引擎同会话、同机、4 线程、静态 batch=1、FP32、输入全 0.5、预热后取 N 次，只统计纯前向。
+**median（ms）**：
+
+| 模型 | onnxsharp | onnxruntime-cpu | opencv-dnn | simdyolo |
+|---|---:|---:|---:|---:|
+| yolov8n | **43.0** | 27.9 | 50.3 | 33.0 |
+| yolo11n | **37.2** | 23.4 | 46.3 | 30.4 |
+| yolov8s | **116.2** | 77.0 | 138.5 | 82.1 |
+| yolo11s | **108.6** | 67.3 | 133.2 | 77.9 |
+| rfdetr-small | **217.4** | 188.8 | 326.0 | N/A |
+
+### 16.1 与冻结基线比（`progressv2 §2`，2026-11-15）
+
+| 模型 | 基线 | 现在 | 变化 | vs ORT（前 → 后） |
+|---|---:|---:|---:|---:|
+| yolov8n | 46.0 | 43.0 | **−6.5%** | 1.63× → **1.54×** |
+| yolo11n | 39.1 | 37.2 | **−4.9%** | 1.66× → **1.59×** |
+| yolov8s | 121.0 | 116.2 | **−4.0%** | 1.58× → **1.51×** |
+| yolo11s | 111.7 | 108.6 | **−2.8%** | 1.72× → **1.61×** |
+| rfdetr-small | 262.5 | 217.4 | **−17.2%** | 1.39× → **1.15×** |
+
+- rfdetr 的 −17.2% = P6'（MR=6/12，−9.8%）+ P4（Transpose 折进 GEMM，−4.5%）+ P3/P5（Where + Reshape，−2.0%）。
+- yolo 系只吃到 −3…−7%：它们的 GEMM 占比低，且 attention 是 `[B,H,T,D]` 内的矩阵转置（P4 0 命中）；
+  Reshape/Where 在 yolo 里本来就小（yolo11n 的 Reshape 只有 0.3 ms）。
+- **对 OpenCV dnn 全面领先**（0.67× ~ 0.85×）；**对 SimdYolo 仍慢 22%~42%**（1.22× ~ 1.42×），
+  差距主要在 GEMM 与 Conv 的打包/微内核，不在算子覆盖率。
+
+### 16.2 测量注意（这次又踩到了）
+
+`run_all.py` 的轮转只能部分抵消顺序偏置：`--runtimes` 多引擎一起跑时，**后跑的引擎会被前面
+引擎的余热拖慢**，本轮就出现过 ORT 的 rfdetr median 254.8（而 min 189.9）、我们自己的 rfdetr
+median 337.9（min 243.1）这种自相矛盾的数字 —— 同一个引擎 min 与 median 差 100 ms 时，
+**该轮数据必须作废，改用单引擎独立重测**。
+
+最终做法：**每个引擎单独一次会话、跑前冷却 25~40 s、`% Processor Performance` 确认回到 137%+**，
+取该引擎自己的最好 median。上表即按此口径重测（rfdetr：ours 217.4/214.1、ORT 188.8/186.7；
+SimdYolo s 档：82.1/75.4 与 77.9/75.9）。
+
+> `bench/results/latest.json` 每次运行会被覆盖，只保留最后一次的成绩；本表是 6 次独立运行的汇总。
+
+### 16.3 新发现：yolo 系的瓶颈是 Conv，不是 GEMM（P1 的否决只在 rfdetr 成立）
+
+`profile yolo11n`（4 线程，sum-of-min 36.4 ms）：
+
+| 类型 | ops | min ms | share |
+|---|---:|---:|---:|
+| **Conv** | 87 | **30.7** | **84.4%** |
+| Concat | 23 | 1.9 | 5.3% |
+| MaxPool | 3 | 1.0 | 2.8% |
+| Split | 11 | 0.6 | 1.7% |
+| 其余（Mul/Softmax/Add/Resize/MatMul/Transpose…） | — | 1.9 | 5.2% |
+
+ORT 整个 yolo11n 只花 23.4 ms —— 也就是说**我们光 Conv 就比 ORT 的全模型还慢 7 ms**。
+`planv2` 里 P1「Conv 低线程效率」被否决的依据是「Conv 实测 11.2 ms（4.3%）」，
+那个数字是 **rfdetr-small** 的（DETR 的 backbone 轻、GEMM 重）；**yolo 系完全相反**：
+Conv 占 84%，是唯一的主项。
+
+结论：
+- **rfdetr 的路线（GEMM 微内核 + 融合）不该往 yolo 上套**，yolo 要提速只能改 Conv。
+- 87 个 Conv 里最大单个才 1.94 ms（`model.3/conv`），是**大量中等尺寸 conv 的效率问题**，
+  不是某个巨大 conv；对应的是 Winograd/Im2Col 的选择阈值与打包开销，属于 P1 的原始议题，
+  但需要按 yolo 的形状分布重做一遍（rfdetr 形状太少，当时的结论不适用）。
+- 这一项未排期：当前阶段目标是 rfdetr ≤210（差 3.5%）。

@@ -318,6 +318,98 @@ yolo 系 attention 是 `[B,H,T,D]` 内的矩阵转置（`perm=[0,1,3,2]`），A 
 只在确实出现「块数 < 线程数」的具体 kernel 上单独处理，并且必须有微基准数据支撑。
 **收益预期从「结构性」下调为 0~2%，移出主线。**
 
+### P7 对照 ORT 1.32 源码（**参照清单，未排期**）
+
+源码：`F:/code/onnxruntime-1.32.0/onnxruntime`（2026-11-16 通读 MLAS + CPU EP）。
+
+#### P7.0 先纠正三个假设（否则会照着错的靶子优化）
+
+| 曾经的猜测 | 实际 |
+|---|---|
+| ORT 的 Conv 靠 oneDNN | **CPU EP 里没有 oneDNN**：`core/providers/cpu` 全目录 `use_dnnl\|UseDnnl\|dnnl::` 0 命中；dnnl 是独立可选 EP（`core/providers/dnnl/`），要单独编译并显式挂载 |
+| ORT 的 3×3 走 Winograd/FFT | **没有**：`core/mlas/lib` 里 `Winograd\|Fft\|Fourier` 0 命中 |
+| ORT 用了 AMX 的 float 算力 | **没有**：`core/mlas/lib/platform.cpp:842` 只把 AMX 接到 `MlasGemmU8S8DispatchAmx`（int8 专用） |
+
+结论：ORT 的 Conv 优势**全部来自布局与循环结构**，不是算法。
+
+#### P7.1 它实际怎么做（对照我们的实现）
+
+| 维度 | ORT | 我们 | 差距 |
+|---|---|---|---|
+| 布局 | **NCHWc(16)** 图级布局传播（`core/optimizer/nchwc_transformer.cc:83`，仅在收益为正时插 reorder） | NCHW | 见 §P7.4 否决 |
+| 权重 | `OIHWBiBo`，**图优化期**重排成 initializer 并去重缓存（`nchwc_transformer.cc:448-469`，`MlasConvPrepare` 里 prepack） | `[block][k][4]` 4 行交错 + `ConditionalWeakTable` 缓存（`Kernels/PackedConv.cs:43`） | 基本持平 |
+| im2col | **完全不物化**，直接从 NCHWc 取数 | `PackPanel` 物化 `K×16` 面板（K=576 时 36 KB，写一遍再读一遍，`PackedConv.cs:241/262`） | **差在这一步** |
+| 微内核 | 6 像素 × 4 filter 块 × 16 oc = **24 个 zmm**（`core/mlas/lib/snchwc.cpp` 的 `MlasConvNchwcFloatKernelAvx512F`） | 16 像素 × 4 行 × 2 ymm = **8 累加器**（`PackedConv.cs:30` 的 `RowBlock=4`） | 我们窄 3 倍 |
+| 循环顺序 | **输入通道块在外层**，整行输出反复累加（`ACCUMULATE_OUTPUT`，`snchwc.cpp:948`） | 面板内一次走完全 K | 输出行不复用 |
+| 1×1 | 专用 `ConvPointwiseFloatKernel` | 走 GEMM + `PackedB` | 持平 |
+| depthwise | 专用 + AVX-512 滑动窗口版 | 已有 `Kernels/DepthwiseConv.cs` | 持平 |
+
+一条关键量化：ORT 的 3×3 内核里一个输入标量广播后服务 **4 filter 块 × 6 像素 = 24 条 FMA**，
+我们的权重标量只服务 4 行 × 2 向量 = 8 条。**它的「每次 load 换到的 FMA 数」是我们的 3 倍** ——
+这才是「87 个中等 conv 打不过」的直接原因，而 `PackedConv.cs:27-29` 那条「6 行慢 25%」的注释
+是**纯 AVX2（16 个 YMM）时代的结论**，与 `GemmKernel` 后来按 `Avx512F.VL` 分派拿到 MR=12 并不矛盾。
+
+#### P7.2 值得抄的四项（按性价比排序）
+
+| # | 做法 | 改哪 | 与主线关系 | 预期 |
+|---|---|---|---|---|
+| A | **去掉面板物化**：`singleRow && strideW==1 && 面板在界内` 时，在内核 K 步里现取 16 像素（2 个 ymm），跳过 `PackPanel` | `Kernels/PackedConv.cs` | yolo 专用 | −10~20%（省 36 KB 写+读往返） |
+| B | **行块 4→8**，用 AVX-512VL 的 ymm16~31（16 累加器 + 2 B + 广播 = 19 ymm），照搬 `GemmKernel.UseMr12` 的 ISA 分派 | `Kernels/PackedConv.cs` | yolo 专用 | −5~15% |
+| C | **输入通道块外提 + 输出行累积**（一行输出常驻 L1，输入行被整条 K 复用） | `Kernels/PackedConv.cs` | yolo 专用 | 与 A 合并做才有意义 |
+| D | **降低 GEMM 并行阈值**：MLAS 是 `M·N·K / 65536 + 1`，我们是 `GemmKernel.ParallelThreshold = 1<<22`（**高 64 倍**） | `Tensors/GemmKernel.cs:29` | **rfdetr 主线** | 待测，成本最低 |
+
+A+B+C 对 yolo11n 的上限：Conv 30.7 ms 若降到 23 ms（−25%），端到端 37.2 → 29.5，
+对 ORT 从 1.59× 拉到 **1.26×**。**对 rfdetr 一点用都没有**（Conv 只占 5.1%，见 §P7.4）。
+
+D 是这份源码里**唯一**可能推动 rfdetr ≤210 的东西：`MatMul 139 个占 77.1%`，其中 attention 的
+`k` 只有 32/64，按现在的阈值很可能全程单线程。验证方式：把阈值改成可配置
+（`ONNXSHARP_GEMM_THRESHOLD`），在 `gemmbench` 的 6 类主形状上扫 1<<16 / 1<<18 / 1<<22，
+再对 rfdetr 做交替 A/B。**先微基准、后端到端**，否则又是一次「微基准变快、端到端为 0」。
+
+#### P7.3 已经持平或领先、不用抄
+
+- **`beta==0` 不读 C**：我们的 bias/columnBias 直接做累加器初值（`GemmKernel.Multiply` 的
+  `bias` / `columnBias` 参数），等价。
+- **N 尾补齐到 16**：我们 `nb=16` 补零，等价于 MLAS 的掩码内核。
+- **B 面板常驻**：我们有 `PackedB`（MatMul 常量权重）+ `PackedConv.Cache`（Conv 权重）。
+  **反例：ORT 自己没做全** —— float `MatMul` 每次现 pack B（`core/providers/cpu/math/matmul.cc:436`
+  直接 `MlasGemmBatch`），只有 `Gemm` 节点用了 `packed_b_`。这块**我们领先**，不要被「ORT 有预打包」误导。
+
+#### P7.4 明确否决：NCHWc 全图布局传播
+
+**不做。** 三条理由（第 1 条是决定性的）：
+
+1. **rfdetr 的收益分母不在 Conv 上**。同口径 profile（`sum-of-min` 234 ms）：
+
+   | type | ops | min ms | share |
+   |---|---:|---:|---:|
+   | MatMul | 139 | 180.3 | **77.1%** |
+   | Conv | **9** | 12.0 | **5.1%** |
+   | Softmax | 18 | 7.6 | 3.2% |
+
+   NCHWc 只对「空间算子」（Conv / Pool / Concat / DWConv）有意义，对 2D 的 MatMul **零收益**。
+   即使 Conv 快到 2×（12.0 → 6.0），端到端也只省 **2.6%**；而 NCHWc 本身最好情况也只是
+   「Conv 提速 1.3~2×」，现实落在 **−1.3%~−2.6%**，连 3.5% 缺口都不够，且是高风险大改。
+
+2. **reorder 成本会吃掉它**。NCHWc 是「传染式」布局：只有相邻节点的张量都在 c 布局时才免转换。
+   rfdetr 的静态图里有 `Add 169 / Mul 114 / Reshape 122 / Transpose 113 / Slice 62`（`bench.md`
+   的 2064 节点直方图），9 个 Conv 的输入/输出边界（约 18 处）都要么把邻接算子也 c 化、
+   要么插一次全量 reorder。Conv 少的模型**恰恰是 reorder 摊不薄**的模型 —— ORT 自己在
+   `nchwc_transformer.cc` 里也是按「收益/开销」逐节点判定的，不是无脑全转。
+
+3. **我们的 Conv 本身已接近峰值**：`bench.md §9` 实测 Winograd 167 GMAC/s = 4 核 AVX2 峰值的 79%，
+   剩余空间来自打包而非布局。真正想动 Conv 应该做 §P7.2 的 A/B/C（针对 yolo），
+   而不是重写整个引擎的内存布局。
+
+工程量参考：ORT 自己为此写了 `nchwc_transformer.cc`（1000+ 行图级 pass）+ 每个算子的 c 布局支持表
++ allocator 的形状改造。我们是 88 个算子注册、buffer 复用已按 NCHW 物理布局设计（`Engine/BufferAllocator.cs`），
+这套改造的回归面覆盖全部 88 个算子 —— 对 3.5% 的目标而言**投入产出完全不成立**。
+
+#### P7.5 一句话
+
+**GEMM 侧我们已超过 ORT（B 预打包常驻），Conv 侧的差距是「物化 im2col + 窄行块」，
+只对 yolo 系有意义；rfdetr 主线要从 GEMM 阈值（§P7.2 D）里找那 3.5%。**
+
 ---
 
 ## 5. 执行顺序与依赖
@@ -329,6 +421,8 @@ P0（测量）──┬─→ P6'（GEMM 微内核）── MR=6（-5.0%）+ MR=
             └─→ P3 / P5（Where 2.6→0.1 + Reshape 4.4→0.2）**已完成 -2.0%**
 已关闭：P1（Conv，11.2 ms）、P1'（逐元素，12 ms）、P2（Relu/Silu 融合，0.4 ms）、
         P6（并行粒度，线性）、内存复用（Fit bug 已修）
+参照（未排期）：P7 ─ 只有 D（GEMM 并行阈值 1<<22 → 1<<16 量级）落在 rfdetr 主线，
+                    A/B/C（Conv 去物化 + 8 行块 + ic 块外提）是 yolo 专用
 ```
 
 **排期依据**：`sum-of-min` 现在与 `bench` min 对得上（252.5 vs 253.5），所以分解可以直接按绝对值读。
