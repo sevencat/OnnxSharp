@@ -16,3 +16,4 @@ bench/results/dump-*/
 .idea
 /.codebuddy
 /.tmp
+/bench/results

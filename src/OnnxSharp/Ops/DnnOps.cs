@@ -1856,6 +1856,13 @@ internal static class DnnOps
 
     private sealed class MatMulLayer : Layer, IBiasAddable
     {
+        /// <summary>
+        /// 逐算子把形状和耗时打到 stderr（<c>ONNXSHARP_MM_TRACE=1</c>）。
+        /// 用来核对 profile 的 per-op 数字与内核微基准是否自洽。
+        /// </summary>
+        private static readonly bool TraceEnabled =
+            Environment.GetEnvironmentVariable("ONNXSHARP_MM_TRACE") == "1";
+
         public MatMulLayer(LayerParams parameters)
         {
             Type = parameters.Type;
@@ -1947,6 +1954,9 @@ internal static class DnnOps
             var b = inputs[1];
             var output = outputs[0];
 
+            bool trace = TraceEnabled;
+            var swTrace = trace ? System.Diagnostics.Stopwatch.StartNew() : null;
+
             var aDims = a.Shape.Rank == 1 ? new[] { 1, a.Shape.Dims[0] } : a.Shape.ToArray();
             var bDims = b.Shape.Rank == 1 ? new[] { b.Shape.Dims[0], 1 } : b.Shape.ToArray();
 
@@ -2019,6 +2029,9 @@ internal static class DnnOps
                         dst.Slice(0, rows * n),
                         rows,
                         columnBias: columnBias);
+                    if (trace)
+                        Console.Error.WriteLine(
+                            $"MMp m={rows} k={k} n={n} bat={batches} ms={swTrace!.Elapsed.TotalMilliseconds:F3} {Name}");
                     return;
                 }
 
@@ -2028,6 +2041,44 @@ internal static class DnnOps
                     dst.Slice(0, rows * n),
                     rows, k, n,
                     columnBias: columnBias);
+                if (trace)
+                    Console.Error.WriteLine(
+                        $"MMs m={rows} k={k} n={n} bat={batches} ms={swTrace!.Elapsed.TotalMilliseconds:F3} {Name}");
+                return;
+            }
+
+            // 两个操作数的 batch 维都与输出完全一致时（注意力 QK^T / P·V：[4,6,257,64]×[4,6,64,257]），
+            // 每个 batch 的偏移就是连续的 bi*m*k / bi*k*n —— 可以交给批量内核**一次派发**，
+            // 而不是 24 次「各自开一个并行域、17 个列块摊给 4 线程」。
+            // rf-detr 实测（交替 A/B，min of 3）：238.1 vs 249.6 ms，1.048×。
+            bool densePerBatch = true;
+            for (int i = 0; i < batchRank; i++)
+            {
+                if (aBatch[i] != outBatch[i] || bBatch[i] != outBatch[i])
+                {
+                    densePerBatch = false;
+                    break;
+                }
+            }
+
+            long aTotal = (long)batches * m * k;
+            long bTotal = (long)batches * k * n;
+            long cTotal = (long)batches * m * n;
+
+            if (densePerBatch && aTotal <= int.MaxValue && bTotal <= int.MaxValue && cTotal <= int.MaxValue)
+            {
+                GemmKernel.MultiplyBatched(
+                    srcA.Slice(0, (int)aTotal),
+                    srcB.Slice(0, (int)bTotal),
+                    dst.Slice(0, (int)cTotal),
+                    (int)batches, m, k, n,
+                    columnBias: columnBias);
+                if (trace)
+                    Console.Error.WriteLine(
+                        $"MMb m={m} k={k} n={n} bat={batches} ms={swTrace!.Elapsed.TotalMilliseconds:F3} " +
+                        $"sameAb={(ReferenceEquals(a.Buffer, b.Buffer) ? 1 : 0)}sameAc={(ReferenceEquals(a.Buffer, output.Buffer) ? 1 : 0)} " +
+                        $"offA={a.ByteOffset} offB={b.ByteOffset} offC={output.ByteOffset} " +
+                        $"lenA={a.Buffer.Length} lenC={output.Buffer.Length} {Name}");
                 return;
             }
 
@@ -2058,6 +2109,10 @@ internal static class DnnOps
                     coords[i] = 0;
                 }
             }
+
+            if (trace)
+                Console.Error.WriteLine(
+                    $"MMl m={m} k={k} n={n} bat={batches} ms={swTrace!.Elapsed.TotalMilliseconds:F3} {Name}");
         }
     }
 

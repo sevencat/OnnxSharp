@@ -32,7 +32,8 @@ internal static class Interpreter
         Graph graph,
         bool executeLayers = true,
         Dictionary<LayerInfo, (double Milliseconds, int Calls)>? timings = null,
-        bool detectNaN = false)
+        bool detectNaN = false,
+        Dictionary<LayerInfo, long>? allocs = null)
     {
         // 绑定 LayerInfo.Net 并按生命周期分槽（图结构变化时才重算）。
         net.PrepareForGraph(graph);
@@ -53,6 +54,10 @@ internal static class Interpreter
         {
             if (op is not Layer layer)
                 throw new OnnxSharpException($"op '{op.Name}' ({op.Type}) has no executor");
+
+            // 分配归因要覆盖整层的全部动作：形状推断、BindAll（输出 Fit）、
+            // PrepackWeights/Finalize（动态形状层每帧都会重跑）。只包 Forward 会漏掉大头。
+            long allocBefore = allocs is null ? 0 : GC.GetTotalAllocatedBytes(precise: true);
 
             inpMats.Clear();
             inpShapes.Clear();
@@ -139,10 +144,20 @@ internal static class Interpreter
                     throw new OnnxSharpException(
                         $"op '{op.Name}' ({op.Type}) has dynamic output shapes; " +
                         "shape-only mode cannot infer them");
+
+                if (allocs is not null)
+                    allocs[op] = allocs.GetValueOrDefault(op) + (GC.GetTotalAllocatedBytes(precise: true) - allocBefore);
                 continue;
             }
 
-            bool signatureChanged = !layer.FinalizedOnce || !sameSignature;
+            // Finalize 的失效判定必须用 LastInShapes/LastInTypes（上一次真正 Finalize 时的签名），
+            // 不能用上面那个 sameSignature —— 它依赖 ShapeCacheValid，而**动态形状层永远不写
+            // 这个标志**（只有缓存分支才写），于是动态层每帧都判定为「签名变了」，
+            // 每帧重跑 PrepackWeights + Finalize。rfdetr-small 上这等于每帧白分配 52 MB
+            // （attention 的 score 缓冲、Softmax、fc1 输出各重来一遍）。
+            bool signatureChanged = !layer.FinalizedOnce
+                || !SameShapes(layer.LastInShapes, inpShapes)
+                || !SameTypes(layer.LastInTypes, inpTypes);
 
             if (signatureChanged)
             {
@@ -155,18 +170,31 @@ internal static class Interpreter
                 layer.FinalizedOnce = true;
             }
 
-            if (timings is null)
+            if (timings is null && allocs is null)
             {
                 layer.Forward(inpMats, outs, temps);
             }
             else
             {
-                long start = Stopwatch.GetTimestamp();
+                // 分配量用 precise 口径：它会把其他工作线程尚未归集的 TLS 缓冲一起刷进来，
+                // 否则 Conv/GEMM 这类多线程层的分配会被漏掉。代价是每次调用要扫一遍线程，
+                // 所以只在诊断（传了 timings/allocs）时开。
+                long start = timings is null ? 0 : Stopwatch.GetTimestamp();
+
                 layer.Forward(inpMats, outs, temps);
 
-                double ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
-                var acc = timings.GetValueOrDefault(layer);
-                timings[layer] = (acc.Milliseconds + ms, acc.Calls + 1);
+                if (timings is not null)
+                {
+                    double ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                    var acc = timings.GetValueOrDefault(layer);
+                    timings[layer] = (acc.Milliseconds + ms, acc.Calls + 1);
+                }
+
+                if (allocs is not null)
+                {
+                    long delta = GC.GetTotalAllocatedBytes(precise: true) - allocBefore;
+                    allocs[layer] = allocs.GetValueOrDefault(layer) + delta;
+                }
             }
 
             if (detectNaN)

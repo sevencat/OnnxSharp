@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace OnnxSharp.Tensors;
 
@@ -56,6 +58,15 @@ public sealed class Tensor
         return t;
     }
 
+    /// <summary>诊断：<see cref="Fit"/> 触发缓冲重分配的次数与总字节数。</summary>
+    internal static long FitReallocCount;
+
+    /// <summary>诊断：<see cref="Fit"/> 触发缓冲重分配的总字节数。</summary>
+    internal static long FitReallocBytes;
+
+    /// <summary>诊断：重分配现场（形状/需求/现有容量），用于定位「为什么又要分配」。</summary>
+    internal static readonly ConcurrentQueue<string> ReallocLog = new();
+
     /// <summary>
     /// 重新绑定形状/类型。缓冲足够时复用，否则重新分配（对齐 OpenCV <c>Mat::fit</c> 语义）。
     /// </summary>
@@ -66,11 +77,26 @@ public sealed class Tensor
             throw new NotSupportedException(
                 $"tensor too large: {shape} {dtype} needs {need} bytes, max {int.MaxValue}");
 
-        if (!reuse || DType != dtype || Buffer.Length < need)
+        // 只在「显式要求重分配」或「容量不够」时重建缓冲。
+        // dtype 变化**不算**重建理由：Buffer 是 byte[]，dtype 只是解释视图，长度够就能直接复用。
+        // 这条曾经是个真 bug —— 共享槽位会被 F32 大张量与 I64 小张量轮流使用，
+        // 每次 dtype 切换都 new byte[need]（精确大小），小张量把大缓冲缩成几百字节，
+        // 下一帧大张量只好重新分配。rfdetr-small 因此每帧白分配 53 MB、触发 19 次重分配。
+        if (!reuse || Buffer.Length < need)
         {
+            // 诊断计数器：区分「缓冲被复用」和「每帧重新分配」。跨线程累加用 Interlocked，
+            // 只有诊断时读（Net/Tensor 不暴露公开 API，CLI 直接读 internal 字段）。
+            Interlocked.Increment(ref FitReallocCount);
+            Interlocked.Add(ref FitReallocBytes, need);
+            if (ReallocLog.Count < 24)
+                ReallocLog.Enqueue(
+                    $"#{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this):x8} " +
+                    $"old=[{string.Join(",", Shape.Dims.ToArray())}] need={need} have={Buffer.Length} " +
+                    $"reuse={reuse} dtype={DType}->{dtype}");
             Buffer = need == 0 ? Array.Empty<byte>() : new byte[need];
-            DType = dtype;
         }
+
+        DType = dtype;
 
         Layout = Layout.NCHW;
         Shape = shape;

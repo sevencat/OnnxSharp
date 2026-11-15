@@ -182,7 +182,7 @@ public sealed class Net
     /// 每个算子的最小值基本不会同时出现。
     /// </para>
     /// </summary>
-    public IReadOnlyList<OpTiming> ProfileAll(int iters = 2, int warmup = 0)
+    public IReadOnlyList<OpTiming> ProfileAll(int iters = 2, int warmup = 0, bool allocation = false)
     {
         if (_impl.MainGraph is not { } graph)
             throw new OnnxSharpException("model is not loaded");
@@ -194,13 +194,14 @@ public sealed class Net
 
         var sum = new Dictionary<LayerInfo, (double Milliseconds, int Calls)>();
         var min = new Dictionary<LayerInfo, double>();
+        var allocs = allocation ? new Dictionary<LayerInfo, long>() : null;
 
         // 每轮单独统计再合并：均值会被后台负载的重尾放大（测量机上均值比中位数高 25%），
         // 而上百个算子合起来看时只有「每算子的最小耗时」能和 bench 的 min 对上。
         for (int i = 0; i < iters; i++)
         {
             var once = new Dictionary<LayerInfo, (double Milliseconds, int Calls)>();
-            Interpreter.Run(_impl, graph, executeLayers: true, once);
+            Interpreter.Run(_impl, graph, executeLayers: true, timings: once, allocs: allocs);
 
             foreach (var (layer, value) in once)
             {
@@ -214,7 +215,15 @@ public sealed class Net
 
         var result = new List<OpTiming>(sum.Count);
         foreach (var (layer, value) in sum)
-            result.Add(new OpTiming(layer.Name, layer.Type, value.Milliseconds, value.Calls, min[layer]));
+        {
+            result.Add(new OpTiming(
+                layer.Name,
+                layer.Type,
+                value.Milliseconds,
+                value.Calls,
+                min[layer],
+                allocs is null ? 0 : allocs.GetValueOrDefault(layer) / iters));
+        }
 
         // 按最小耗时排序：均值的排序会被偶发的慢迭代打乱
         result.Sort((a, b) => b.MinMilliseconds.CompareTo(a.MinMilliseconds));
@@ -228,7 +237,8 @@ public sealed record OpTiming(
     string Type,
     double Milliseconds,
     int Calls,
-    double MinMilliseconds)
+    double MinMilliseconds,
+    long AllocatedBytes = 0)
 {
     public double Average => Calls > 0 ? Milliseconds / Calls : 0;
 }

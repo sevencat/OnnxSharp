@@ -113,7 +113,9 @@ def main():
     ap.add_argument("--runtime", required=True, choices=["ort", "cv"])
     ap.add_argument("--models", default=os.path.join(HERE, "models.json"))
     ap.add_argument("--names", default="")
-    ap.add_argument("--threads", type=int, default=16)
+    # 默认 4 线程：这台机器 16 线程满载会撞温度墙（% Processor Performance 掉到 21%），
+    # 耗时会随机涨 5-7 倍。需要 16 线程口径时显式传 --threads 16。
+    ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
     args = ap.parse_args()

@@ -10,22 +10,26 @@
 | 输入 | 静态 batch=1、FP32、NCHW，全部元素常量 `0.5`（与 SimdYolo 默认一致） |
 | 预热 | `run_all.py` 默认 5 帧（`warmup=5`），不计入样本 |
 | 样本 | 默认 40 帧（`iters=40`），跑 2 轮取 median 较低的一轮 |
-| 线程 | 全部固定 16 线程（`ONNXSHARP_THREADS=16` / `intra_op_num_threads=16` / `cv2.setNumThreads(16)` / SimdYolo `threads=16`） |
+| 线程 | **4 线程**（`ONNXSHARP_THREADS=4` / `intra_op_num_threads=4` / `cv2.setNumThreads(4)` / SimdYolo `threads=4`）。<br>**2026-11-07 ~ 11-11 的历史段落是 16 线程口径**，且其中 onnxsharp 的数字实为 **32 线程**（`run_all.py` 的 env 没传给子进程，`ONNXSHARP_THREADS` 从未生效，见第八轮）。跨段落比较前先确认线程数 |
 | 指标 | 主指标 **median**；副指标 **min**（反映无干扰时的下限） |
 
 ## 环境
 
 | 项 | 取值 |
 | --- | --- |
-| CPU | AMD Ryzen 7 8845HS（8C/16T，3.8 GHz，Zen4，AVX-512） |
-| 内存 | 47 GB |
-| OS | Windows（AC 供电） |
-| .NET | 10.0.402（OnnxSharp / SimdYolo 均 Release） |
-| ONNXRuntime | 1.31.1（`CPUExecutionProvider`，`ORT_ENABLE_ALL`，inter_op=1） |
+| CPU | **AMD Ryzen 9 8945HX**（16C/32T，基频 2.5 GHz，Zen4，AVX-512）· HP OMEN 16-ap0xxx 笔记本 |
+| 内存 | 31.1 GB |
+| OS | Windows（AC 供电；电源方案 `QuickCpuScheme`，`PROCTHROTTLEMIN = 100%` —— 满载撞温度墙的根因，见 §8.1） |
+| .NET | 11.0.100 SDK，目标 `net10.0`（OnnxSharp / SimdYolo 均 Release） |
+| ONNXRuntime | 1.32.0（`CPUExecutionProvider`，`ORT_ENABLE_ALL`，inter_op=1） |
 | OpenCV | 5.0.0（`cv2.dnn` 新图引擎，`DNN_BACKEND_OPENCV` / `DNN_TARGET_CPU`） |
-| SimdYolo | 0.11.3（`CPU SIMD (256 bits)`） |
+| SimdYolo | **0.11.4**（本地源码构建 `F:\code\SimdYolo\src\SimdYolo.Cli\bin\Release\net10.0\`，commit `824e574`，`CPU SIMD (256 bits)`）。<br>升级时注意：`git pull` 只换源码，**必须重新 `dotnet build -c Release`** —— 本次就出现过源码已是 0.11.4 而 `bin` 里还是 11-10 的旧 dll 的情况 |
 
-> 说明：测量机是共享环境（后台有 ~1.5 核的常驻负载），所以同一次会话里依次跑完全部引擎，没有跨天拼接数字。ONNXRuntime 对线程抢占特别敏感（median 与 min 常差 40%+，见下文），跨轮次 median 波动 ±10% 属正常。
+> **机器已于 2026-11-15 更换**：文中 11-07 ~ 11-11 的所有段落是旧机器
+> **Ryzen 7 8845HS（8C/16T、47 GB）** 上测的，与当前 8945HX（16C/32T）的绝对值**不可比**；
+> 那一批数字只保留「同一次会话内的相对倍率」价值。
+>
+> 说明：测量机是共享环境（后台有常驻负载），所以同一次会话里依次跑完全部引擎，没有跨天拼接数字。ONNXRuntime 对线程抢占特别敏感（median 与 min 常差 40%+，见下文）。
 
 ### 测量方法上的坑（务必先读）
 
@@ -39,17 +43,21 @@
 
 ```powershell
 # 一次跑完四个引擎 × 全部模型（结果写 bench/results/latest.json，并打印 Markdown 表）
-python bench/run_all.py --iters 30 --warmup 10 --rounds 2 --threads 16
+# 脚本默认已是 4 线程；要 16 线程口径必须显式 --threads 16（会撞温度墙，见第八轮）
+python bench/run_all.py --iters 30 --warmup 10 --rounds 2
 
 # 只跑部分模型 / 部分引擎
 python bench/run_all.py --names yolo11n,rfdetr-small --runtimes onnxsharp,opencv-dnn
 
 # 单引擎单独跑（脚本内部也是调这些）
-python bench/run_python_bench.py --runtime ort --iters 30 --warmup 10 --threads 16
-python bench/run_python_bench.py --runtime cv  --iters 30 --warmup 10 --threads 16
-tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe bench <model.onnx> --input <in.f32> --iters 30 --warmup 10
+python bench/run_python_bench.py --runtime ort --iters 30 --warmup 10
+python bench/run_python_bench.py --runtime cv  --iters 30 --warmup 10
+tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe bench <model.onnx> --input <in.f32> --iters 30 --warmup 10 --threads 4
 tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe run  <model.onnx> --input <in.f32> --dump out/   # 输出按 F32 落盘（逐值 A/B 用）
-F:\code\SimdYolo\src\SimdYolo.Cli\bin\Release\net10.0\SimdYolo.Cli.exe bench <model.onnx> cpu 640 30 16 10
+F:\code\SimdYolo\src\SimdYolo.Cli\bin\Release\net10.0\SimdYolo.Cli.exe bench <model.onnx> cpu 640 30 4 10
+
+# 测之前先确认没在降频（>80% 才可用，<60% 直接作废）
+(Get-Counter '\Processor Information(_Total)\% Processor Performance').CounterSamples.CookedValue
 ```
 
 模型清单在 `bench/models.json`。
@@ -247,6 +255,10 @@ min（无干扰下限）：
 
 ## 下一步（按收益排序）
 
+> **2026-11-15 注**：本节基于 16 线程口径 + 旧机器（8845HS），其中「s 档大 GEMM 打包是唯一解释」
+> 与「剩下差距全在小 GEMM」两条已被 §8.4 的 4 线程实测推翻（GEMM 已打平）。
+> **后续排期以 `planv2.md` 为准**，本节仅作历史记录保留。
+
 1. ~~**逐元素融合**~~ —— **已完成（2026-11-07，见结论 2）**：GELU 链 `Div→Erf→Add→Mul→Mul` 已融合，
    rfdetr-small/medium 端到端 **-7.4% / -9.1%**（min），输出逐位不变。
    注意结论 2 里的带宽核算：融合后已经贴在 42 GB/s 的逐元素带宽上限上，**这条路到头了**，
@@ -411,3 +423,585 @@ SimdYolo 在 yolov8n 上也抖（34.7 / 18.1），遇到 DETR 模型直接抛异
 **结论**：ORT 仍是 CPU 上最快的（我们落后 15~30%）；OpenCV 与我们互有胜负；
 RF-DETR 与 ORT 的比值从 1.21× 收到 1.18×（按 min 是 1.21×），剩下差距几乎全在
 transformer 的小 GEMM（MLP 的 m=257、24 个 head-batch 的 QK/PV）。
+
+## 2026-11-15 第八轮：温度墙 → 口径改成 4 线程；GEMM 归零，差距全在 GEMM 之外
+
+### 8.1 为什么之前的数字不可信：不是后台负载，是热降频
+
+16 线程同代码同模型，min 在 **108 ↔ 780 ms** 之间跳（7 倍）。满载期间每 400 ms 采样
+`\Processor Information(_Total)\% Processor Performance`：
+
+| 状态 | perf% | rfdetr-small min |
+|---|---:|---:|
+| 空闲 | 138% | — |
+| **16 线程满载 25 iters** | **20.96 / 21.05 / 21.00（15 点，极稳）** | 777.6 ms |
+| 冷却 60 s 后 | ~130% | 108.0 ms |
+
+根因：电源方案 `QuickCpuScheme` 的**最小处理器状态 = 100%**（AC/DC 都是 100），CPU 常驻最高频，
+16 线程一满载立刻撞温度/功耗墙，频率被压到标称的 21%。`138/21 ≈ 6.6`，正好对上 7 倍。
+
+**规矩定死**：跑基准前先看 perf%，< 60% 的整轮数据直接作废；长期方案是把
+`PROCTHROTTLEMIN` 调回 5%（`powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 5`）。
+**现在默认口径改为 4 线程**：4 线程功耗远低于墙，同代码两轮重跑差异 **< 0.5%**（p95 与 min 差 < 4%），
+历史数据一律 4 线程重测。
+
+> ⚠️ **4 线程也不是绝对安全**：2026-11-15 晚测 SimdYolo 0.11.4 时，`yolov8s` + `yolo11s`
+> 各 3 轮连续跑 **约 40 s**，perf% 从 138 掉到 **20.9**，`yolo11s` median 冲到 526 ms（正常 77 ms）。
+> 冷却后立即恢复。所以 **s 档模型（尤其中间那个引擎是 simdyolo）不能连着跑多轮**，
+> 每测完一个 s 档模型就查一次 perf%，低于 100 就等。
+
+### 8.2 顺带查出的 bug：`ONNXSHARP_THREADS` 从未生效
+
+`run_all.py` 里 `env = dict(os.environ, ONNXSHARP_THREADS=str(threads))` 算出来了，
+但 `run()` 的签名是 `run(cmd, cwd=ROOT)`，**env 没传给 `subprocess.run`**。于是：
+**`bench.md` 11-07 ~ 11-11 所有 onnxsharp 列标注的「16 线程」实为 32 线程**
+（`Environment.ProcessorCount = 32`）。已修（`run(cmd, cwd, env)`），
+那一批 onnxsharp 数字只保留「同会话内的相对倍率」价值，绝对值等 4 线程重测。
+
+### 8.3 4 线程全表（median，括号内 min）
+
+`python bench/run_all.py --iters 20 --rounds 2`（引擎顺序每轮轮转），同一次会话：
+
+| 模型 | onnxsharp | onnxruntime-cpu | opencv-dnn | simdyolo（0.11.4） |
+|---|---:|---:|---:|---:|
+| yolov8n 640² | 46.0（45.6） | **28.3（27.9）** | 54.5（48.5） | 31.4（29.9） |
+| yolo11n 640² | 39.1（37.5） | **23.6（23.5）** | 48.6（46.8） | 31.8（29.2） |
+| yolov8s 640² | 121.0（120.0） | **76.7（76.1）** | 138.8（135.5） | 78.7（76.6） |
+| yolo11s 640² | 111.7（103.0） | **65.1（63.8）** | 133.4（127.6） | 77.2（76.7） |
+| rfdetr-small 512² | 262.5（252.4） | **189.4（187.9）** | 326.3（317.8） | 跑不了 |
+
+> **simdyolo 列已换成 0.11.4**（2026-11-15 21:23 重建 `F:\code\SimdYolo` 后单独重测，
+> 其余三列未变）。0.11.4 对这四个 YOLO 模型的收益基本在噪声内：
+> yolo11s 快 5%（81.3 → 77.2），yolov8s 慢 3%（76.2 → 78.7），n 档持平（min 差 < 2%）。
+> **注意**：该次重测踩了温度墙 —— `simdyolo` 在 s 档 4 线程连跑 40 s 就把 perf% 从 138 打到
+> **20.9**（median 瞬间涨到 526 ms），冷却到 138% 后复测才拿到 77 ms。**跑 simdyolo 的 s 档必须单模型、跑完即查 perf%。**
+
+倍率（onnxsharp ÷ 该引擎 median，>1 表示比它慢）：
+
+| 模型 | vs ORT | vs OpenCV | vs SimdYolo |
+|---|---:|---:|---:|
+| yolov8n | 1.63 | **0.84** | 1.47 |
+| yolo11n | 1.66 | **0.80** | 1.23 |
+| yolov8s | 1.58 | **0.87** | 1.54 |
+| yolo11s | 1.71 | **0.84** | 1.45 |
+| rfdetr-small | 1.39 | **0.80** | N/A |
+
+**两个口径依赖的现象，不要混着引用**：
+
+- 4 线程下 OpenCV dnn 退化得比谁都厉害（yolo11n 28.6 → **48.6**），我们反而领先它 16~20%；
+  16 线程时是它领先我们。**「谁快」在这台机器上是线程数决定的，不是内核决定的。**
+- 我们对 ORT 的劣势从 16 线程的 1.15~1.30× 扩大到 **1.39~1.71×**。ORT 几乎不吃线程
+  （yolo11n 23.4 → 23.6，16 → 4 线程），我们从 27.4 → 39.1。它早已撞上带宽墙，我们还没有。
+
+### 8.4 关键结论：GEMM 已经不落后了，差距全在 GEMM 之外
+
+同会话 profile（rfdetr-small，4 线程，占比；profiling 会放大绝对值，只看结构）：
+
+| op_type | onnxsharp | ORT | 折算绝对值（我们 252 / ORT 189） |
+|---|---:|---:|---|
+| MatMul + Gemm | **61.2%** | 79.2%（Gemm+FusedMatMul+MatMul） | **154 ms vs 150 ms** |
+| Conv | 10.9% | 4.1% | **27 vs 8 ms** |
+| Transpose | 4.3% | 2.7% | 11 vs 5 ms |
+| Mul + Add | 6.5% | 2.4% | 16 vs 4.5 ms |
+| LayerNormalization | 2.3% | 1.9% | 6 vs 3.6 ms |
+| Softmax | 2.2% | 2.3% | 5.5 vs 4.3 ms |
+| Where | 2.0% | 0（被折叠） | 5 vs 0 ms |
+| GridSample | 1.4% | 0.5% | 3.5 vs 0.9 ms |
+| FusedEltwise + Relu + Silu | 2.9% | 0（Conv+SiLU 融合） | 7 vs 0 ms |
+| GatherElements | 1.0% | ≤0.3% | 2.5 vs 0.6 ms |
+
+**GEMM 类绝对耗时几乎打平（154 vs 150 ms），39 ms 的差距全部在非 GEMM 的 98 ms 里。**
+这修正了 11-07 的结论「剩下差距几乎全在 transformer 的小 GEMM」——按 4 线程口径不成立：
+差距是 **Conv（-19 ms）+ 逐元素/激活（-20 ms，其中 Conv+SiLU 融合一项就 -7 ms）+ Transpose（-6 ms）
++ Where/Gather/Reshape 这类本该被常量折叠或融合掉却没掉的算子（-8 ms）**。
+
+### 8.5 ORT 的图优化对 RF-DETR 是负收益（可复现）
+
+`--opt-level disable`（1537 节点）vs `all`（776 节点），4 线程，各跑两轮：
+
+| 优化等级 | 轮 1 min | 轮 2 min | median |
+|---|---:|---:|---:|
+| disable | **182.07** | **182.77** | 183.1 |
+| all | 186.87 | 187.14 | 187.7 |
+
+**关掉全部图优化反而快 2.6%，两次复现一致。** 融合省下的 700 个节点被 Gemm 化引入的
+253 个 `Reshape` 和 NCHWc 的 `ReorderInput/Output` 拷贝吃掉了。而 `MatMul::PrePack`
+（`orttraining/orttraining/training_ops/cpu/math/matmul.cc:301`）是 **kernel 级、session 初始化时
+对常量权重做的，与 `graph_optimization_level` 无关** —— 所以 disable 档也照样快。
+
+⇒ 对 `planv2.md` 的直接含义：**ORT 的优势不在图融合，在运行时（预打包 / 内存模式 / 线程池）。
+我们已经有 `GemmKernel.PackedB`（MatMul 常量权重）和 `PackedConv.Cache`（Conv 权重）两条等价物，
+所以「补预打包」不是待办 —— 待办是 GEMM 之外的 98 ms。**
+
+## 2026-11-15 第九轮：单层微基准 —— §8.4 的卷积 27 ms 被推翻，实际只有 11 ms
+
+§8.4 的算子分解是拿 `profile` 占比 × 端到端 min 折算出来的，而 `profile` 的每层回调开销
+**按层数摊**：MatMul 有几百层，Conv 只有 9 层，两者被放大的倍数完全不同，占比必然失真。
+这一轮用 `convbench` / `gemmbench` 直接测单层（4 线程，iters 20，取 min）。
+
+### 9.1 先修工具：`convbench --shape` 从来没生效过
+
+`ParseOptions` 把 `--shape` 收进了 `CliOptions.Shapes` 列表，而 `ConvBench` 用
+`options.GetString("--shape")` 去取（走的是 `_values` 字典），永远拿到 null，
+于是**不管传什么形状都在跑 yolo11n 的默认层**。已改为读 `options.Shapes`，并支持重复传多个
+`--shape`。`gemmbench` 早就是这个写法（它做了两种兼容），只有 `convbench` 漏了。
+
+> 教训：任何「跑出来都一样」的基准工具，先验证参数真的进去了。
+
+### 9.2 RF-DETR-small 的 9 个 Conv（真实形状，来自 `dump-graph --type Conv` + 权重 dims）
+
+| 层 | 权重 | 类型 | M×N×K |
+|---|---|---|---|
+| patch_embed | `[384,3,16,16]` s16 | 输入投影 | 1024×384×768 |
+| projector cv1 | `[256,1536,1,1]` | 1×1 | 1024×256×1536 |
+| stages.0.0 ×6 | `[128,128,3,3]` p1 | 3×3 全通道（**非 DW**） | 1024×128×1152 |
+| projector cv2 | `[256,640,1,1]` | 1×1 | 1024×256×640 |
+
+Conv 合计 **1.78 GMAC**。4 线程实测（各取最快内核）：
+
+| 层 | im2col | packed | Winograd | 采用 |
+|---|---:|---:|---:|---:|
+| patch_embed | **2.05** | 2.39 | — | 2.05 |
+| cv1 1×1 | **2.66** | — | — | 2.66 |
+| 3×3 128→128 ×6 | 1.56 | 1.13 | **0.90** | 5.40 |
+| cv2 1×1 | **1.12** | — | — | 1.12 |
+| **合计** | | | | **11.23 ms** |
+
+- 6 个 3×3 层**全部命中 Winograd**（`spatial=1024 ≤ MaxSpatialPixels=4096`），
+  167 GMAC/s，对 4 核 AVX2 理论上限（~211 GMAC/s）是 **79%**。
+- 三个候选假设全部证伪：① `PackedConv` 面板数 64 ≥ 4×线程数 16，不空转；
+  ② Winograd 的 16 个 component / 4 线程已接近线性；③ 没有层因 `ParallelThreshold` 退化。
+- **`§8.4` 的 27 ms 是折算错误，实际 11.2 ms（占 262 ms 的 4.3%）**。Conv 的可优化上限
+  因此从「-6~7%」降到 **-3~4%**，`planv2` 的 P1 已据此降级。
+
+### 9.3 GEMM 才是 69%，且微内核效率已经 70~74%
+
+`shape_inference` 统计：全模型 GEMM 共 **27.1 GMAC**（Conv 只有 1.78），其中 86% 集中在 6 类形状。
+
+| 形状（batch, M, N, K） | 个数 | GFLOPS | 单次 ms | 合计 ms |
+|---|---:|---:|---:|---:|
+| 4× 257×384×384（QKV） | 33 | 313 | 0.97 | 31.9 |
+| 4× 257×384×1536（fc1） | 12 | 296 | 4.10 | 49.2 |
+| 4× 257×1536×384（fc2） | 12 | 302 | 4.02 | 48.2 |
+| 1× 1028×384×384（dense） | 12 | 290 | 1.05 | 12.6 |
+| 24× 257×64×257（PV） | 9 | 236 | 0.84 | 7.6 |
+| 24× 257×257×64（QK） | 9 | 243 | 0.86 | 7.8 |
+| | | | | **157.3** |
+
+加上剩余 14% 的小 GEMM，GEMM 总计约 **180 ms（69%）**。4 线程 AVX2 理论峰值 ~422 GFLOPS，
+实测 290~313，即 **70~74%** —— 剩下的 26% 要靠 AVX-512 微内核或更大分块，不是「小 GEMM 没优化」。
+
+### 9.4 线程扩展性接近线性，P6 的前提也不成立
+
+`convbench`（128→128 @32² k3）跨线程档：
+
+| 线程 | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| Winograd ms | 3.46 | 1.77 | 0.90 | 0.56 |
+| 加速比 | — | 1.95× | 3.84× | 6.18× |
+
+1→2 是 1.95×、2→4 是 1.97×、4→8 是 1.61×。**没有出现「块数不足导致退化」**，
+`planv2` P6「4 线程下块数 < 线程数会整层退化」的根因假设可以划掉。
+
+### 9.5 修正后的端到端分解（rfdetr-small 262 ms，4 线程）
+
+| 类别 | 实测 | 占比 | 4 线程效率 |
+|---|---:|---:|---:|
+| GEMM | ~180 ms | 69% | 70~74% of AVX2 峰值 |
+| 逐元素（Mul/Add/Div/Where/激活） | ~32 ms | 12% | 未测，疑似带宽/多 pass |
+| Conv（9 层） | 11.2 ms | 4.3% | 79% |
+| Transpose（111 个） | ~11 ms | 4.2% | 未测 |
+| Softmax + LayerNorm | ~12 ms | 4.6% | 未测 |
+| GridSample / Gather / Reshape 等 | ~15 ms | 6% | 未测 |
+
+**新结论：`planv2` 原先的 P1（Conv）与 P6（并行粒度）都建立在这轮被推翻的前提上。**
+
+> **本表已被 §11 取代**：「逐元素 ~32 ms」复现不出来，同口径实测只有 ~10 ms。下表其余各项
+> 与本轮复查一致（MatMul 数字后来微调为 186~188 ms）。
+
+---
+
+## 2026-11-15 第十轮：分配归因 —— 共享槽位的 `Tensor.Fit` 把大缓冲缩容了
+
+第 1 轮讨论时断言过「ORT 的三大机制（PrePack / memory pattern / 常驻线程池）我们都已等价实现」。
+本轮把这句拿去做验证，结果 **memory pattern 这一项我们此前是有真缺陷的**：不是没做复用规划，
+而是复用规划的落点 `Tensor.Fit` 会把已经变大的缓冲缩回去。
+
+### 10.1 先加归因，再改代码
+
+`Interpreter.Run` 增加 `allocs` 参数，用 `GC.GetTotalAllocatedBytes(precise:true)` 差值逐层归因，
+探针**包住循环开头到 `Forward` 结束**（第一版只包 `Forward`，只归到 1.4 MB，漏掉了形状推断 /
+`BindAll` / `PrepackWeights` / `Finalize`）。CLI：`profile --alloc`（逐算子 KB 列）、
+`bench --alloc`（另打 `fit realloc` 计数与现场日志）。
+
+首测 rfdetr-small（20 iter，4 线程）：
+
+| 指标 | 改前 |
+|---|---:|
+| 每帧分配 | **54 823 KB** |
+| `Fit` 重分配 | **19 次/20 帧** |
+| gen2 GC | **5 次/20 帧** |
+
+### 10.2 根因：`Fit` 把 dtype 变化当成了重分配理由
+
+原实现：
+
+```csharp
+if (!reuse || Buffer.Length < need || DType != dtype) { ... Buffer = new byte[need]; }
+```
+
+`Buffer` 是 `byte[]`，`DType` 只是解释视图，长度够就该直接复用。加上 `DType != dtype` 后：
+
+- 网络里有共享槽位（`NetImpl._slots`）被不同 dtype 的张量轮流使用。
+- `ReallocLog` 抓到同一个 slot `#03c85018` 在 `[1,128,32,32] I64 (2400 B)` 与
+  `[1,6,64,1028] F32 (25 MB)` 之间来回切换。
+- 每次切到 I64 就 `new byte[2400]`，**把 25 MB 的缓冲缩成 2.4 KB**；下一帧 F32 再重新分配 25 MB。
+
+即：不仅白分配，还把「复用的容量」销毁了，等于每帧重来。
+
+修复后（`Tensor.Fit`）：
+
+```csharp
+if (!reuse || Buffer.Length < need) { ... Buffer = new byte[need]; }
+DType = dtype;
+```
+
+### 10.3 效果
+
+| 指标 | 改前 | 改后 |
+|---|---:|---:|
+| 每帧分配 | 54 823 KB | **1 397 KB** |
+| `Fit` 重分配 | 19 次/20 帧 | **0** |
+| gen2 GC | 5 次/20 帧 | **0** |
+
+### 10.4 等价性与性能
+
+- **逐字节等价**：`git stash` 前后分别 `run --dump`，`rfdetr out0/out1`、`yolo11n out0`
+  三个输出全部 IDENTICAL（4800 / 3600 / 2 822 400 字节）。
+- **端到端**：rfdetr min 252.6 → 254.2 ms，在噪声内（perf% 前后均 137~138）。
+- **回归**：yolo11n 38.0 / 38.9、yolov8n 46.3 / 46.9、rfdetr 254.0 / 261.9，均在前几轮波动范围内。
+- `gc pause` 实测仅 **0.1~0.2 ms** → **分配不是耗时主因**。这项修复是消除隐患
+  （GC 抖动与内存峰值），不是提速手段，不能计入「阶段 A 的 -13%」。
+
+### 10.5 结论
+
+1. `planv2 §2.3`「ORT 三机制我们都有」的说法要降级为：**前两项（PrePack、常驻线程池）等价，
+   第三项（memory pattern）此前有 bug，现已修复并验证等价。**
+2. 「分配合规」之后，逐元素 32 ms 的成因只能从**带宽 / 多 pass** 上找，不能再用「每帧在分配」解释。
+   这正是 P1'（`eltwisebench`）要回答的问题。
+
+---
+
+## 2026-11-15 第十一轮：逐元素「32 ms」是错的，实测只有 ~10 ms
+
+`planv2` 的 P1'/P2/P3 三项（合计承诺 -8%）都建立在「逐元素 ~32 ms」这个数字上。
+本轮先复测这个前提，结论是**前提不成立**，于是这一批课题直接作废。
+
+### 11.1 先确认 profile 的分解可信
+
+以前担心 `profile`「会放大绝对值」，所以 §8.4 只用**份额**去折算。现在加了预热，
+`sum-of-min` 与 `bench` 的 min 能对上了：
+
+| | bench min | profile sum-of-min |
+|---|---:|---:|
+| rfdetr-small 4 线程 | 253.5 ms | 252.5 ms |
+
+差 0.4%，可以当绝对时间用。于是拿到一份可信分解（3 iter，4 线程）：
+
+| type | ops | min ms | 占比 |
+|---|---:|---:|---:|
+| MatMul | 139 | 186.4 | **73.8%** |
+| Conv | 9 | 11.8 | 4.7% |
+| Transpose | 111 | 10.5 | 4.2% |
+| Softmax | 18 | 7.9 | 3.1% |
+| **Mul** | 76 | **5.4** | 2.1% |
+| LayerNormalization | 49 | 5.2 | 2.0% |
+| Reshape | 119 | 4.4 | 1.7% |
+| **FusedEltwise** | 12 | **4.2** | 1.7% |
+| GridSample | 3 | 3.5 | 1.4% |
+| **Where** | 1 | **2.6** | 1.0% |
+| **Add** | 46 | **1.2** | 0.5% |
+| **Div** | 7 | 0.7 | 0.3% |
+| **Relu / Silu** | 8+8 | **0.2 + 0.2** | 0.2% |
+
+**逐元素合计 ≈ 12 ms（4.7%）**，不是 32 ms。§9.5 / §8.4 里 Mul 8.6 ms、Add 7.8 ms、
+Relu 6.4 ms、Silu 6.0 ms 那一组数**在本机复现不出来**（可能是更旧的代码状态或未预热的
+`avg`；预热与否对 `min` 无影响，已单独验证）。
+
+### 11.2 加 `dump-graph --inputs`：算真实流量
+
+只看 ms 判断不了「贵不贵」，得知道搬了多少字节。`dump-graph` 原来只打印输出形状，
+本轮加 `--inputs` 同时打印输入形状，于是能区分标量广播（2 趟）、尾广播（≈2 趟）、全长（3 趟）：
+
+| type | ops | 输出元素 | 真实流量 | 实测 | 等效带宽 |
+|---|---:|---:|---:|---:|---:|
+| Mul | 76 | 6.8 M | 153.1 MB | 4.9 ms | **31 GB/s** |
+| Add | 46 | 10.9 M | 126.6 MB | 1.2 ms | **106 GB/s** |
+| Relu | 8 | 3.0 M | 17.0 MB | 0.2 ms | 85 GB/s |
+| Silu | 8 | 2.1 M | 10.0 MB | 0.2 ms | 50 GB/s |
+| Where | 1 | 0.26 M | 2.0 MB | 2.6 ms | **0.8 GB/s** |
+
+Mul 54% 的输入是 `F32 [1]` 或 `F32 [384]`，所以它只有 ~2 趟流量，153 MB 里已经算过。
+Mul 的 31 GB/s 偏低（Add 是 106 GB/s），差在 24 个 `layer_scale/Mul`（`[4,257,384] × [384]`）
+走了尾广播路径；见 11.4。
+
+### 11.3 `eltwisebench`：内核本身贴着缓存带宽
+
+新加 `eltwisebench`（`--shape` 可指定，默认取 rfdetr 的真实形状），每项给 ms / GB/s / ns·元素，
+并**自带带宽参考** —— `copy`（1 读 1 写 memmove）是这台机器在该线程数下的上限，别的不跟它比就没意义。
+`[4,257,384]`（a+b+c = 4.52 MB，L3 常驻）4 线程：
+
+| 内核 | ms | GB/s | ns/元素 |
+|---|---:|---:|---:|
+| copy（memmove） | 0.057 | 55.2 | 0.145 |
+| add | 0.043 | 111.2 | 0.108 |
+| mul | 0.040 | 119.0 | 0.101 |
+| mul-scalar | 0.051 | 61.7 | 0.130 |
+| **mul-tail（`[384]`）** | **0.534** | **5.9** | **1.354** |
+| relu | 0.024 | 131.6 | 0.061 |
+| silu | 0.090 | 35.0 | 0.228 |
+| **copy1（逐元素 4 字节 CopyTo）** | **0.315** | **10.0** | **0.799** |
+
+两条读数值得记：
+
+- **连续内核 100+ GB/s，已经超过 `copy` 本身**（三趟流比两趟更容易掩盖延迟）→ 逐元素**不是**亏在算法上。
+  图里 Mul 只有 31 GB/s 是**缓存不命中**（生产者隔了几百个算子），不是内核缺陷。
+- **`copy1` = 0.8 ns/元素**，是 `copy` 的 5~6 倍。`Where` 正是这个写法
+  （`OpUtil.CopyBytes(..., 1)` 逐元素），262 K 元素实测 2.6 ms = **10 ns/元素**
+  （多出来的部分是掩码 `ReadBools` + 三套 stride 推进）。**单点 1% 的纯浪费，改法明确。**
+
+### 11.4 尾广播：分段循环搬进内核（-28%）
+
+`ApplyBroadcast` 原来是「逐段调用 `ApplyContiguous`」，1028 段就 switch 1028 次、
+压 1028 次 `fixed`。改成一次 switch 选内核、分段循环放在内核内部：
+
+| | ms | ns/元素 |
+|---|---:|---:|
+| 改前（逐段 dispatch） | 0.712 | 1.803 |
+| 改后（内核内分段） | 0.534 | 1.354 |
+
+图中 `Mul` 5.4 → **4.9 ms**，端到端在噪声内（这 0.5 ms 不到 0.2%）。
+**遗留问题**：即便搬进内核，仍比连续内核慢 13×（1.35 vs 0.10 ns/元素），
+且**与段大小无关**（inner 从 384 扫到 4112，ns/元素 恒定 1.3~1.7）——说明不是分段调度开销，
+而是每元素级别的代价（怀疑 4K 别名或内核未被向量化，未定位）。图里这些节点实际只要
+~0.13 ms/个（比微基准快 4 倍），所以**没有继续追**。
+
+### 11.5 结论
+
+1. **P1'（逐元素为什么贵）关闭：它不贵。** 12 ms，其中 Mul 已贴带宽，剩下的
+   `Where`（2.6 ms）与 `copy1` 模式是唯一明确的浪费，合计收益上限 ≈ 2.5 ms（1%）。
+2. `planv2` 的 P2（Conv+SiLU 融合）、P3（逐元素碎片）随之作废 —— 它们的杠杆是按 32 ms 估的。
+3. 剩余预算里 **MatMul 独占 73.8%（186 ms）**，而 `gemmbench` 说明它已到 AVX2 微内核的 70~74%，
+   图里 290 GFLOPS ≈ 微基准水平，**没有逐层损耗**。要再往下走只能动微内核本身（P6'）。
+4. 非 GEMM 合计 65 ms（ORT 约 39 ms），分散在 Transpose 10.5 / Softmax 7.9 / LN 5.2 /
+   Reshape 4.4 / FusedEltwise 4.2 / GridSample 3.5 / Where 2.6，单项都不超过 4%
+   —— 属于「有空顺手做」的档，不再单列课题。
+
+
+## 2026-11-15 第十二轮：GEMM 微内核 MR 4→6（端到端 -5%）
+
+`planv2` 的 P6' 是唯一大项。本轮先纠正两个测量前提，再动内核。
+
+### 12.1 先把「峰值」钉死
+
+以前说「微内核 70~74%」是拿 290 GFLOPS 比一个含糊的峰值。现在有 `flopsbench`
+（纯 FMA 环，`--threads` 可调）当硬上限：
+
+| | GFLOPS | 备注 |
+|---|---:|---|
+| 1 线程 | 111.0 | = 2×FMA × 8 lane × 2 × 3.45 GHz，**贴着理论值** |
+| 4 线程 | 427.1 | 4 核线性扩展 |
+
+同期 `% Processor Performance` = 137.8（≈3.45 GHz），且**GEMM 满载 6 秒内该值不动**
+（`gemmbench --iters 400` 期间连续采样恒定 137.8）→ GEMM 期间不存在降频，427 是硬上限。
+
+于是效率可以直接算：`1028×384×1536` 打包路径 3.400 ms = **356.6 GFLOPS = 83.5%**；
+未打包 3.759 ms = 322.6 GFLOPS = 75.6%。（上一轮说的 70~74% 用的是旧的 4 行内核。）
+
+### 12.2 两个被推翻的猜测
+
+- **「大 k（n 小）会掉一半」是降频假象。** 某次 `1028,1536,384` 只跑到 47 GFLOPS，
+  复测同样命令是 297.8。凡是一次进程里连跑 3~4 个形状，**后面的形状会撞墙**
+  （同一进程内 4 个 `Best()` 累计 ~4 s 重载即可触发）。所以：
+  **每个形状单独起进程 + 之间冷却 10~20 s + 取 min**，是本机唯一可信姿势。
+- **对齐不是问题。** `gemmbench --misalign 1` 对 `257,64,257×24` 无影响
+  （逐 batch 0.033 ms 不变）。图里 `byte[]` 切片只保证 4 字节对齐，但内核是 32 字节
+  非对齐 load，Zen4 上代价可忽略。
+
+### 12.3 内核：MR=4 → MR=6
+
+原来 `Multiply4Rows`（4 行 × 16 列 = 8 个累加器）每个 k 需要 2 条 B load + 4 条 A 广播
+= 6 条 load（3 拍）对 8 条 FMA（4 拍）—— 只有 25% 余量。改成 `Multiply6Rows`
+（6 行 × 16 列 = 12 个累加器）：8 条 load（4 拍）对 12 条 FMA（6 拍），余量 50%，
+每行的 B 流量降到 2/3。这也正是 OpenBLAS Haswell sgemm 内核的 6×16 分块。
+
+累加仍是 k 递增的单条 FMA 链 → **逐位一致**（见 12.5）。
+
+微基准（每形状单独进程、取 min of 20，GFLOPS 为未打包路径）：
+
+| 形状 | MR=4 | MR=6 | 提升 |
+|---|---:|---:|---:|
+| 1028,384,1536 | 295.8 | 321.1 | +8.6% |
+| 1028,1536,384 | 297.8 | 323.4 | +8.6% |
+| 1028,384,384 | 299.8 | 324.9 | +8.4% |
+| 300,256,2048 | 310.0 | 339.0 | +9.4% |
+| 1028,1024,1024 | 272.9 | 289.9 | +6.2% |
+
+端到端（交替 A/B，`--warmup 2 --iters 4`，每轮之间冷却 15 s，取 min）：
+
+| | 3 次 min ms | 最好 |
+|---|---|---:|
+| MR=6 | 234.3 / 235.1 / 237.0 | **234.3** |
+| MR=4 | 246.0 / 246.3 / 247.1 | 246.0 |
+
+**-5.0%（246.0 → 234.3 ms）**。`yolo11n` 37.9 ms 不变（38.0）—— 它是卷积模型，
+MatMul 只有几个，符合预期。
+
+### 12.4 批量 GEMM 合并：确实有用（1.048×）
+
+注意力 `QK^T`/`PV` 是 `[4,6,257,64]×[4,6,64,257]`：24 个 batch、每个只有 8.4 MFLOP。
+逐 batch 调 `Multiply` 会开 24 次并行域（每次 17 个列块摊 4 线程 = 5:4:4:4），
+新增 `MultiplyBatched` 把 `batch × 列块` 铺成 408 个任务**一次派发**。
+
+端到端交替 A/B（其余代码相同，只切 `densePerBatch` 分支）：
+**238.1 vs 249.6 ms，1.048×**。因此保留该路径（原先只是「收益有限」的猜测，
+现在有端到端读数）。
+
+顺带确认 `gemmbench` 对同一形状：逐 batch 0.033×24 = 0.79 ms，合并 0.68 ms（1.16×）。
+
+### 12.5 等价性
+
+`bench/ab/*` 与本轮改动前后的 dump 逐位比对（4 线程、同一输入）：
+
+| 模型 | 输出 | 结果 |
+|---|---|---|
+| rfdetr-small | out0 / out1 | IDENTICAL |
+| yolo11n | out0 | IDENTICAL |
+
+另外单独验证过 MR=6 与 MR=4 的输出 MD5 完全相同（`ONNXSHARP_GEMM_MR=4` 退回旧内核）。
+
+### 12.6 profile 的 per-op 小算子仍然不可信（未解决的口径问题）
+
+同一个 `attention/attention/MatMul`（203 MFLOP），三种口径给出三个数：
+
+| 口径 | ms | 折算 |
+|---|---:|---|
+| `gemmbench 257,64,257 --batch 24`（合并） | 0.68 | 298 GFLOPS |
+| `ONNXSHARP_MM_TRACE=1` 图内稳态 | 0.80 | 254 GFLOPS |
+| `profile --warmup 4` 的 min | 1.47 | 138 GFLOPS |
+| `profile --warmup 10` 的 min | 3.60 | 56 GFLOPS |
+
+预热越多反而越大 → 不是 JIT 提升不足，而是**运行期间它在变大**（同一份代码、同一形状）。
+`sum-of-min` 与 `bench min` 总量能对上（232.9 vs 234.3），说明这些偏差在别处被抵消，
+per-op 单项不能单独引用。**判断某条路径值不值得做，一律用「关掉该路径」的端到端 A/B**，
+12.4 就是这么做的。
+
+### 12.7 结论与剩余空间
+
+1. MR=6 落地，端到端 **-5.0%**；内核从 75.6% → 83.5%（打包路径）。
+2. 打包路径已经 83.5%，未打包 75.6%，差 8 个点就是「每帧重新打包 B」的成本
+   （`1028,384,1536` 打包/不打包 = 3.400 / 3.759 ms）。常量权重已走 `Pack` 缓存，
+   未打包路径只剩注意力这类动态 B。
+3. 剩下的 16.5% 不是调参能拿的：JIT 生成的内层循环已经是
+   `2 load + 6 broadcast + 12 FMA + 5 标量` / k（`DOTNET_JitDisasm=Multiply6Rows`
+   已核对，12 个累加器全在寄存器里，用到了 AVX-512 的 ymm16~31）。
+   再往上要么 **NR=32 / MR=12 的 24 累加器内核**（寄存器够，但需要 AVX-512 分派），
+   要么 **BLIS 式 A 打包 + k 分块**。按 12.6 的口径教训，这两项都要先有可靠的
+   per-op 读数才值得投入，当前**暂不启动**。
+   > 同日已做：MR=12 的 24 累加器内核，打包路径 83.5% → **92.2%**，见 §13。
+
+### 12.8 复现命令
+
+```powershell
+$env:ONNXSHARP_THREADS='4'
+$cli='tools/OnnxSharp.Cli/bin/Release/net10.0/OnnxSharp.Cli.dll'
+
+# 峰值参考
+dotnet $cli flopsbench --iters 100 --inner 500000 --threads 4
+
+# 单形状（每个形状一个进程，之间冷却）
+dotnet $cli gemmbench --iters 20 --shape 1028,384,1536
+
+# 内核 A/B（退回 4 行内核）
+$env:ONNXSHARP_GEMM_MR='4'
+
+# 逐算子形状/耗时
+$env:ONNXSHARP_MM_TRACE='1'
+```
+
+
+## 2026-11-15 第十三轮：MR 6→12（24 累加器，打包路径到 92%）
+
+§12 留下 16.5% 的缺口，判断是「每 k 的 load 与标量开销摊得太薄」。这一轮按
+**BLIS/OpenBLAS 的老办法**把 MR 再翻一倍：6×16 → 12×16。
+
+### 13.1 为什么 12 行（而不是 8 行）
+
+| MR×NR | 累加器 | 每 k：load / FMA | load 占比 | 需要的 ymm |
+|---|---:|---|---:|---:|
+| 4×16 | 8 | 6 / 8 | 75% | 6 |
+| 6×16 | 12 | 8 / 12 | 67% | 15 |
+| **12×16** | **24** | **14 / 24** | **58%** | **27** |
+
+12 行还有个附带收益：同一个 B 面板被重流的次数减半（行组数 m/6 → m/12），
+而 k=384 时面板正好 24 KB —— 这种「刚好压住 L1」的尺寸最怕被反复重流。
+
+24 个累加器 + 2 条 B + 1 条 A 广播 = 27 个 ymm，**只有 AVX-512 的 32 个向量寄存器装得下**
+（AVX2 只有 16 个，直接溢出到栈），所以 `UseMr12` 在运行时按 `Avx512F.VL.IsSupported` 分派，
+AVX2 机器仍走 6 行内核；`ONNXSHARP_GEMM_MR=6` / `=4` 可强制降级。
+
+### 13.2 踩到的坑：12 个 bias 向量把寄存器吃满了
+
+第一版照抄 6 行内核的写法（`var b0v = Vector256.Create(bias[0]) … b11v`），
+24 + 12 + 3 > 32 → 溢出，实测只比 6 行快 2%且方差 6.8%。
+改成**只在初始化表达式里就地广播**（`initBias ? Vector256.Create(i0) : ...`，`i0` 是 float 标量），
+持久向量降到 27 个，性能立刻跳到 11%。
+
+### 13.3 结果
+
+微基准（交替 A/B、每档之间冷却 20 s、每档 15 iter，两次独立复现）：
+
+| 形状 1028,384,1536 | 未打包 ms | 未打包 GFLOPS | 打包 ms | 打包效率 |
+|---|---:|---:|---:|---:|
+| MR=6 | 3.814 / 3.817 | 318.0 / 317.7 | 3.424 / 3.438 | 83.0% |
+| **MR=12** | **3.473 / 3.475** | **349.0 / 349.2** | **3.079 / 3.096** | **92.2%** |
+
+打包路径 1.2126 GFLOP / 3.079 ms = **393.8 GFLOPS = 92.2%**（峰值 427.1）；未打包 81.7%。
+
+端到端（rfdetr，交替 A/B，`--warmup 2 --iters 4`，两次独立实验共 6 对）：
+
+| 对 | MR=6 | MR=12 | MR12 快 |
+|---|---:|---:|---:|
+| 1 | 257.7 | 248.4 | 3.7% |
+| 2 | 246.6 | 235.4 | 4.7% |
+| 3 | 241.3 | 227.9 | 5.9% |
+| 4（反向） | 233.7 | 221.8 | 5.4% |
+| 5（反向） | 234.5 | 244.2 | **-4.0%** |
+| 6（反向） | 235.0 | 223.0 | 5.4% |
+
+5/6 对 MR=12 更快，中位 **5.4%**；反向顺序（先跑 MR=12）也保持 5.4%，不是顺序偏置。
+最好读数 **221.8 ms**（MR=4 时代是 246.0，累计 **-9.8%**）。
+第 5 对的反例伴随整机发热（同一时段 MR=6 也从 233 升到 234.5、MR=12 从 221 跳到 244），
+按 §12.2 的口径纪律判为噪声。
+
+`yolo11n` 同协议 **37.9 → 36.4 ms**（-4%），方向一致（它也有几处常量权重 MatMul）。
+
+### 13.4 等价性
+
+MR=12 与 MR=6 的 `--dump` 逐位比对：`rfdetr out0/out1` **IDENTICAL**
+（累加仍是 k 递增的单条 FMA 链，只是行块变宽，求和顺序不变）。
+
+### 13.5 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'
+$cli='tools/OnnxSharp.Cli/bin/Release/net10.0/OnnxSharp.Cli.dll'
+dotnet $cli gemmbench --iters 15 --shape 1028,384,1536   # 默认 MR=12
+$env:ONNXSHARP_GEMM_MR='6'                               # 退回 6 行内核
+```
+
+### 13.6 还剩什么
+
+打包路径 92.2%、未打包 81.7%（差 10 个点仍是「每帧重新打包动态 B」）。GEMM 总量按
+83.5% → 92% 折算还剩约 12 ms（端到端 ~5%），已经没有「两位数」的空间：
+再往上要靠 BLIS 式 A 打包 + k 分块把未打包路径也拉平，收益上限 10 ms 量级。

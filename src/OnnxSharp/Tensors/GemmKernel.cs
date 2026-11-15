@@ -190,6 +190,141 @@ internal static class GemmKernel
     }
 
     /// <summary>
+    /// 批量 GEMM：B 每个 batch 一份，<c>c[i] = a[i] · b[i]</c>。
+    /// <para>
+    /// 注意力里的 QK^T / P·V 就是这种形态（<c>[4,6,257,64] × [4,6,64,257]</c>）：24 个 batch，
+    /// 每个 batch 只有 8 MFLOP。按 batch 逐个调 <see cref="Multiply"/> 时，每个 batch 都要
+    /// 单独派发一次并行域，而它只有 17 个列块 —— 4 线程的余数（17/4 → 5:4:4:4）加上每次派发
+    /// 的开销，合计吃掉一半并行度：rfdetr 实测这批算子 **130 GFLOPS**，而同一个形状单跑
+    /// <c>gemmbench</c> 是 253。
+    /// </para>
+    /// <para>
+    /// 这里把 <c>batch × 列块</c> 铺成一个并行域：一次派发、按块均摊，负载粒度更细。
+    /// </para>
+    /// </summary>
+    internal static unsafe void MultiplyBatched(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int batches,
+        int m,
+        int k,
+        int n,
+        bool parallel = true,
+        ReadOnlySpan<float> columnBias = default,
+        int aStride = 0,
+        int aBatchStride = 0,
+        int bColStride = 1,
+        int bBatchStride = 0,
+        int bStride = 0)
+    {
+        if (batches <= 0 || m <= 0 || n <= 0)
+            return;
+
+        if (aStride <= 0)
+            aStride = k;
+        if (aBatchStride <= 0)
+            aBatchStride = m * k;
+        if (bStride <= 0)
+            bStride = n;
+        if (bBatchStride <= 0)
+            bBatchStride = k * n;
+
+        if (k <= 0 || (batches == 1 && aStride == k && bColStride == 1))
+        {
+            for (int bi = 0; bi < batches; bi++)
+            {
+                Multiply(
+                    a.Slice(0, m * k), b.Slice(0, k * n), c.Slice(bi * m * n, m * n),
+                    m, k, n, columnBias: columnBias);
+            }
+
+            return;
+        }
+
+        int nb = SelectColumnBlock(n);
+        int columnBlocks = (n + nb - 1) / nb;
+        int tasks = batches * columnBlocks;
+        int threads = ParallelRange.Threads;
+
+        // 合并后单个任务只有 m×nb×k 次乘加，粒度够细，阈值可以比 Multiply 低一档
+        bool useParallel = parallel && tasks > 1
+            && (long)batches * m * n * k >= ParallelThreshold;
+
+        bool hasColumnBias = columnBias.Length >= n;
+
+        fixed (float* pa = a)
+        fixed (float* pb = b)
+        fixed (float* pc = c)
+        fixed (float* pcbias = hasColumnBias ? columnBias : ReadOnlySpan<float>.Empty)
+        {
+            float* a0 = pa;
+            float* b0 = pb;
+            float* c0 = pc;
+            float* columnBias0 = pcbias;
+
+            void Task(int task, float* pack)
+            {
+                int bi = task / columnBlocks;
+                int j0 = (task - bi * columnBlocks) * nb;
+                if (j0 >= n)
+                    return;
+
+                MultiplyColumnRange(
+                    a0 + (long)bi * aBatchStride,
+                    b0 + (long)bi * bBatchStride,
+                    c0 + (long)bi * m * n,
+                    m, k, n, n, nb, j0, Math.Min(j0 + nb, n), pack, null, columnBias0, aStride, bColStride, bStride);
+            }
+
+            if (useParallel)
+            {
+                int basePer = tasks / threads;
+                int rem = tasks % threads;
+
+                ParallelRange.For(threads, (begin, end) =>
+                {
+                    // 面板缓冲按线程租一次，别按任务（408 个任务时租还开销会显出来）
+                    var rented = ArrayPool<float>.Shared.Rent(k * nb);
+                    try
+                    {
+                        fixed (float* pack = rented)
+                        {
+                            for (int t = begin; t < end; t++)
+                            {
+                                int t0 = t * basePer + Math.Min(t, rem);
+                                int t1 = t0 + basePer + (t < rem ? 1 : 0);
+                                for (int task = t0; task < t1; task++)
+                                    Task(task, pack);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(rented);
+                    }
+                });
+            }
+            else
+            {
+                var rented = ArrayPool<float>.Shared.Rent(k * nb);
+                try
+                {
+                    fixed (float* pack = rented)
+                    {
+                        for (int task = 0; task < tasks; task++)
+                            Task(task, pack);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(rented);
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// 预打包的 B：<c>[列块][k][width]</c> 连续面板，块宽固定为 <see cref="BlockWidth"/>（尾部不足的列补 0）。
     /// <para>
     /// 常量权重每帧都要被 <see cref="Multiply"/> 重新打包一遍：<c>[96,320,1280]</c> 是
@@ -225,6 +360,18 @@ internal static class GemmKernel
     /// <summary>关掉常量权重预打包（<c>ONNXSHARP_NO_PREPACK=1</c>），供交替 A/B 用。</summary>
     internal static bool PrepackEnabled { get; } =
         Environment.GetEnvironmentVariable("ONNXSHARP_NO_PREPACK") is not { Length: > 0 };
+
+    /// <summary>临时 A/B 开关：<c>ONNXSHARP_GEMM_MR=4</c> 退回 4 行内核（比较 MR=6 用）。</summary>
+    internal static bool UseMr6 { get; } =
+        Environment.GetEnvironmentVariable("ONNXSHARP_GEMM_MR") != "4";
+
+    /// <summary>
+    /// MR=12 的 24 累加器内核需要 32 个向量寄存器（AVX-512 才有 ymm16~31），
+    /// 纯 AVX2 机器上会溢出到栈，因此按 ISA 分派。<c>ONNXSHARP_GEMM_MR=6</c> 可强制退回 6 行内核。
+    /// </summary>
+    internal static bool UseMr12 { get; } =
+        Environment.GetEnvironmentVariable("ONNXSHARP_GEMM_MR") is not ("4" or "6")
+        && Avx512F.VL.IsSupported;
 
     /// <summary>把 <c>b[k, n]</c> 打包成面板；调用方负责按权重实例缓存结果。</summary>
     internal static unsafe PackedB Pack(ReadOnlySpan<float> b, int k, int n)
@@ -322,6 +469,42 @@ internal static class GemmKernel
                 int bulk = colScale is null ? width : width & ~15;
 
                 int row = row0;
+                for (; UseMr12 && row + 12 <= row1; row += 12)
+                {
+                    Multiply12Rows(a0 + (long)row * k, k, panel, c0 + (long)row * ldc + j0, k, bulk,
+                        panelStride, ldc, bias0 is null ? null : bias0 + row, colBias, colScale);
+
+                    if (bulk >= width)
+                        continue;
+
+                    int rest12 = width - bulk;
+                    for (int i = 0; i < 12; i++)
+                    {
+                        float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
+                        // 纯累加（bias 留给 ScaleColumns 加，否则列尾会把 bias 加两遍）
+                        MultiplyRow(a0 + (long)(row + i) * k, panel + bulk, cRow, k, rest12, panelStride);
+                        ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest12);
+                    }
+                }
+
+                for (; UseMr6 && row + 6 <= row1; row += 6)
+                {
+                    Multiply6Rows(a0 + (long)row * k, k, panel, c0 + (long)row * ldc + j0, k, bulk,
+                        panelStride, ldc, bias0 is null ? null : bias0 + row, colBias, colScale);
+
+                    if (bulk >= width)
+                        continue;
+
+                    int rest = width - bulk;
+                    for (int i = 0; i < 6; i++)
+                    {
+                        float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
+                        // 纯累加（bias 留给 ScaleColumns 加，否则列尾会把 bias 加两遍）
+                        MultiplyRow(a0 + (long)(row + i) * k, panel + bulk, cRow, k, rest, panelStride);
+                        ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest);
+                    }
+                }
+
                 for (; row + 4 <= row1; row += 4)
                 {
                     Multiply4Rows(a0 + (long)row * k, k, panel, c0 + (long)row * ldc + j0, k, bulk,
@@ -334,7 +517,6 @@ internal static class GemmKernel
                     for (int i = 0; i < 4; i++)
                     {
                         float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
-                        // 纯累加（bias 留给 ScaleColumns 加，否则列尾会把 bias 加两遍）
                         MultiplyRow(a0 + (long)(row + i) * k, panel + bulk, cRow, k, rest, panelStride);
                         ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest);
                     }
@@ -411,24 +593,44 @@ internal static class GemmKernel
         int jEnd,
         float* pack,
         float* bias,
-        float* columnBias)
+        float* columnBias,
+        int aStride = 0,
+        int bColStride = 1,
+        int bStride = 0)
     {
+        if (aStride <= 0)
+            aStride = k;
+        if (bStride <= 0)
+            bStride = n;
+
         for (int j0 = jBegin; j0 < jEnd; j0 += nb)
         {
             int width = Math.Min(nb, jEnd - j0);
-            PackColumns(b + j0, k, n, width, pack);
+            PackColumns(b + (long)j0 * bColStride, k, bStride, width, pack, 0, bColStride);
             float* colBias = columnBias is null ? null : columnBias + j0;
 
             int row = 0;
+            for (; UseMr12 && row + 12 <= m; row += 12)
+            {
+                Multiply12Rows(a + (long)row * aStride, aStride, pack, c + (long)row * ldc + j0, k, width, width, ldc,
+                    bias is null ? null : bias + row, colBias);
+            }
+
+            for (; UseMr6 && row + 6 <= m; row += 6)
+            {
+                Multiply6Rows(a + (long)row * aStride, aStride, pack, c + (long)row * ldc + j0, k, width, width, ldc,
+                    bias is null ? null : bias + row, colBias);
+            }
+
             for (; row + 4 <= m; row += 4)
             {
-                Multiply4Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
+                Multiply4Rows(a + (long)row * aStride, aStride, pack, c + (long)row * ldc + j0, k, width, width, ldc,
                     bias is null ? null : bias + row, colBias);
             }
 
             for (; row < m; row++)
             {
-                MultiplyRow(a + (long)row * k, pack, c + (long)row * ldc + j0, k, width, width,
+                MultiplyRow(a + (long)row * aStride, pack, c + (long)row * ldc + j0, k, width, width,
                     bias is null ? 0f : bias[row], colBias);
             }
         }
@@ -478,9 +680,21 @@ internal static class GemmKernel
                     int width = n - j0 < nb ? n - j0 : nb;
                     PackColumns(b + j0, k, n, width, pack);
 
-                    // 4 行一起算：同一次 B 的 load 供 4 行复用，L1 的 load 端口不再
-                    // 被「每行各自把 B 拉一遍」占满。剩下不足 4 行的用单行内核收尾。
+                    // 多行一起算：同一次 B 的 load 供多行复用，L1 的 load 端口不再
+                    // 被「每行各自把 B 拉一遍」占满。行块按 12 → 6 → 4 → 1 级联收尾。
                     int row = row0;
+                    for (; UseMr12 && row + 12 <= row1; row += 12)
+                    {
+                        Multiply12Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
+                            bias is null ? null : bias + row, columnBias is null ? null : columnBias + j0);
+                    }
+
+                    for (; UseMr6 && row + 6 <= row1; row += 6)
+                    {
+                        Multiply6Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
+                            bias is null ? null : bias + row, columnBias is null ? null : columnBias + j0);
+                    }
+
                     for (; row + 4 <= row1; row += 4)
                     {
                         Multiply4Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
@@ -509,10 +723,26 @@ internal static class GemmKernel
     /// </para>
     /// </summary>
     private static unsafe void PackColumns(
-        float* b, int k, int srcStride, int width, float* pack, int packStride = 0)
+        float* b, int k, int srcStride, int width, float* pack, int packStride = 0, int srcColStride = 1)
     {
         if (packStride <= 0)
             packStride = width;
+
+        // 转置视图（比如 attention 的 K^T：[k=D, n=T]，源是 [B,T,H,D]）：
+        // 列方向不连续，只能逐元素 gather。k×width 个元素、每次跳 srcColStride×4 字节，
+        // 仍然比「先物化一遍转置再读」少一趟完整读写。
+        if (srcColStride != 1)
+        {
+            for (int t = 0; t < k; t++)
+            {
+                float* src = b + (long)t * srcStride;
+                float* dst = pack + (long)t * packStride;
+                for (int j = 0; j < width; j++)
+                    dst[j] = src[(long)j * srcColStride];
+            }
+
+            return;
+        }
 
         int j = 0;
 
@@ -529,12 +759,420 @@ internal static class GemmKernel
         }
     }
 
+    /// <summary>
+    /// 12 行共享一次 B 加载的微内核（MR=12、NR=16，24 个累加器）。
+    /// <para>
+    /// 6 行版每个 k 是 2 条 B load + 6 条 A 广播 = 8 条 load（Zen 4 每拍 2 条 → 4 拍）对 12 条 FMA
+    /// （6 拍），load 已经吃掉 2/3 的发射带宽；12 行时同一批 load 是 2 + 12 = 14 条（7 拍）对 24 条
+    /// FMA（12 拍），load 占比降到 58%。同时同一个 B 面板被重流的次数减半（行组数 m/6 → m/12），
+    /// 面板 24 KB（k=384）这种「刚好压住 L1」的尺寸对网状的伤害也随之减半。
+    /// </para>
+    /// <para>
+    /// 24 个累加器 + 2 条 B + 1 条 A 广播 = 27 个 ymm，只有 AVX-512 的 32 个向量寄存器装得下；
+    /// AVX2 的 16 个会溢出到栈，所以由 <see cref="UseMr12"/> 在运行时按 ISA 分派。累加仍是 k 递增的
+    /// 单条 FMA 链，与 <see cref="Multiply6Rows"/> 逐位一致。
+    /// </para>
+    /// </summary>
+    private static unsafe void Multiply12Rows(
+        float* a,
+        int aStride,
+        float* b,
+        float* c,
+        int k,
+        int width,
+        int bStride,
+        int ldc,
+        float* bias = null,
+        float* columnBias = null,
+        float* columnScale = null)
+    {
+        float* a1 = a + aStride;
+        float* a2 = a + 2 * aStride;
+        float* a3 = a + 3 * aStride;
+        float* a4 = a + 4 * aStride;
+        float* a5 = a + 5 * aStride;
+        float* a6 = a + 6 * aStride;
+        float* a7 = a + 7 * aStride;
+        float* a8 = a + 8 * aStride;
+        float* a9 = a + 9 * aStride;
+        float* a10 = a + 10 * aStride;
+        float* a11 = a + 11 * aStride;
+
+        float* c1 = c + ldc;
+        float* c2 = c + 2 * ldc;
+        float* c3 = c + 3 * ldc;
+        float* c4 = c + 4 * ldc;
+        float* c5 = c + 5 * ldc;
+        float* c6 = c + 6 * ldc;
+        float* c7 = c + 7 * ldc;
+        float* c8 = c + 8 * ldc;
+        float* c9 = c + 9 * ldc;
+        float* cc10 = c + 10 * ldc;
+        float* cc11 = c + 11 * ldc;
+
+        bool scaled = columnScale is not null;
+
+        // 只留 12 个 float 标量（不占向量寄存器）：24 个累加器 + B + 广播已经 27 个 ymm，
+        // 若再让 12 个 bias 向量全程保活就会溢出到栈。
+        bool initBias = columnBias is null || scaled;
+        float i0 = !scaled && bias is not null ? bias[0] : 0f;
+        float i1 = !scaled && bias is not null ? bias[1] : 0f;
+        float i2 = !scaled && bias is not null ? bias[2] : 0f;
+        float i3 = !scaled && bias is not null ? bias[3] : 0f;
+        float i4 = !scaled && bias is not null ? bias[4] : 0f;
+        float i5 = !scaled && bias is not null ? bias[5] : 0f;
+        float i6 = !scaled && bias is not null ? bias[6] : 0f;
+        float i7 = !scaled && bias is not null ? bias[7] : 0f;
+        float i8 = !scaled && bias is not null ? bias[8] : 0f;
+        float i9 = !scaled && bias is not null ? bias[9] : 0f;
+        float ia = !scaled && bias is not null ? bias[10] : 0f;
+        float ib = !scaled && bias is not null ? bias[11] : 0f;
+
+        int j = 0;
+
+        for (; j + 16 <= width; j += 16)
+        {
+            var c00 = initBias ? Vector256.Create(i0) : Avx.LoadVector256(columnBias + j);
+            var c01 = initBias ? c00 : Avx.LoadVector256(columnBias + j + 8);
+            var c10 = initBias ? Vector256.Create(i1) : c00;
+            var c11 = initBias ? c10 : c01;
+            var c20 = initBias ? Vector256.Create(i2) : c00;
+            var c21 = initBias ? c20 : c01;
+            var c30 = initBias ? Vector256.Create(i3) : c00;
+            var c31 = initBias ? c30 : c01;
+            var c40 = initBias ? Vector256.Create(i4) : c00;
+            var c41 = initBias ? c40 : c01;
+            var c50 = initBias ? Vector256.Create(i5) : c00;
+            var c51 = initBias ? c50 : c01;
+            var c60 = initBias ? Vector256.Create(i6) : c00;
+            var c61 = initBias ? c60 : c01;
+            var c70 = initBias ? Vector256.Create(i7) : c00;
+            var c71 = initBias ? c70 : c01;
+            var c80 = initBias ? Vector256.Create(i8) : c00;
+            var c81 = initBias ? c80 : c01;
+            var c90 = initBias ? Vector256.Create(i9) : c00;
+            var c91 = initBias ? c90 : c01;
+            var ca0 = initBias ? Vector256.Create(ia) : c00;
+            var ca1 = initBias ? ca0 : c01;
+            var cb0 = initBias ? Vector256.Create(ib) : c00;
+            var cb1 = initBias ? cb0 : c01;
+
+            float* brow = b + j;
+            for (int t = 0; t < k; t++, brow += bStride)
+            {
+                var vb0 = Avx.LoadVector256(brow);
+                var vb1 = Avx.LoadVector256(brow + 8);
+
+                var va = Vector256.Create(a[t]);
+                c00 = Fma.MultiplyAdd(va, vb0, c00);
+                c01 = Fma.MultiplyAdd(va, vb1, c01);
+
+                va = Vector256.Create(a1[t]);
+                c10 = Fma.MultiplyAdd(va, vb0, c10);
+                c11 = Fma.MultiplyAdd(va, vb1, c11);
+
+                va = Vector256.Create(a2[t]);
+                c20 = Fma.MultiplyAdd(va, vb0, c20);
+                c21 = Fma.MultiplyAdd(va, vb1, c21);
+
+                va = Vector256.Create(a3[t]);
+                c30 = Fma.MultiplyAdd(va, vb0, c30);
+                c31 = Fma.MultiplyAdd(va, vb1, c31);
+
+                va = Vector256.Create(a4[t]);
+                c40 = Fma.MultiplyAdd(va, vb0, c40);
+                c41 = Fma.MultiplyAdd(va, vb1, c41);
+
+                va = Vector256.Create(a5[t]);
+                c50 = Fma.MultiplyAdd(va, vb0, c50);
+                c51 = Fma.MultiplyAdd(va, vb1, c51);
+
+                va = Vector256.Create(a6[t]);
+                c60 = Fma.MultiplyAdd(va, vb0, c60);
+                c61 = Fma.MultiplyAdd(va, vb1, c61);
+
+                va = Vector256.Create(a7[t]);
+                c70 = Fma.MultiplyAdd(va, vb0, c70);
+                c71 = Fma.MultiplyAdd(va, vb1, c71);
+
+                va = Vector256.Create(a8[t]);
+                c80 = Fma.MultiplyAdd(va, vb0, c80);
+                c81 = Fma.MultiplyAdd(va, vb1, c81);
+
+                va = Vector256.Create(a9[t]);
+                c90 = Fma.MultiplyAdd(va, vb0, c90);
+                c91 = Fma.MultiplyAdd(va, vb1, c91);
+
+                va = Vector256.Create(a10[t]);
+                ca0 = Fma.MultiplyAdd(va, vb0, ca0);
+                ca1 = Fma.MultiplyAdd(va, vb1, ca1);
+
+                va = Vector256.Create(a11[t]);
+                cb0 = Fma.MultiplyAdd(va, vb0, cb0);
+                cb1 = Fma.MultiplyAdd(va, vb1, cb1);
+            }
+
+            if (scaled)
+            {
+                var s0 = Avx.LoadVector256(columnScale + j);
+                var s1 = Avx.LoadVector256(columnScale + j + 8);
+                var t0 = columnBias is null ? Vector256<float>.Zero : Avx.LoadVector256(columnBias + j);
+                var t1 = columnBias is null ? Vector256<float>.Zero : Avx.LoadVector256(columnBias + j + 8);
+
+                c00 = Fma.MultiplyAdd(c00, s0, t0);
+                c01 = Fma.MultiplyAdd(c01, s1, t1);
+                c10 = Fma.MultiplyAdd(c10, s0, t0);
+                c11 = Fma.MultiplyAdd(c11, s1, t1);
+                c20 = Fma.MultiplyAdd(c20, s0, t0);
+                c21 = Fma.MultiplyAdd(c21, s1, t1);
+                c30 = Fma.MultiplyAdd(c30, s0, t0);
+                c31 = Fma.MultiplyAdd(c31, s1, t1);
+                c40 = Fma.MultiplyAdd(c40, s0, t0);
+                c41 = Fma.MultiplyAdd(c41, s1, t1);
+                c50 = Fma.MultiplyAdd(c50, s0, t0);
+                c51 = Fma.MultiplyAdd(c51, s1, t1);
+                c60 = Fma.MultiplyAdd(c60, s0, t0);
+                c61 = Fma.MultiplyAdd(c61, s1, t1);
+                c70 = Fma.MultiplyAdd(c70, s0, t0);
+                c71 = Fma.MultiplyAdd(c71, s1, t1);
+                c80 = Fma.MultiplyAdd(c80, s0, t0);
+                c81 = Fma.MultiplyAdd(c81, s1, t1);
+                c90 = Fma.MultiplyAdd(c90, s0, t0);
+                c91 = Fma.MultiplyAdd(c91, s1, t1);
+                ca0 = Fma.MultiplyAdd(ca0, s0, t0);
+                ca1 = Fma.MultiplyAdd(ca1, s1, t1);
+                cb0 = Fma.MultiplyAdd(cb0, s0, t0);
+                cb1 = Fma.MultiplyAdd(cb1, s1, t1);
+            }
+
+            Avx.Store(c + j, c00);
+            Avx.Store(c + j + 8, c01);
+            Avx.Store(c1 + j, c10);
+            Avx.Store(c1 + j + 8, c11);
+            Avx.Store(c2 + j, c20);
+            Avx.Store(c2 + j + 8, c21);
+            Avx.Store(c3 + j, c30);
+            Avx.Store(c3 + j + 8, c31);
+            Avx.Store(c4 + j, c40);
+            Avx.Store(c4 + j + 8, c41);
+            Avx.Store(c5 + j, c50);
+            Avx.Store(c5 + j + 8, c51);
+            Avx.Store(c6 + j, c60);
+            Avx.Store(c6 + j + 8, c61);
+            Avx.Store(c7 + j, c70);
+            Avx.Store(c7 + j + 8, c71);
+            Avx.Store(c8 + j, c80);
+            Avx.Store(c8 + j + 8, c81);
+            Avx.Store(c9 + j, c90);
+            Avx.Store(c9 + j + 8, c91);
+            Avx.Store(cc10 + j, ca0);
+            Avx.Store(cc10 + j + 8, ca1);
+            Avx.Store(cc11 + j, cb0);
+            Avx.Store(cc11 + j + 8, cb1);
+        }
+
+        // 不足 16 列的尾巴：交回单行内核（只覆盖各自列区间，不会与上面重叠）
+        int rest = width - j;
+        if (rest <= 0)
+            return;
+
+        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a4, b + j, c4 + j, k, rest, bStride, bias is null ? 0f : bias[4], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a5, b + j, c5 + j, k, rest, bStride, bias is null ? 0f : bias[5], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a6, b + j, c6 + j, k, rest, bStride, bias is null ? 0f : bias[6], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a7, b + j, c7 + j, k, rest, bStride, bias is null ? 0f : bias[7], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a8, b + j, c8 + j, k, rest, bStride, bias is null ? 0f : bias[8], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a9, b + j, c9 + j, k, rest, bStride, bias is null ? 0f : bias[9], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a10, b + j, cc10 + j, k, rest, bStride, bias is null ? 0f : bias[10], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a11, b + j, cc11 + j, k, rest, bStride, bias is null ? 0f : bias[11], columnBias is null ? null : columnBias + j);
+
+        if (scaled)
+        {
+            float* scale = columnScale + j;
+            float* offset = columnBias is null ? null : columnBias + j;
+            ScaleColumns(c + j, scale, offset, rest);
+            ScaleColumns(c1 + j, scale, offset, rest);
+            ScaleColumns(c2 + j, scale, offset, rest);
+            ScaleColumns(c3 + j, scale, offset, rest);
+            ScaleColumns(c4 + j, scale, offset, rest);
+            ScaleColumns(c5 + j, scale, offset, rest);
+            ScaleColumns(c6 + j, scale, offset, rest);
+            ScaleColumns(c7 + j, scale, offset, rest);
+            ScaleColumns(c8 + j, scale, offset, rest);
+            ScaleColumns(c9 + j, scale, offset, rest);
+            ScaleColumns(cc10 + j, scale, offset, rest);
+            ScaleColumns(cc11 + j, scale, offset, rest);
+        }
+    }
+
+    /// <summary>
+    /// 6 行共享一次 B 加载的微内核（MR=6、NR=16，12 个累加器）。
+    /// <para>
+    /// 为什么是 6：<see cref="Multiply4Rows"/> 每个 k 需要 2 条 B load + 4 条 A 广播 = 6 条 load
+    /// （Zen 4 每拍 2 条 → 3 拍）对 8 条 FMA（4 拍），只有 25% 余量 —— 一次 L1 未命中或指针
+    /// 自增的额外 uop 就能把它推过 4 拍。6 行时同一批 load 是 2 + 6 = 8 条（4 拍）对 12 条 FMA
+    /// （6 拍），余量 50%，且每行的 B 流量降到 4 行版的 2/3。12 个累加器 + 2 条 B +
+    /// 1 条 A 广播 = 15 个 ymm，正好塞进 16 个寄存器（再往上就溢出到栈）。
+    /// </para>
+    /// <para>
+    /// 这也是 OpenBLAS Haswell sgemm 内核的选择（6×16）。累加顺序仍是 k 递增的单条 FMA 链，
+    /// 与 <see cref="Multiply4Rows"/> 逐位一致。
+    /// </para>
+    /// </summary>
+    private static unsafe void Multiply6Rows(
+        float* a,
+        int aStride,
+        float* b,
+        float* c,
+        int k,
+        int width,
+        int bStride,
+        int ldc,
+        float* bias = null,
+        float* columnBias = null,
+        float* columnScale = null)
+    {
+        float* a1 = a + aStride;
+        float* a2 = a + 2 * aStride;
+        float* a3 = a + 3 * aStride;
+        float* a4 = a + 4 * aStride;
+        float* a5 = a + 5 * aStride;
+
+        float* c1 = c + ldc;
+        float* c2 = c + 2 * ldc;
+        float* c3 = c + 3 * ldc;
+        float* c4 = c + 4 * ldc;
+        float* c5 = c + 5 * ldc;
+
+        bool scaled = columnScale is not null;
+        var b0v = Vector256.Create(!scaled && bias is not null ? bias[0] : 0f);
+        var b1v = Vector256.Create(!scaled && bias is not null ? bias[1] : 0f);
+        var b2v = Vector256.Create(!scaled && bias is not null ? bias[2] : 0f);
+        var b3v = Vector256.Create(!scaled && bias is not null ? bias[3] : 0f);
+        var b4v = Vector256.Create(!scaled && bias is not null ? bias[4] : 0f);
+        var b5v = Vector256.Create(!scaled && bias is not null ? bias[5] : 0f);
+
+        int j = 0;
+
+        for (; j + 16 <= width; j += 16)
+        {
+            var c00 = columnBias is null || scaled ? b0v : Avx.LoadVector256(columnBias + j);
+            var c01 = columnBias is null || scaled ? b0v : Avx.LoadVector256(columnBias + j + 8);
+            var c10 = columnBias is null || scaled ? b1v : c00;
+            var c11 = columnBias is null || scaled ? b1v : c01;
+            var c20 = columnBias is null || scaled ? b2v : c00;
+            var c21 = columnBias is null || scaled ? b2v : c01;
+            var c30 = columnBias is null || scaled ? b3v : c00;
+            var c31 = columnBias is null || scaled ? b3v : c01;
+            var c40 = columnBias is null || scaled ? b4v : c00;
+            var c41 = columnBias is null || scaled ? b4v : c01;
+            var c50 = columnBias is null || scaled ? b5v : c00;
+            var c51 = columnBias is null || scaled ? b5v : c01;
+
+            float* brow = b + j;
+            for (int t = 0; t < k; t++, brow += bStride)
+            {
+                var vb0 = Avx.LoadVector256(brow);
+                var vb1 = Avx.LoadVector256(brow + 8);
+
+                var va = Vector256.Create(a[t]);
+                c00 = Fma.MultiplyAdd(va, vb0, c00);
+                c01 = Fma.MultiplyAdd(va, vb1, c01);
+
+                va = Vector256.Create(a1[t]);
+                c10 = Fma.MultiplyAdd(va, vb0, c10);
+                c11 = Fma.MultiplyAdd(va, vb1, c11);
+
+                va = Vector256.Create(a2[t]);
+                c20 = Fma.MultiplyAdd(va, vb0, c20);
+                c21 = Fma.MultiplyAdd(va, vb1, c21);
+
+                va = Vector256.Create(a3[t]);
+                c30 = Fma.MultiplyAdd(va, vb0, c30);
+                c31 = Fma.MultiplyAdd(va, vb1, c31);
+
+                va = Vector256.Create(a4[t]);
+                c40 = Fma.MultiplyAdd(va, vb0, c40);
+                c41 = Fma.MultiplyAdd(va, vb1, c41);
+
+                va = Vector256.Create(a5[t]);
+                c50 = Fma.MultiplyAdd(va, vb0, c50);
+                c51 = Fma.MultiplyAdd(va, vb1, c51);
+            }
+
+            if (scaled)
+            {
+                var s0 = Avx.LoadVector256(columnScale + j);
+                var s1 = Avx.LoadVector256(columnScale + j + 8);
+                var t0 = columnBias is null ? Vector256<float>.Zero : Avx.LoadVector256(columnBias + j);
+                var t1 = columnBias is null ? Vector256<float>.Zero : Avx.LoadVector256(columnBias + j + 8);
+
+                c00 = Fma.MultiplyAdd(c00, s0, t0);
+                c01 = Fma.MultiplyAdd(c01, s1, t1);
+                c10 = Fma.MultiplyAdd(c10, s0, t0);
+                c11 = Fma.MultiplyAdd(c11, s1, t1);
+                c20 = Fma.MultiplyAdd(c20, s0, t0);
+                c21 = Fma.MultiplyAdd(c21, s1, t1);
+                c30 = Fma.MultiplyAdd(c30, s0, t0);
+                c31 = Fma.MultiplyAdd(c31, s1, t1);
+                c40 = Fma.MultiplyAdd(c40, s0, t0);
+                c41 = Fma.MultiplyAdd(c41, s1, t1);
+                c50 = Fma.MultiplyAdd(c50, s0, t0);
+                c51 = Fma.MultiplyAdd(c51, s1, t1);
+            }
+
+            Avx.Store(c + j, c00);
+            Avx.Store(c + j + 8, c01);
+            Avx.Store(c1 + j, c10);
+            Avx.Store(c1 + j + 8, c11);
+            Avx.Store(c2 + j, c20);
+            Avx.Store(c2 + j + 8, c21);
+            Avx.Store(c3 + j, c30);
+            Avx.Store(c3 + j + 8, c31);
+            Avx.Store(c4 + j, c40);
+            Avx.Store(c4 + j + 8, c41);
+            Avx.Store(c5 + j, c50);
+            Avx.Store(c5 + j + 8, c51);
+        }
+
+        // 不足 16 列的尾巴：交回单行内核（只覆盖各自列区间，不会与上面重叠）
+        int rest = width - j;
+        if (rest <= 0)
+            return;
+
+        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a4, b + j, c4 + j, k, rest, bStride, bias is null ? 0f : bias[4], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a5, b + j, c5 + j, k, rest, bStride, bias is null ? 0f : bias[5], columnBias is null ? null : columnBias + j);
+
+        if (scaled)
+        {
+            float* scale = columnScale + j;
+            float* offset = columnBias is null ? null : columnBias + j;
+            ScaleColumns(c + j, scale, offset, rest);
+            ScaleColumns(c1 + j, scale, offset, rest);
+            ScaleColumns(c2 + j, scale, offset, rest);
+            ScaleColumns(c3 + j, scale, offset, rest);
+            ScaleColumns(c4 + j, scale, offset, rest);
+            ScaleColumns(c5 + j, scale, offset, rest);
+        }
+    }
+
+    /// <summary>
     /// 4 行共享一次 B 加载的微内核（一次 2 个 <see cref="Vector256{T}"/>，即 16 列）。
     /// <para>
     /// 单行 8 向量版本每个 k 需要 8 条 B load + 1 条 A 广播 = 9 条 load，而 Zen 4 每拍只发 2 条 load，
     /// 光 load 就要 4.5 拍 —— 已经超过 8 条 FMA 所需的 4 拍，等于被 load 端口卡住。
     /// 4 行共享时每条 B load 喂 4 条 FMA，load 指令数降到 2 + 4 条广播 = 6 条，
     /// 反过来让 8 条 FMA（4 拍）重新成为瓶颈。
+    /// </para>
+    /// <para>
+    /// 已被 <see cref="Multiply6Rows"/> 取代为主内核，这里只负责不足 6 行的收尾（6 → 4 → 1）。
     /// </para>
     /// </summary>
     private static unsafe void Multiply4Rows(

@@ -41,6 +41,7 @@ return args[0].ToLowerInvariant() switch
     "parbench" => ParBench(args),
     "flopsbench" => FlopsBench(args),
     "convbench" => ConvBench(args),
+    "eltwisebench" => EltwiseBench.Run(ParseOptions(args, 1)),
     "help" or "-h" or "--help" => Usage(),
     _ => Usage(),
 };
@@ -79,6 +80,8 @@ static int Usage()
     Console.WriteLine("                                      # SAM3：图像 + 框提示 → 掩码（模型需先 FP16→FP32）");
     Console.WriteLine("  OnnxSharp.Cli gemmbench [--iters N] [--shape m,k,n]");
     Console.WriteLine("                                      # GEMM 微内核吞吐（GFLOPS），调优用");
+    Console.WriteLine("  OnnxSharp.Cli eltwisebench [--iters N] [--shape d1,d2,...]");
+    Console.WriteLine("                                      # 逐元素算子 ms/GB/s，带 copy 作带宽参考");
     return 2;
 }
 
@@ -174,8 +177,9 @@ static int DumpGraph(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.Error.WriteLine("usage: dump-graph <model.onnx> [--shape 1,3,960,960] [--type <OpType>] [--limit N]");
-        Console.Error.WriteLine("       --shape 用于全动态模型（如 PaddleOCR）：先给输入定具体尺寸，导入期才能折叠形状链");
+        Console.Error.WriteLine("usage: dump-graph <model.onnx> [--shape 1,3,960,960] [--type <OpType>] [--limit N] [--inputs]");
+        Console.Error.WriteLine("       --shape  用于全动态模型（如 PaddleOCR）：先给输入定具体尺寸，导入期才能折叠形状链");
+        Console.Error.WriteLine("       --inputs 同时打印输入形状（看广播形态、算内存流量）");
         return 2;
     }
 
@@ -183,6 +187,7 @@ static int DumpGraph(string[] args)
     CliOptions options = ParseOptions(args, 2);
     string? filter = options.GetString("--type");
     int limit = options.GetInt("--limit", int.MaxValue);
+    bool showInputs = options.Has("--inputs");
 
     if (!File.Exists(path))
     {
@@ -222,7 +227,17 @@ static int DumpGraph(string[] args)
             outs.Add(arg.Idx == 0 ? "<none>" : Describe(net.Impl.GetArgData(arg)));
         }
 
-        Console.WriteLine($"  [{index,4}] {op.Type,-12} {op.Name,-44} -> {string.Join(", ", outs)}");
+        // --inputs 打印输入形状：分析广播形态（标量 / 尾广播 / 全长）与内存流量用。
+        string ins = "";
+        if (showInputs)
+        {
+            var list = new List<string>(op.Inputs.Count);
+            foreach (var arg in op.Inputs)
+                list.Add(arg.Idx == 0 ? "<none>" : Describe(net.Impl.GetArgData(arg)));
+            ins = "   <- " + string.Join(" ", list);
+        }
+
+        Console.WriteLine($"  [{index,4}] {op.Type,-12} {op.Name,-44} -> {string.Join(", ", outs)}{ins}");
     }
 
     Console.WriteLine("outputs   :");
@@ -352,7 +367,10 @@ static int Bench(string[] args)
 
     // 分配量与 GC 次数是解释「单算子计时之和 ≠ 端到端」的关键：
     // 分配多就会频繁触发 gen0/gen1 GC，而 GC 暂停会被算进当时正在跑的那个算子头上。
+    OnnxSharp.Tensors.Tensor.ReallocLog.Clear();
     long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
+    long fitBytesBefore = OnnxSharp.Tensors.Tensor.FitReallocBytes;
+    long fitCountBefore = OnnxSharp.Tensors.Tensor.FitReallocCount;
     int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
     TimeSpan pauseBefore = GC.GetTotalPauseDuration();
 
@@ -376,6 +394,11 @@ static int Bench(string[] args)
     Console.WriteLine($"mean      : {samples.Average():F1} ms");
     Console.WriteLine($"max       : {samples[^1]:F1} ms");
     Console.WriteLine($"alloc     : {allocPerIter / 1024.0:F0} KB/iter");
+    Console.WriteLine($"fit realloc: {(OnnxSharp.Tensors.Tensor.FitReallocBytes - fitBytesBefore) / 1024.0 / Math.Max(1, iters):F0} KB/iter " +
+                      $"({(OnnxSharp.Tensors.Tensor.FitReallocCount - fitCountBefore) / Math.Max(1, iters)} 次/iter)");
+
+    foreach (string line in OnnxSharp.Tensors.Tensor.ReallocLog.Take(8))
+        Console.WriteLine($"  realloc: {line}");
     Console.WriteLine($"gc        : gen0 {GC.CollectionCount(0) - g0}  gen1 {GC.CollectionCount(1) - g1}  gen2 {GC.CollectionCount(2) - g2}  (共 {iters} 次推理)");
     Console.WriteLine($"gc pause  : {gcMsPerIter:F1} ms/iter ({gcMsPerIter / Math.Max(1e-9, samples[iters / 2]) * 100:F0}% of median)");
     return 0;
@@ -440,9 +463,14 @@ static int GemmBench(string[] args)
 
     foreach (var (m, k, n) in shapes)
     {
-        var a = new float[batches * m * k];
-        var b = new float[batches * k * n];
-        var c = new float[batches * m * n];
+        // --misalign N：把三块缓冲整体后移 N 个 float，用来量「张量在共享槽位里
+        // 不是 32 字节对齐」对向量 load 的影响（图里的 A/B/C 都是 byte[] 切片，
+        // 起点只保证 4 字节对齐，跨 cache line 的 load 在 Zen 上要额外一拍）。
+        int off = Math.Max(0, options.GetInt("--misalign", 0));
+
+        var a = new float[off + batches * m * k];
+        var b = new float[off + batches * k * n];
+        var c = new float[off + batches * m * n];
         var rng = new Random(12345);
         for (int i = 0; i < a.Length; i++) a[i] = (float)rng.NextDouble();
         for (int i = 0; i < b.Length; i++) b[i] = (float)rng.NextDouble();
@@ -471,7 +499,7 @@ static int GemmBench(string[] args)
             return best;
         }
 
-        double best = Best(() => RunBatched(a, b, c, batches, m, k, n));
+        double best = Best(() => RunBatched(a, b, c, batches, m, k, n, off));
         double perBatch = best / batches;
         double gflops = 2.0 * m * k * n / (perBatch * 1e6);
 
@@ -481,10 +509,22 @@ static int GemmBench(string[] args)
         string speedupText = "        -";
         if (batches == 1)
         {
-            var packed = GemmKernel.Pack(b, k, n);
-            double packedBest = Best(() => GemmKernel.MultiplyPacked(a, packed, c, m));
+            var packed = GemmKernel.Pack(b.AsSpan(off, k * n), k, n);
+            double packedBest = Best(() => GemmKernel.MultiplyPacked(a.AsSpan(off, m * k), packed, c.AsSpan(off, m * n), m));
             packedText = $"{packedBest,13:F3}";
             speedupText = $"{best / packedBest,10:F2}x";
+        }
+
+        // --merged：走 MultiplyBatched（一个并行域铺开 batch×列块），对比逐 batch 派发
+        if (batches > 1)
+        {
+            double mergedBest = Best(() => GemmKernel.MultiplyBatched(
+                a.AsSpan(off, batches * m * k),
+                b.AsSpan(off, batches * k * n),
+                c.AsSpan(off, batches * m * n),
+                batches, m, k, n));
+            packedText = $"{mergedBest,13:F3}";
+            speedupText = $"{best / mergedBest,10:F2}x";
         }
 
         Console.WriteLine($"{m,6}  {k,6}  {n,6}  {batches,6}   {perBatch,12:F3}  {gflops,8:F1} {packedText} {speedupText}");
@@ -492,14 +532,14 @@ static int GemmBench(string[] args)
 
     return 0;
 
-    static void RunBatched(float[] a, float[] b, float[] c, int batches, int m, int k, int n)
+    static void RunBatched(float[] a, float[] b, float[] c, int batches, int m, int k, int n, int off)
     {
         var aSpan = a.AsSpan();
         var bSpan = b.AsSpan();
         var cSpan = c.AsSpan();
         for (int bi = 0; bi < batches; bi++)
-            GemmKernel.Multiply(aSpan.Slice(bi * m * k, m * k), bSpan.Slice(bi * k * n, k * n),
-                                cSpan.Slice(bi * m * n, m * n), m, k, n);
+            GemmKernel.Multiply(aSpan.Slice(off + bi * m * k, m * k), bSpan.Slice(off + bi * k * n, k * n),
+                                cSpan.Slice(off + bi * m * n, m * n), m, k, n);
     }
 }
 
@@ -615,15 +655,22 @@ static int ConvBench(string[] args)
     int iters = options.GetInt("--iters", 20);
 
     var configs = new List<(int Ic, int Oc, int H, int W, int K, int S, int P)>();
-    string? single = options.GetString("--shape");
 
-    if (!string.IsNullOrEmpty(single))
+    // --shape 被 ParseOptions 收进 Shapes 列表（不是 _values 字典），GetString 取不到，
+    // 必须读 options.Shapes。支持重复给多次，一次跑多个形状。
+    foreach (var spec in options.Shapes)
     {
-        var p = single.Split(',', StringSplitOptions.RemoveEmptyEntries);
+        var p = spec.Split(',', StringSplitOptions.RemoveEmptyEntries);
+        if (p.Length != 7)
+        {
+            Console.Error.WriteLine($"--shape 需要 7 个数字（ic,oc,h,w,k,s,p），收到：{spec}");
+            return 2;
+        }
         configs.Add((int.Parse(p[0]), int.Parse(p[1]), int.Parse(p[2]), int.Parse(p[3]),
             int.Parse(p[4]), int.Parse(p[5]), int.Parse(p[6])));
     }
-    else
+
+    if (configs.Count == 0)
     {
         configs.Add((3, 16, 640, 640, 3, 2, 1));
         configs.Add((16, 32, 320, 320, 3, 2, 1));
@@ -734,7 +781,8 @@ static int Profile(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.Error.WriteLine("usage: profile <model.onnx> --input <file.bin> [--iters N] [--top N]");
+        Console.Error.WriteLine("usage: profile <model.onnx> --input <file.bin> [--iters N] [--top N] [--alloc]");
+        Console.Error.WriteLine("       --alloc 额外统计每个算子的分配字节数（归因「每帧分配多少是谁花的」）");
         return 2;
     }
 
@@ -755,29 +803,50 @@ static int Profile(string[] args)
     // 预热不计入统计：前几次迭代是 tier-0 代码，会把计算密集算子的份额抬高一大截。
     int warmup = Math.Max(0, options.GetInt("--warmup", 5));
 
+    // --alloc 打开逐算子分配归因（GC.GetTotalAllocatedBytes），用来回答「每帧 53 MB 是谁分配的」。
+    // 它会给每个算子加两次 precise 计数调用，耗时口径会比不加时略高，所以默认关闭。
+    bool traceAlloc = options.Has("--alloc");
+
     var watch = System.Diagnostics.Stopwatch.StartNew();
-    var timings = net.ProfileAll(iters, warmup);
+    var timings = net.ProfileAll(iters, warmup, traceAlloc);
     watch.Stop();
 
     double total = timings.Sum(t => t.Milliseconds);
     double totalMin = timings.Sum(t => t.MinMilliseconds);
+    double totalAllocKB = timings.Sum(t => t.AllocatedBytes) / 1024.0;
 
     Console.WriteLine($"model     : {path}");
     Console.WriteLine($"ops       : {net.MainGraph?.Prog.Count}    iters: {iters}    warmup: {warmup}    {watch.Elapsed.TotalMilliseconds:F0} ms");
     Console.WriteLine($"total     : {total / iters:F1} ms/iter (mean)   {totalMin:F1} ms/iter (sum of min)");
+    if (traceAlloc)
+        Console.WriteLine($"alloc     : {totalAllocKB:F0} KB/iter (未在算子间的部分见下方「旁路」差额)");
     Console.WriteLine($"note      : share 按 sum-of-min 算；mean 会被后台负载的重尾放大，和 bench 的 median 对不上");
     Console.WriteLine();
-    Console.WriteLine($"{"#",4}  {"type",-18}{"min ms",10}{"avg ms",10}{"share",8}  name");
+
+    if (traceAlloc)
+    {
+        Console.WriteLine($"{"#",4}  {"type",-18}{"min ms",10}{"avg ms",10}{"share",8}{"KB",10}  name");
+    }
+    else
+    {
+        Console.WriteLine($"{"#",4}  {"type",-18}{"min ms",10}{"avg ms",10}{"share",8}  name");
+    }
 
     int index = 0;
     foreach (var timing in timings.Take(top < 1 ? timings.Count : top))
     {
-        Console.WriteLine($"{++index,4}  {timing.Type,-18}{timing.MinMilliseconds,10:F2}{timing.Average,10:F2}{timing.MinMilliseconds / totalMin * 100,7:F1}%  {timing.Name}");
+        string head = $"{++index,4}  {timing.Type,-18}{timing.MinMilliseconds,10:F2}{timing.Average,10:F2}" +
+                      $"{timing.MinMilliseconds / totalMin * 100,7:F1}%";
+        Console.WriteLine(traceAlloc
+            ? $"{head}{timing.AllocatedBytes / 1024.0,10:F0}  {timing.Name}"
+            : $"{head}  {timing.Name}");
     }
 
     // 按算子类型汇总：热点分散时（几百个 op 各占 1%）看这个更有用
     Console.WriteLine();
-    Console.WriteLine($"{"type",-20}{"ops",6}{"min ms",10}{"avg ms",10}{"share",8}");
+    Console.WriteLine(traceAlloc
+        ? $"{"type",-20}{"ops",6}{"min ms",10}{"avg ms",10}{"share",8}{"KB",10}"
+        : $"{"type",-20}{"ops",6}{"min ms",10}{"avg ms",10}{"share",8}");
 
     var byType = timings
         .GroupBy(t => t.Type)
@@ -787,11 +856,15 @@ static int Profile(string[] args)
             Ops = g.Count(),
             Min = g.Sum(t => t.MinMilliseconds),
             Milliseconds = g.Sum(t => t.Milliseconds) / iters,
+            AllocKB = g.Sum(t => t.AllocatedBytes) / 1024.0,
         })
-        .OrderByDescending(g => g.Min);
+        .OrderByDescending(g => traceAlloc ? g.AllocKB : g.Min);
 
     foreach (var group in byType)
-        Console.WriteLine($"{group.Type,-20}{group.Ops,6}{group.Min,10:F1}{group.Milliseconds,10:F1}{group.Min / totalMin * 100,7:F1}%");
+    {
+        string head = $"{group.Type,-20}{group.Ops,6}{group.Min,10:F1}{group.Milliseconds,10:F1}{group.Min / totalMin * 100,7:F1}%";
+        Console.WriteLine(traceAlloc ? $"{head}{group.AllocKB,10:F0}" : head);
+    }
 
     return 0;
 }

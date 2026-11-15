@@ -3,8 +3,11 @@
 四个引擎都在同一台机器、同一会话里依次跑，口径一致：
 静态 batch=1、FP32、输入全 0.5、预热后取 N 次样本，只统计纯推理前向（不含前处理与 NMS）。
 
-    python bench/run_all.py                  # 默认 iters=40 warmup=5 threads=16 rounds=2
+    python bench/run_all.py                  # 默认 iters=40 warmup=5 threads=4 rounds=2
     python bench/run_all.py --iters 20 --rounds 1 --names yolo11n,rfdetr-small
+    python bench/run_all.py --threads 16      # 需要 16 线程口径时显式指定（注意温度墙）
+
+默认 4 线程：本机 16 线程满载会撞温度墙（% Processor Performance 掉到 21%），耗时随机涨 5-7 倍。
 
 结果写 bench/results/latest.json，并打印可直接粘进 bench.md 的 Markdown 表。
 """
@@ -26,8 +29,8 @@ OURS_CLI = os.path.join(ROOT, "tools", "OnnxSharp.Cli", "bin", "Release", "net10
 RUNTIMES = ["onnxsharp", "onnxruntime-cpu", "opencv-dnn", "simdyolo"]
 
 
-def run(cmd, cwd=ROOT):
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+def run(cmd, cwd=ROOT, env=None):
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -59,7 +62,7 @@ def bench_onnxsharp(model, iters, warmup, threads):
     inp, _ = ensure_input(model["path"])
     env = dict(os.environ, ONNXSHARP_THREADS=str(threads))
     code, out, err = run([OURS_CLI, "bench", model["path"], "--input", inp,
-                          "--iters", str(iters), "--warmup", str(warmup)])
+                          "--iters", str(iters), "--warmup", str(warmup)], env=env)
     if code != 0:
         raise RuntimeError((err or out).strip().splitlines()[-1][:200] if (err or out).strip() else "exit %d" % code)
     vals = {}
@@ -97,6 +100,11 @@ def bench_simdyolo(model, iters, warmup, threads):
     if start < 0:
         raise RuntimeError("no JSON in output")
     record = json.loads(out[start:])
+    # SimdYolo 的 JSON 会回显它实际用的线程数；对不上说明参数没传进去（历史上 onnxsharp 就栽在这），
+    # 直接报错，别让 32 线程的静默结果混进 4 线程的表里。
+    actual = record.get("CpuThreads")
+    if actual is not None and actual != threads:
+        raise RuntimeError(f"SimdYolo 实际 CpuThreads={actual}，与请求的 {threads} 不符")
     return record["MedianMs"], record["MinMs"]
 
 
@@ -114,7 +122,7 @@ def main():
     ap.add_argument("--names", default="")
     ap.add_argument("--iters", type=int, default=40)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--runtimes", default=",".join(RUNTIMES))
     args = ap.parse_args()

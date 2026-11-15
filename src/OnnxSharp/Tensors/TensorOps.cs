@@ -681,6 +681,12 @@ public static class TensorOps
     /// <summary>
     /// 尾部广播：广播方每 <paramref name="inner"/> 个元素重复一次，
     /// 于是可以按 inner 分段，每段内部都是连续访问，照常向量化。
+    /// <para>
+    /// 注意分段循环必须待在**内核内部**。早先的写法是逐段调用 <see cref="ApplyContiguous"/>，
+    /// 每段都要重新 switch 一次 op、重新压一次 <c>fixed</c>；段小的时候这点固定开销
+    /// 比段内那点计算还贵 —— <c>[4,257,384] × [384]</c> 共 1028 段，实测 1.8 ns/元素，
+    /// 而同等流量的连续内核只要 0.1 ns/元素（见 <c>eltwisebench</c> 的 mul / mul-t）。
+    /// </para>
     /// </summary>
     private static void ApplyBroadcast(
         BinaryOpKind op,
@@ -690,17 +696,58 @@ public static class TensorOps
         int inner,
         bool leftIsFull)
     {
-        for (int start = 0; start < c.Length; start += inner)
-        {
-            int length = Math.Min(inner, c.Length - start);
-            var full = a.Slice(start, length);
-            var repeat = b.Slice(0, length);
-            var dst = c.Slice(start, length);
+        if (inner <= 0)
+            return;
 
-            if (leftIsFull)
-                ApplyContiguous(op, full, repeat, dst);
-            else
-                ApplyContiguous(op, repeat, full, dst);
+        switch (op)
+        {
+            case BinaryOpKind.Add: BroadcastKernel<AddKernel>(a, b, c, inner, leftIsFull); break;
+            case BinaryOpKind.Sub: BroadcastKernel<SubKernel>(a, b, c, inner, leftIsFull); break;
+            case BinaryOpKind.Mul: BroadcastKernel<MulKernel>(a, b, c, inner, leftIsFull); break;
+            case BinaryOpKind.Div: BroadcastKernel<DivKernel>(a, b, c, inner, leftIsFull); break;
+            case BinaryOpKind.Max: BroadcastKernel<MaxKernel>(a, b, c, inner, leftIsFull); break;
+            case BinaryOpKind.Min: BroadcastKernel<MinKernel>(a, b, c, inner, leftIsFull); break;
+            default:
+                for (int start = 0; start < c.Length; start += inner)
+                {
+                    int length = Math.Min(inner, c.Length - start);
+                    var full = a.Slice(start, length);
+                    var repeat = b.Slice(0, length);
+                    var dst = c.Slice(start, length);
+
+                    if (leftIsFull)
+                        ApplyContiguous(op, full, repeat, dst);
+                    else
+                        ApplyContiguous(op, repeat, full, dst);
+                }
+                break;
+        }
+    }
+
+    private static unsafe void BroadcastKernel<T>(
+        ReadOnlySpan<float> full,
+        ReadOnlySpan<float> repeat,
+        Span<float> c,
+        int inner,
+        bool leftIsFull)
+        where T : struct, IBinaryKernel
+    {
+        fixed (float* pf = full)
+        fixed (float* pr = repeat)
+        fixed (float* pc = c)
+        {
+            int n = c.Length;
+
+            for (int start = 0; start < n; start += inner)
+            {
+                int length = Math.Min(inner, n - start);
+
+                // 全长操作数按段偏移，广播操作数每段都从 0 开始
+                if (leftIsFull)
+                    ContiguousRange<T>(pf + start, pr, pc + start, 0, length);
+                else
+                    ContiguousRange<T>(pr, pf + start, pc + start, 0, length);
+            }
         }
     }
 
