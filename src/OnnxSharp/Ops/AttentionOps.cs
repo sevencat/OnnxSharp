@@ -38,6 +38,23 @@ internal static class AttentionOps
 
     private sealed class AttentionLayer : Layer
     {
+        /// <summary>
+        /// 超过这个序列长度就改用 GEMM 分块内核（<see cref="ComputeBlocks"/>）。
+        /// <para>
+        /// <see cref="ComputeRows"/> 逐行做点积 + axpy，每行都要把整个 K/V 平面重读一遍，
+        /// 只有在 K/V 平面小到能留在 L1/L2 且 hsum 开销被摊薄时（ASR 的 T=76）才划算；
+        /// T=257 时它比图上的 MatMul+Softmax 慢一倍（66 ms vs 33 ms）。
+        /// GEMM 分块把 S 块按 <c>[T][T]</c>（T=257 时 264 KB）算出来，两趟 GEMM 之间不落地，
+        /// 于是既拿到 GEMM 的算术密度，又没有 6.3 MB 的 scores 帧缓冲往返。
+        /// </para>
+        /// <para><c>ONNXSHARP_ATTN_BLOCK_SEQ</c> 可覆盖（0 = 全部走 GEMM 分块）。</para>
+        /// </summary>
+        private static readonly int BlockKernelMinSeq =
+            int.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_BLOCK_SEQ"), out int blockSeq)
+                && blockSeq >= 0
+                ? blockSeq
+                : 128;
+
         private readonly float _scale;
         private readonly int _heads;
         private readonly bool _outputHeadSpace;
@@ -217,8 +234,16 @@ internal static class AttentionOps
                             }
                         });
 
-                        ComputeRows(b, h, t, d, width, headsForm, qStrideT, vStrideT,
-                            pm, maskBatch, maskRow, pq, pv, po, keysPointer);
+                        if (t > BlockKernelMinSeq)
+                        {
+                            ComputeBlocks(b, h, t, d, width, headsForm, qStrideT, vStrideT,
+                                pm, maskBatch, maskRow, pq, pv, po, keysBuffer, b * t * width);
+                        }
+                        else
+                        {
+                            ComputeRows(b, h, t, d, width, headsForm, qStrideT, vStrideT,
+                                pm, maskBatch, maskRow, pq, pv, po, keysPointer);
+                        }
                     }
                 }
             }
@@ -311,6 +336,180 @@ internal static class AttentionOps
                     ArrayPool<float>.Shared.Return(scoreBuffer);
                     ArrayPool<float>.Shared.Return(accBuffer);
                     ArrayPool<float>.Shared.Return(rowBuffer);
+                }
+            });
+        }
+
+        /// <summary>
+        /// 大 T 的 GEMM 分块内核：把 <c>S = Q·K^T → Softmax → O = S·V</c> 按 **Br 行**切开，
+        /// 一块 S 只有 <c>Br×T</c>（下面 budget 控制在 ~512 KB，落 L2），算完就地 softmax、
+        /// 立刻乘 V，**不经过帧缓冲**。
+        /// <para>
+        /// 为什么按行切而不是整块：rf-detr 的 T 是 1028（512/16 的 32×32 加 4 个 register token），
+        /// 整块 <c>S</c> 是 4.2 MB，超过 L2 一倍多 —— 那样只是把「25 MB 的 [B,H,T,T] 往返」
+        /// 换成「每个 head 4.2 MB 往返」，白忙。按行切之后 S 块的写/读都在 L2 里，
+        /// 剩下的成本只有 K/V 被每个行块重读一遍（<c>rows_per_block</c> 份）。
+        /// </para>
+        /// <para>
+        /// ⚠ 不走 online-softmax：整行的 T 个分数都在 S 块里，max/sum 一遍就能算完，
+        /// 不需要 rescale 累加器。代价是 K/V 要被重读，收益是 softmax 侧零额外状态。
+        /// </para>
+        /// </summary>
+        private static readonly bool TraceBlocks =
+            Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_TRACE") == "1";
+
+        private static long _traceCopy;
+        private static long _traceQk;
+        private static long _traceSoft;
+        private static long _tracePv;
+        private static long _traceCount;
+
+        private unsafe void ComputeBlocks(
+            int b,
+            int h,
+            int t,
+            int d,
+            int width,
+            bool headsForm,
+            int qStrideT,
+            int vStrideT,
+            float* mask,
+            int maskBatch,
+            int maskRow,
+            float* sourceQ,
+            float* sourceV,
+            float* destination,
+            float[] keyBuffer,
+            int outputLength)
+        {
+            int plane = checked(t * d);
+            int outputStride = _outputHeadSpace ? d : width;
+
+            // 每块 S 的目标大小：512 KB 给分数矩阵，剩下半个 L2 留给 K/V 平面（各 t·d·4）
+            const int ScoreBudget = 512 * 1024;
+            int rowBlock = Math.Clamp(ScoreBudget / (t * sizeof(float)), 8, 256);
+            int rowBlocks = (t + rowBlock - 1) / rowBlock;
+
+            int qBlockCount = checked(rowBlock * d);
+            int scoreBlockCount = checked(rowBlock * t);
+
+            ParallelRange.For(b * h * rowBlocks, (begin, end) =>
+            {
+                float[] qBuffer = ArrayPool<float>.Shared.Rent(qBlockCount);
+                float[] sBuffer = ArrayPool<float>.Shared.Rent(scoreBlockCount);
+
+                try
+                {
+                    fixed (float* pq = qBuffer)
+                    fixed (float* ps = sBuffer)
+                    {
+                        long accCopy = 0, accQk = 0, accSoft = 0, accPv = 0, accBlocks = 0;
+
+                        for (int index = begin; index < end; index++)
+                        {
+                            int block = index % rowBlocks;
+                            int bh = index / rowBlocks;
+                            int bi = bh / h;
+                            int hi = bh % h;
+                            int r0 = block * rowBlock;
+                            int rows = Math.Min(rowBlock, t - r0);
+
+                            int planeBase = headsForm ? bi * t * width + hi * d : bh * t * d;
+
+                            // 计时只在 ONNXSHARP_ATTN_TRACE=1 时取样：四次 rdtsc 本身很便宜，
+                            // 但没必要在默认路径上留（0 常量会被 JIT 折掉）。
+                            long t0 = TraceBlocks ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+                            // Q 行块紧凑化并乘 scale（与图上 Mul(Qh, 1/√D) 等价）
+                            for (int r = 0; r < rows; r++)
+                            {
+                                float* src = sourceQ + planeBase + (long)(r0 + r) * qStrideT;
+                                float* qRow = pq + (long)r * d;
+                                for (int di = 0; di < d; di++)
+                                    qRow[di] = src[di] * _scale;
+                            }
+
+                            long t1 = TraceBlocks ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+                            // S 块 = Q块·K^T：[rows][t]，B 源是 [T][D] 的 K 平面（行距 1、列距 d）
+                            GemmKernel.MultiplyFromSource(
+                                new ReadOnlySpan<float>(pq, qBlockCount),
+                                keyBuffer,
+                                bh * plane,
+                                d,
+                                1,
+                                d,
+                                t,
+                                new Span<float>(ps, scoreBlockCount),
+                                rows,
+                                t);
+
+                            long t2 = TraceBlocks ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+                            if (mask is not null)
+                            {
+                                for (int r = 0; r < rows; r++)
+                                {
+                                    float* sRow = ps + (long)r * t;
+                                    float* mRow = mask + (long)maskBatch * bi + (long)maskRow * (r0 + r);
+                                    for (int j = 0; j < t; j++)
+                                        sRow[j] += mRow[j];
+                                }
+                            }
+
+                            for (int r = 0; r < rows; r++)
+                            {
+                                float* sRow = ps + (long)r * t;
+                                VectorMath.SoftmaxRow(sRow, sRow, t);
+                            }
+
+                            long t3 = TraceBlocks ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+                            // O = S块·V：[rows][d]，V 直接从（可能带 stride 的）源打包
+                            int offset = _outputHeadSpace
+                                ? bh * t * d + r0 * d
+                                : (bi * t + r0) * width + hi * d;
+
+                            GemmKernel.MultiplyFromSource(
+                                new ReadOnlySpan<float>(ps, scoreBlockCount),
+                                sourceV + planeBase,
+                                t,
+                                vStrideT,
+                                1,
+                                d,
+                                new Span<float>(destination + offset, outputLength - offset),
+                                rows,
+                                outputStride);
+
+                            if (TraceBlocks)
+                            {
+                                long t4 = System.Diagnostics.Stopwatch.GetTimestamp();
+                                accCopy += t1 - t0;
+                                accQk += t2 - t1;
+                                accSoft += t3 - t2;
+                                accPv += t4 - t3;
+                                accBlocks++;
+                            }
+                        }
+
+                        if (TraceBlocks && accBlocks > 0)
+                        {
+                            Interlocked.Add(ref _traceCopy, accCopy);
+                            Interlocked.Add(ref _traceQk, accQk);
+                            Interlocked.Add(ref _traceSoft, accSoft);
+                            Interlocked.Add(ref _tracePv, accPv);
+                            long total = Interlocked.Add(ref _traceCount, accBlocks);
+                            double k = 1000.0 / (System.Diagnostics.Stopwatch.Frequency * total);
+                            Console.Error.WriteLine(
+                                $"[attnblk] blocks={total} per-block ms: copy {_traceCopy * k:F3} " +
+                                $"qk {_traceQk * k:F3} soft {_traceSoft * k:F3} pv {_tracePv * k:F3}");
+                        }
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(qBuffer);
+                    ArrayPool<float>.Shared.Return(sBuffer);
                 }
             });
         }

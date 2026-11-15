@@ -840,14 +840,27 @@ internal static class GraphFusion
     /// <c>Shape→Gather→Concat</c> 动态链）输入留在 head 空间，H/D 由形状给出，
     /// 仍然折掉 scores 物化、Softmax、两次 MatMul、输出 Transpose 与 Reshape。
     /// </para>
+    /// <para>
+    /// <b>已知不匹配的形态</b>：rf-detr 的 decoder 用 <c>ModuleList</c> 里那套「先
+    /// <c>Transpose([0,2,1,3])</c> 再补一个 <c>Reshape([1,8,T,D])</c> 补 batch 维」的写法，
+    /// 且输出侧是 <c>Transpose([1,2,0,3]) → Reshape([T,C])</c>。3 层 decoder 的
+    /// self/cross-attn 因此留在图上（profile 里 6 个 <c>MatMul</c> + 6 个 <c>Softmax</c>，
+    /// 合计 ~1 ms），不值得为它把模式匹配再铺一层。
+    /// </para>
     /// </summary>
     /// <summary>
-    /// 融合层支持的最大序列长度。融合内核逐行做点积 / axpy，T 一大每行都要把整个 K/V
-    /// 平面重读一遍；实测 rf-detr 的 T=257 反而比原图的 MatMul+Softmax 慢一倍
-    /// （66 ms vs 33 ms），所以超过这个长度就不融合，交给 GEMM。
-    /// ASR 的 T=76 才是甜点区。
+    /// 融合层支持的最大序列长度。<c>FusedAttention</c> 有两套内核：逐行标量
+    /// （T 小、每行重读 K/V 也便宜）与 GEMM 分块（T 大，S 块留 L2 不落地）。
+    /// rf-detr 的 T=1028 走分块内核后，微模型上 6 层 attention 从 43~46 ms 掉到
+    /// 15.7~18.4 ms（bench.md §19），所以阈值放到 4096，图上 MatMul+Softmax 只在
+    /// 更极端的序列长度上才更省。
+    /// <para><c>ONNXSHARP_ATTN_FUSE_MAXSEQ</c> 可覆盖（0 = 一律不融合，用于 A/B）。</para>
     /// </summary>
-    private const int AttentionFusionMaxSeq = 128;
+    private static readonly int AttentionFusionMaxSeq =
+        int.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_FUSE_MAXSEQ"), out int maxSeq)
+            && maxSeq >= 0
+            ? maxSeq
+            : 4096;
 
     private static int FuseAttention(NetImpl net, Graph graph)
     {
@@ -1032,10 +1045,8 @@ internal static class GraphFusion
                 vReshape = vr;
             }
 
-            // 大 T 不融合：融合层用的是「每行一次点积 + 一次 axpy」的标量内核，
-            // T=257（rf-detr）时 12 个块要 66 ms，而原图上这些 MatMul+Softmax 只要 ~33 ms
-            // （GEMM 按缓存块复用 K/V，标量内核每行都要把整个 K/V 平面重读一遍）。
-            // ASR 的 T=76 才是融合的甜点区（那里 40 个块省掉一半以上）。
+            // 序列长度的兜底：分块内核（见 AttentionOps.ComputeBlocks）已经能覆盖
+            // rf-detr 的 T=1028，只有更长的序列才交回图上的 MatMul + Softmax。
             if (sequence > AttentionFusionMaxSeq)
                 continue;
 

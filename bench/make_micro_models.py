@@ -55,6 +55,49 @@ def build_attention_chain(batch, tokens, head_dim, reps):
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], producer_name="bench")
 
 
+def build_attention_stack(layers, batch, tokens, heads, head_dim):
+    """layers 层标准 torch 风格 MHA（scale 省略），形状取自 RF-DETR 主干。
+
+    用途：把 attention 从 250 ms 的整图里摘出来。图上路径是
+    MatMul(QK^T) + Softmax + MatMul(PV) 加 6 个 Reshape/Transpose；
+    融合路径是单个 FusedAttention 分块内核。两者的差值在整图里只有 ~4%，
+    被负载抖动完全盖住，所以只能在这个微模型上读。
+    """
+    width = heads * head_dim
+    inp = helper.make_tensor_value_info("x", TensorProto.FLOAT, [batch, tokens, width])
+    out = helper.make_tensor_value_info("y", TensorProto.FLOAT, [batch, tokens, width])
+
+    nodes, inits, cur = [], [], "x"
+    for i in range(layers):
+        for tag in ("q", "k", "v"):
+            inits.append(numpy_helper.from_array(
+                np.array([batch, tokens, heads, head_dim], dtype=np.int64), f"shape_{i}_{tag}"))
+            nodes.append(helper.make_node("Reshape", [cur, f"shape_{i}_{tag}"],
+                                          [f"{i}_{tag}_3d"], name=f"reshape_{i}_{tag}"))
+
+        for tag, perm in (("q", [0, 2, 1, 3]), ("k", [0, 2, 3, 1]), ("v", [0, 2, 1, 3])):
+            nodes.append(helper.make_node("Transpose", [f"{i}_{tag}_3d"], [f"{i}_{tag}_h"],
+                                          name=f"transpose_{i}_{tag}", perm=perm))
+
+        nodes.append(helper.make_node("MatMul", [f"{i}_q_h", f"{i}_k_h"], [f"{i}_scores"],
+                                      name=f"matmul_{i}_qk"))
+        nodes.append(helper.make_node("Softmax", [f"{i}_scores"], [f"{i}_p"],
+                                      name=f"softmax_{i}", axis=-1))
+        nodes.append(helper.make_node("MatMul", [f"{i}_p", f"{i}_v_h"], [f"{i}_ctx"],
+                                      name=f"matmul_{i}_pv"))
+        nodes.append(helper.make_node("Transpose", [f"{i}_ctx"], [f"{i}_ctx_t"],
+                                      name=f"transpose_{i}_out", perm=[0, 2, 1, 3]))
+        inits.append(numpy_helper.from_array(
+            np.array([batch, tokens, width], dtype=np.int64), f"shape_{i}_out"))
+        dst = "y" if i == layers - 1 else f"{i}_y"
+        nodes.append(helper.make_node("Reshape", [f"{i}_ctx_t", f"shape_{i}_out"], [dst],
+                                      name=f"reshape_{i}_out"))
+        cur = dst
+
+    graph = helper.make_graph(nodes, "attn_stack", [inp], [out], inits)
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], producer_name="bench")
+
+
 def build_mlp_chain(layers, tokens, d, hidden, residual=True):
     """layers 层 MLP 串联：每层 (fc1 + fc2 [+ Add])，形状完全取自 rfdetr-small。
 
@@ -141,6 +184,11 @@ def main():
     # 裸内核同形状 0.88~0.97 ms/个，若这个微模型也是 0.9 那就是「真模型特有的干扰」
     save(build_mlp_chain(12, 257, 384, 1536), "mlp-12x257x384x1536")
     save_input((1, 257, 384))
+
+    # 6 层 MHA，形状取自 rfdetr-small 主干（8 头 × 32 维，T=1028）
+    # 用来单独量 FusedAttention 分块内核对同源 MatMul+Softmax 的倍率
+    save(build_attention_stack(6, 1, 1028, 8, 32), "attnstack-6x1028x8x32")
+    save_input((1, 1028, 256))
 
 
 if __name__ == "__main__":

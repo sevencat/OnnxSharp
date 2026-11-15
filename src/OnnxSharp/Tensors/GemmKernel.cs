@@ -443,6 +443,98 @@ internal static class GemmKernel
     }
 
     /// <summary>
+    /// 从**任意内存布局**的 B 源打包后算 <c>c = a · b</c>，串行、无并行派发。
+    /// <para>
+    /// B 的逻辑形状是 <c>[k][n]</c>，源里元素 <c>b[t][c]</c> 的地址是
+    /// <c>bSource + bSourceOffset + t*srcStride + c*srcColStride</c> —— 覆盖两种 attention 形态：
+    /// <c>K^T</c>（源是 <c>[T][D]</c> 的 K 平面，<c>srcStride=1 / srcColStride=D</c>）
+    /// 与 <c>V</c>（源是 <c>[T][D]</c>，<c>srcStride=D</c>）。
+    /// </para>
+    /// <para>
+    /// 供 <c>FusedAttention</c> 的 GEMM 分块内核用：它已经在 <c>(b,h)</c> 维度并行，
+    /// 内部再嵌套并行会把线程池打爆，所以这里固定串行。
+    /// 面板走 <see cref="ArrayPool{T}"/>，不产生每帧的 <c>new float[]</c>。
+    /// </para>
+    /// </summary>
+    internal static unsafe void MultiplyFromSource(
+        ReadOnlySpan<float> a,
+        float[] bSource,
+        int bSourceOffset,
+        int k,
+        int srcStride,
+        int srcColStride,
+        int n,
+        Span<float> c,
+        int m,
+        int ldc)
+    {
+        fixed (float* pb = bSource)
+            MultiplyFromSourceCore(a, pb + bSourceOffset, k, srcStride, srcColStride, n, c, m, ldc);
+    }
+
+    /// <summary><see cref="MultiplyFromSource(ReadOnlySpan{float}, float[], int, int, int, int, int, Span{float}, int, int)"/> 的指针版：
+    /// 调用方已 <c>fixed</c> 住 B 源（大张量上再 <c>fixed</c> 会多一层）。</summary>
+    internal static unsafe void MultiplyFromSource(
+        ReadOnlySpan<float> a,
+        float* bSource,
+        int k,
+        int srcStride,
+        int srcColStride,
+        int n,
+        Span<float> c,
+        int m,
+        int ldc)
+        => MultiplyFromSourceCore(a, bSource, k, srcStride, srcColStride, n, c, m, ldc);
+
+    private static unsafe void MultiplyFromSourceCore(
+        ReadOnlySpan<float> a,
+        float* bSource,
+        int k,
+        int srcStride,
+        int srcColStride,
+        int n,
+        Span<float> c,
+        int m,
+        int ldc)
+    {
+        if (m <= 0 || n <= 0)
+            return;
+        if (ldc <= 0)
+            ldc = n;
+
+        int blockWidth = SelectColumnBlock(n);
+        int blockCount = (n + blockWidth - 1) / blockWidth;
+        int panelSize = checked(blockCount * k * blockWidth);
+
+        float[] panel = ArrayPool<float>.Shared.Rent(panelSize);
+        try
+        {
+            fixed (float* pp = panel)
+            {
+                for (int block = 0; block < blockCount; block++)
+                {
+                    int j0 = block * blockWidth;
+                    int width = Math.Min(blockWidth, n - j0);
+                    PackColumns(
+                        bSource + (long)j0 * srcColStride,
+                        k,
+                        srcStride,
+                        width,
+                        pp + (long)block * k * blockWidth,
+                        blockWidth,
+                        srcColStride);
+                }
+            }
+
+            MultiplyPacked(a, new PackedB(panel, k, n, blockWidth), c, m, ldc, parallel: false);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(panel);
+        }
+    }
+
+    /// <summary>
     /// 用预打包的 B 算 <c>c = a · b</c>，等价于 <see cref="Multiply"/> 但**不重打包**。
     /// <para>
     /// 并行比 <see cref="Multiply"/> 简单一档：面板只读共享，所以
