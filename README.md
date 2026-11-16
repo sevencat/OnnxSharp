@@ -31,7 +31,7 @@
 
 `OnnxSharp` 是一个自己实现的 ONNX 运行时：读 ONNX 文件 → 建图 → 常量折叠 + 算子融合 → 缓冲池 + 多线程 SIMD 内核 → 按节点执行。语义对齐 OpenCV 5 `dnn` 与 SimdYolo 的做法，目标是「纯托管、无 P/Invoke、纯 CPU 也能跑检测模型」。
 
-实测（四引擎同会话，见 [性能](#性能)）：对 ONNXRuntime 差 **1.06~1.26×**（F32 图）/ **1.67×**（int8 decoder），对 OpenCV 5 dnn 与 SimdYolo 已领先或打平。
+实测（四引擎同会话，见 [性能](#性能)）：**对 ONNXRuntime 与 SimdYolo 还差不少** —— 默认线程下约 **1.4× / 1.8×**（min 口径），双方都限到 4 线程后收窄到 **1.06~1.26×**（F32 图；int8 decoder 1.67×）；**对 OpenCV 5 `dnn` 基本打平**（~1.2×，4 线程下还略快）。
 
 这个引擎能写出来，主要是站在 **SimdYolo** 和 **OpenCV 5 `dnn`** 的肩膀上：算子语义、预处理约定、性能基线和验证方法都大量借鉴了它们。感谢两个项目的作者与贡献者，具体借鉴点见 [致谢](#致谢)。
 
@@ -876,7 +876,7 @@ bench/                四引擎 × 6 模型的对照脚本与产物
 
 `OnnxSharp` is a from-scratch ONNX inference engine in pure C# — **CPU only, FP32, zero third-party dependencies**. It runs ONNX exports of YOLO11 / YOLOv8 / RF-DETR, and ships an optional vision facade that turns an image into detections in source-image coordinates.
 
-Semantics follow OpenCV 5 `dnn` and SimdYolo; the engine is within **1.15–1.30×** of OpenCV on the reference machine (see [Performance](#performance)).
+Semantics follow OpenCV 5 `dnn` and SimdYolo. Measured on four engines in the same session (see [Performance](#performance)): **still clearly behind ONNXRuntime and SimdYolo** — about **1.4× / 1.8×** with each engine at its default thread count, narrowing to **1.06–1.26×** (1.67× on the int8 decoder) when both sides are pinned to 4 threads; **roughly on par with OpenCV 5 `dnn`** (~1.2×, slightly ahead at 4 threads).
 
 This engine stands on the shoulders of **SimdYolo** and **OpenCV 5 `dnn`**: operator semantics, preprocessing conventions, performance baselines and the validation methodology are heavily borrowed from both. Thanks to their authors and contributors — details in [Acknowledgements](#acknowledgements).
 
