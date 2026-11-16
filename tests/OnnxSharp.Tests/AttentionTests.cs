@@ -36,7 +36,7 @@ internal static class AttentionTests
         Assert.Equal(0, prog.Count(op => op.Type == "Reshape"), "output reshape must be absorbed");
 
         var input = Tensor.Allocate(new TensorShape(1, 8, 8), DType.F32);
-        File.ReadAllBytes(Path.Combine(directory, "attention_x.f32")).CopyTo(input.Buffer, 0);
+        File.ReadAllBytes(Path.Combine(directory, "attention_x.f32")).AsSpan().CopyTo(input.Bytes());
         net.SetInput("x", input);
 
         var output = net.ForwardAll()[0].AsSpan<float>();

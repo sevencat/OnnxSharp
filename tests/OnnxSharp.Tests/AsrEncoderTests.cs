@@ -40,10 +40,10 @@ internal static class AsrEncoderTests
             });
 
         var speech = Tensor.Allocate(new TensorShape(1, 96, 560), DType.F32);
-        File.ReadAllBytes(Path.Combine(directory, "speech.f32")).CopyTo(speech.Buffer, 0);
+        File.ReadAllBytes(Path.Combine(directory, "speech.f32")).AsSpan().CopyTo(speech.Bytes());
 
         var lengths = Tensor.Allocate(new TensorShape(1), DType.I32);
-        File.ReadAllBytes(Path.Combine(directory, "speech_lengths.i32")).CopyTo(lengths.Buffer, 0);
+        File.ReadAllBytes(Path.Combine(directory, "speech_lengths.i32")).AsSpan().CopyTo(lengths.Bytes());
 
         net.SetInput("speech", speech);
         net.SetInput("speech_lengths", lengths);

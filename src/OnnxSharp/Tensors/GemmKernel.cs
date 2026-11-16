@@ -79,6 +79,40 @@ internal static class GemmKernel
         new() { MaxDegreeOfParallelism = Math.Max(1, ParallelRange.Threads) };
 
     /// <summary>
+    /// 诊断开关（<c>ONNXSHARP_GEMM_ALIGN=1</c>）：统计真实调用里 A/B/C 的 64 字节对齐比例。
+    /// <para>
+    /// 微基准里缓冲是 <c>new float[]</c> 的起点，图里则是 <c>byte[]</c> 槽位的切片，
+    /// 两者的对齐不同 —— 这个开关就是用来量「图上到底有多少次 GEMM 吃着未对齐的指针」。
+    /// </para>
+    /// </summary>
+    internal static readonly bool DbgAlign =
+        Environment.GetEnvironmentVariable("ONNXSHARP_GEMM_ALIGN") == "1";
+
+    internal static long DbgCalls;
+    internal static long DbgAlignedA;
+    internal static long DbgAlignedB;
+    internal static long DbgAlignedC;
+
+    private static unsafe void SampleAlignment(ReadOnlySpan<float> a, ReadOnlySpan<float> b, ReadOnlySpan<float> c)
+    {
+        fixed (float* pa = a)
+        fixed (float* pb = b)
+        fixed (float* pc = c)
+        {
+            Interlocked.Increment(ref DbgCalls);
+            if (((long)pa & 63) == 0) Interlocked.Increment(ref DbgAlignedA);
+            if (((long)pb & 63) == 0) Interlocked.Increment(ref DbgAlignedB);
+            if (((long)pc & 63) == 0) Interlocked.Increment(ref DbgAlignedC);
+        }
+    }
+
+    internal static (long Calls, long A, long B, long C) TakeAlignment()
+        => (Interlocked.Exchange(ref DbgCalls, 0),
+            Interlocked.Exchange(ref DbgAlignedA, 0),
+            Interlocked.Exchange(ref DbgAlignedB, 0),
+            Interlocked.Exchange(ref DbgAlignedC, 0));
+
+    /// <summary>
     /// <c>c = a · b</c>。
     /// <para>
     /// <paramref name="ldc"/> 是 C 的行步长（元素数），0 表示紧凑 <c>n</c>。
@@ -108,6 +142,9 @@ internal static class GemmKernel
     {
         if (m <= 0 || n <= 0)
             return;
+
+        if (DbgAlign)
+            SampleAlignment(a, b, c);
 
         if (ldc <= 0)
             ldc = n;
@@ -416,6 +453,52 @@ internal static class GemmKernel
         Environment.GetEnvironmentVariable("ONNXSHARP_GEMM_MR") is not ("4" or "6")
         && Avx512F.VL.IsSupported;
 
+    /// <summary>
+    /// K 分块的块高，照抄 MLAS 的 <c>MLAS_SGEMM_STRIDEK</c>（N 段 → K 块 → 重打面板 → 累加）。
+    /// <b>默认 0 = 关闭</b>：`bench.md §26` 实测这条在本机是<b>负收益</b>（真实形状集上慢 12~22%），
+    /// 面板本来就装在 L2 里，多出来的「每块重读重写 C」比局部性收益更贵。留着只为 A/B。
+    /// </summary>
+    internal static int KBlockSize { get; } = ReadKBlockFromEnv();
+
+    private static int ReadKBlockFromEnv()
+    {
+        string? text = Environment.GetEnvironmentVariable("ONNXSHARP_GEMM_KC");
+        if (string.IsNullOrWhiteSpace(text))
+            return 0;
+        return int.TryParse(text, out int value) && value >= 0 ? value : 0;
+    }
+
+    /// <summary>按列块宽度挑 K 块高：让一块面板（<c>kc×width×4</c>）落在 16 KB 以内。</summary>
+    private static int SelectKBlock(int k, int width)
+    {
+        if (k <= 0)
+            return 1;
+
+        int kc = KBlockSize;
+        if (kc <= 0 || width <= 0)
+            return k;
+
+        int fit = 16384 / (width * sizeof(float));
+        if (fit < 32)
+            fit = 32;
+        if (kc > fit)
+            kc = fit;
+
+        return k >= kc ? kc : k;
+    }
+
+    /// <summary>
+    /// 写回一个累加器向量。K 分块时第 2 块起要<b>累加</b>而不是覆盖 —— 这就是 MLAS 的
+    /// <c>ZeroMode</c>：首块写、后续 <c>+=</c>。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreAcc(float* c, Vector256<float> value, bool accumulate)
+    {
+        if (accumulate)
+            value = Avx.Add(Avx.LoadVector256(c), value);
+        Avx.Store(c, value);
+    }
+
     /// <summary>把 <c>b[k, n]</c> 打包成面板；调用方负责按权重实例缓存结果。</summary>
     internal static unsafe PackedB Pack(ReadOnlySpan<float> b, int k, int n)
     {
@@ -440,6 +523,53 @@ internal static class GemmKernel
         }
 
         return new PackedB(data, k, n, blockWidth);
+    }
+
+    /// <summary><see cref="PackFromSource"/> 需要调用方准备的缓冲元素数。</summary>
+    internal static int PackedPanelSize(int k, int n)
+    {
+        int blockWidth = SelectColumnBlock(n);
+        return checked((n + blockWidth - 1) / blockWidth * k * blockWidth);
+    }
+
+    /// <summary>
+    /// 把**任意内存布局**的 B 源打包进调用方提供的缓冲，产出可反复喂给
+    /// <see cref="MultiplyPacked"/> 的面板（约定与 <see cref="MultiplyFromSource"/> 相同）。
+    /// <para>
+    /// attention 用它在每个 <c>(b,h)</c> 上把 <c>K^T</c> 与 <c>V</c> **只打一次**，
+    /// 供该头的所有行块复用 —— 原来每个行块都要重打一遍（<c>K^T</c> 走的是逐元素
+    /// gather 路径，是分块内核里除 GEMM 之外最贵的一件事）。
+    /// </para>
+    /// </summary>
+    internal static unsafe PackedB PackFromSource(
+        float* bSource,
+        int k,
+        int srcStride,
+        int srcColStride,
+        int n,
+        float[] panel)
+    {
+        int blockWidth = SelectColumnBlock(n);
+        int blockCount = (n + blockWidth - 1) / blockWidth;
+
+        fixed (float* pp = panel)
+        {
+            for (int block = 0; block < blockCount; block++)
+            {
+                int j0 = block * blockWidth;
+                int width = Math.Min(blockWidth, n - j0);
+                PackColumns(
+                    bSource + (long)j0 * srcColStride,
+                    k,
+                    srcStride,
+                    width,
+                    pp + (long)block * k * blockWidth,
+                    blockWidth,
+                    srcColStride);
+            }
+        }
+
+        return new PackedB(panel, k, n, blockWidth);
     }
 
     /// <summary>
@@ -603,72 +733,82 @@ internal static class GemmKernel
                 // 有 columnScale 时 16 列整块走微内核里的 FMA epilogue，列尾另算
                 int bulk = colScale is null ? width : width & ~15;
 
-                int row = row0;
-                for (; UseMr12 && row + 12 <= row1; row += 12)
+                // 反量化 epilogue（ScaleColumns）不能跨 K 分块重复做，因此有 columnScale 时不分块
+                int kc = colScale is null ? SelectKBlock(k, width) : k;
+
+                for (int k0 = 0; k0 < k; k0 += kc)
                 {
-                    Multiply12Rows(a0 + (long)row * k, k, panel, c0 + (long)row * ldc + j0, k, bulk,
-                        panelStride, ldc, bias0 is null ? null : bias0 + row, colBias, colScale);
+                    int kw = k < k0 + kc ? k - k0 : kc;
+                    bool acc = k0 > 0;
+                    float* pk = panel + (long)k0 * panelStride;
 
-                    if (bulk >= width)
-                        continue;
-
-                    int rest12 = width - bulk;
-                    for (int i = 0; i < 12; i++)
+                    int row = row0;
+                    for (; UseMr12 && row + 12 <= row1; row += 12)
                     {
-                        float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
-                        // 纯累加（bias 留给 ScaleColumns 加，否则列尾会把 bias 加两遍）
-                        MultiplyRow(a0 + (long)(row + i) * k, panel + bulk, cRow, k, rest12, panelStride);
-                        ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest12);
-                    }
-                }
+                        Multiply12Rows(a0 + (long)row * k + k0, k, pk, c0 + (long)row * ldc + j0, kw, bulk,
+                            panelStride, ldc, acc || bias0 is null ? null : bias0 + row, acc ? null : colBias, colScale, acc);
 
-                for (; UseMr6 && row + 6 <= row1; row += 6)
-                {
-                    Multiply6Rows(a0 + (long)row * k, k, panel, c0 + (long)row * ldc + j0, k, bulk,
-                        panelStride, ldc, bias0 is null ? null : bias0 + row, colBias, colScale);
+                        if (bulk >= width)
+                            continue;
 
-                    if (bulk >= width)
-                        continue;
-
-                    int rest = width - bulk;
-                    for (int i = 0; i < 6; i++)
-                    {
-                        float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
-                        // 纯累加（bias 留给 ScaleColumns 加，否则列尾会把 bias 加两遍）
-                        MultiplyRow(a0 + (long)(row + i) * k, panel + bulk, cRow, k, rest, panelStride);
-                        ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest);
-                    }
-                }
-
-                for (; row + 4 <= row1; row += 4)
-                {
-                    Multiply4Rows(a0 + (long)row * k, k, panel, c0 + (long)row * ldc + j0, k, bulk,
-                        panelStride, ldc, bias0 is null ? null : bias0 + row, colBias, colScale);
-
-                    if (bulk >= width)
-                        continue;
-
-                    int rest = width - bulk;
-                    for (int i = 0; i < 4; i++)
-                    {
-                        float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
-                        MultiplyRow(a0 + (long)(row + i) * k, panel + bulk, cRow, k, rest, panelStride);
-                        ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest);
-                    }
-                }
-
-                for (; row < row1; row++)
-                {
-                    float* cRow = c0 + (long)row * ldc + j0;
-                    if (colScale is null)
-                    {
-                        MultiplyRow(a0 + (long)row * k, panel, cRow, k, width, panelStride,
-                            bias0 is null ? 0f : bias0[row], colBias);
-                        continue;
+                        int rest12 = width - bulk;
+                        for (int i = 0; i < 12; i++)
+                        {
+                            float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
+                            // 纯累加（bias 留给 ScaleColumns 加，否则列尾会把 bias 加两遍）
+                            MultiplyRow(a0 + (long)(row + i) * k + k0, pk + bulk, cRow, kw, rest12, panelStride);
+                            ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest12);
+                        }
                     }
 
-                    MultiplyRow(a0 + (long)row * k, panel, cRow, k, width, panelStride);
-                    ScaleColumns(cRow, colScale, colBias, width);
+                    for (; UseMr6 && row + 6 <= row1; row += 6)
+                    {
+                        Multiply6Rows(a0 + (long)row * k + k0, k, pk, c0 + (long)row * ldc + j0, kw, bulk,
+                            panelStride, ldc, acc || bias0 is null ? null : bias0 + row, acc ? null : colBias, colScale, acc);
+
+                        if (bulk >= width)
+                            continue;
+
+                        int rest = width - bulk;
+                        for (int i = 0; i < 6; i++)
+                        {
+                            float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
+                            // 纯累加（bias 留给 ScaleColumns 加，否则列尾会把 bias 加两遍）
+                            MultiplyRow(a0 + (long)(row + i) * k + k0, pk + bulk, cRow, kw, rest, panelStride);
+                            ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest);
+                        }
+                    }
+
+                    for (; row + 4 <= row1; row += 4)
+                    {
+                        Multiply4Rows(a0 + (long)row * k + k0, k, pk, c0 + (long)row * ldc + j0, kw, bulk,
+                            panelStride, ldc, acc || bias0 is null ? null : bias0 + row, acc ? null : colBias, colScale, acc);
+
+                        if (bulk >= width)
+                            continue;
+
+                        int rest = width - bulk;
+                        for (int i = 0; i < 4; i++)
+                        {
+                            float* cRow = c0 + (long)(row + i) * ldc + j0 + bulk;
+                            MultiplyRow(a0 + (long)(row + i) * k + k0, pk + bulk, cRow, kw, rest, panelStride);
+                            ScaleColumns(cRow, colScale + bulk, colBias is null ? null : colBias + bulk, rest);
+                        }
+                    }
+
+                    for (; row < row1; row++)
+                    {
+                        float* cRow = c0 + (long)row * ldc + j0;
+                        if (colScale is null)
+                        {
+                            MultiplyRow(a0 + (long)row * k + k0, pk, cRow, kw, width, panelStride,
+                                acc || bias0 is null ? 0f : bias0[row], acc ? null : colBias, acc);
+                            continue;
+                        }
+
+                        MultiplyRow(a0 + (long)row * k + k0, pk, cRow, kw, width, panelStride);
+                        ScaleColumns(cRow, colScale, colBias, width);
+                    }
                 }
             }
 
@@ -741,32 +881,40 @@ internal static class GemmKernel
         for (int j0 = jBegin; j0 < jEnd; j0 += nb)
         {
             int width = Math.Min(nb, jEnd - j0);
-            PackColumns(b + (long)j0 * bColStride, k, bStride, width, pack, 0, bColStride);
             float* colBias = columnBias is null ? null : columnBias + j0;
+            int kc = SelectKBlock(k, width);
 
-            int row = 0;
-            for (; UseMr12 && row + 12 <= m; row += 12)
+            for (int k0 = 0; k0 < k; k0 += kc)
             {
-                Multiply12Rows(a + (long)row * aStride, aStride, pack, c + (long)row * ldc + j0, k, width, width, ldc,
-                    bias is null ? null : bias + row, colBias);
-            }
+                int kw = Math.Min(kc, k - k0);
+                bool acc = k0 > 0;
 
-            for (; UseMr6 && row + 6 <= m; row += 6)
-            {
-                Multiply6Rows(a + (long)row * aStride, aStride, pack, c + (long)row * ldc + j0, k, width, width, ldc,
-                    bias is null ? null : bias + row, colBias);
-            }
+                PackColumns(b + (long)j0 * bColStride + (long)k0 * bStride, kw, bStride, width, pack, 0, bColStride);
 
-            for (; row + 4 <= m; row += 4)
-            {
-                Multiply4Rows(a + (long)row * aStride, aStride, pack, c + (long)row * ldc + j0, k, width, width, ldc,
-                    bias is null ? null : bias + row, colBias);
-            }
+                int row = 0;
+                for (; UseMr12 && row + 12 <= m; row += 12)
+                {
+                    Multiply12Rows(a + (long)row * aStride + k0, aStride, pack, c + (long)row * ldc + j0, kw, width, width, ldc,
+                        acc || bias is null ? null : bias + row, acc ? null : colBias, null, acc);
+                }
 
-            for (; row < m; row++)
-            {
-                MultiplyRow(a + (long)row * aStride, pack, c + (long)row * ldc + j0, k, width, width,
-                    bias is null ? 0f : bias[row], colBias);
+                for (; UseMr6 && row + 6 <= m; row += 6)
+                {
+                    Multiply6Rows(a + (long)row * aStride + k0, aStride, pack, c + (long)row * ldc + j0, kw, width, width, ldc,
+                        acc || bias is null ? null : bias + row, acc ? null : colBias, null, acc);
+                }
+
+                for (; row + 4 <= m; row += 4)
+                {
+                    Multiply4Rows(a + (long)row * aStride + k0, aStride, pack, c + (long)row * ldc + j0, kw, width, width, ldc,
+                        acc || bias is null ? null : bias + row, acc ? null : colBias, null, acc);
+                }
+
+                for (; row < m; row++)
+                {
+                    MultiplyRow(a + (long)row * aStride + k0, pack, c + (long)row * ldc + j0, kw, width, width,
+                        acc || bias is null ? 0f : bias[row], acc ? null : colBias, acc);
+                }
             }
         }
     }
@@ -813,33 +961,43 @@ internal static class GemmKernel
                 for (int j0 = 0; j0 < n; j0 += nb)
                 {
                     int width = n - j0 < nb ? n - j0 : nb;
-                    PackColumns(b + j0, k, n, width, pack);
+                    float* colBias = columnBias is null ? null : columnBias + j0;
+                    int kc = SelectKBlock(k, width);
 
-                    // 多行一起算：同一次 B 的 load 供多行复用，L1 的 load 端口不再
-                    // 被「每行各自把 B 拉一遍」占满。行块按 12 → 6 → 4 → 1 级联收尾。
-                    int row = row0;
-                    for (; UseMr12 && row + 12 <= row1; row += 12)
+                    // 列块 → K 分块 → 行：面板每块只有 16 KB，能被整个行块在 L1 里命中。
+                    for (int k0 = 0; k0 < k; k0 += kc)
                     {
-                        Multiply12Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
-                            bias is null ? null : bias + row, columnBias is null ? null : columnBias + j0);
-                    }
+                        int kw = Math.Min(kc, k - k0);
+                        bool acc = k0 > 0;
 
-                    for (; UseMr6 && row + 6 <= row1; row += 6)
-                    {
-                        Multiply6Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
-                            bias is null ? null : bias + row, columnBias is null ? null : columnBias + j0);
-                    }
+                        PackColumns(b + j0 + (long)k0 * n, kw, n, width, pack);
 
-                    for (; row + 4 <= row1; row += 4)
-                    {
-                        Multiply4Rows(a + (long)row * k, k, pack, c + (long)row * ldc + j0, k, width, width, ldc,
-                            bias is null ? null : bias + row, columnBias is null ? null : columnBias + j0);
-                    }
+                        // 多行一起算：同一次 B 的 load 供多行复用，L1 的 load 端口不再
+                        // 被「每行各自把 B 拉一遍」占满。行块按 12 → 6 → 4 → 1 级联收尾。
+                        int row = row0;
+                        for (; UseMr12 && row + 12 <= row1; row += 12)
+                        {
+                            Multiply12Rows(a + (long)row * k + k0, k, pack, c + (long)row * ldc + j0, kw, width, width, ldc,
+                                acc || bias is null ? null : bias + row, acc ? null : colBias, null, acc);
+                        }
 
-                    for (; row < row1; row++)
-                    {
-                        MultiplyRow(a + (long)row * k, pack, c + (long)row * ldc + j0, k, width, width,
-                            bias is null ? 0f : bias[row], columnBias is null ? null : columnBias + j0);
+                        for (; UseMr6 && row + 6 <= row1; row += 6)
+                        {
+                            Multiply6Rows(a + (long)row * k + k0, k, pack, c + (long)row * ldc + j0, kw, width, width, ldc,
+                                acc || bias is null ? null : bias + row, acc ? null : colBias, null, acc);
+                        }
+
+                        for (; row + 4 <= row1; row += 4)
+                        {
+                            Multiply4Rows(a + (long)row * k + k0, k, pack, c + (long)row * ldc + j0, kw, width, width, ldc,
+                                acc || bias is null ? null : bias + row, acc ? null : colBias, null, acc);
+                        }
+
+                        for (; row < row1; row++)
+                        {
+                            MultiplyRow(a + (long)row * k + k0, pack, c + (long)row * ldc + j0, kw, width, width,
+                                acc || bias is null ? 0f : bias[row], acc ? null : colBias, acc);
+                        }
                     }
                 }
             }
@@ -920,7 +1078,8 @@ internal static class GemmKernel
         int ldc,
         float* bias = null,
         float* columnBias = null,
-        float* columnScale = null)
+        float* columnScale = null,
+        bool accumulate = false)
     {
         float* a1 = a + aStride;
         float* a2 = a + 2 * aStride;
@@ -1081,30 +1240,30 @@ internal static class GemmKernel
                 cb1 = Fma.MultiplyAdd(cb1, s1, t1);
             }
 
-            Avx.Store(c + j, c00);
-            Avx.Store(c + j + 8, c01);
-            Avx.Store(c1 + j, c10);
-            Avx.Store(c1 + j + 8, c11);
-            Avx.Store(c2 + j, c20);
-            Avx.Store(c2 + j + 8, c21);
-            Avx.Store(c3 + j, c30);
-            Avx.Store(c3 + j + 8, c31);
-            Avx.Store(c4 + j, c40);
-            Avx.Store(c4 + j + 8, c41);
-            Avx.Store(c5 + j, c50);
-            Avx.Store(c5 + j + 8, c51);
-            Avx.Store(c6 + j, c60);
-            Avx.Store(c6 + j + 8, c61);
-            Avx.Store(c7 + j, c70);
-            Avx.Store(c7 + j + 8, c71);
-            Avx.Store(c8 + j, c80);
-            Avx.Store(c8 + j + 8, c81);
-            Avx.Store(c9 + j, c90);
-            Avx.Store(c9 + j + 8, c91);
-            Avx.Store(cc10 + j, ca0);
-            Avx.Store(cc10 + j + 8, ca1);
-            Avx.Store(cc11 + j, cb0);
-            Avx.Store(cc11 + j + 8, cb1);
+            StoreAcc(c + j, c00, accumulate);
+            StoreAcc(c + j + 8, c01, accumulate);
+            StoreAcc(c1 + j, c10, accumulate);
+            StoreAcc(c1 + j + 8, c11, accumulate);
+            StoreAcc(c2 + j, c20, accumulate);
+            StoreAcc(c2 + j + 8, c21, accumulate);
+            StoreAcc(c3 + j, c30, accumulate);
+            StoreAcc(c3 + j + 8, c31, accumulate);
+            StoreAcc(c4 + j, c40, accumulate);
+            StoreAcc(c4 + j + 8, c41, accumulate);
+            StoreAcc(c5 + j, c50, accumulate);
+            StoreAcc(c5 + j + 8, c51, accumulate);
+            StoreAcc(c6 + j, c60, accumulate);
+            StoreAcc(c6 + j + 8, c61, accumulate);
+            StoreAcc(c7 + j, c70, accumulate);
+            StoreAcc(c7 + j + 8, c71, accumulate);
+            StoreAcc(c8 + j, c80, accumulate);
+            StoreAcc(c8 + j + 8, c81, accumulate);
+            StoreAcc(c9 + j, c90, accumulate);
+            StoreAcc(c9 + j + 8, c91, accumulate);
+            StoreAcc(cc10 + j, ca0, accumulate);
+            StoreAcc(cc10 + j + 8, ca1, accumulate);
+            StoreAcc(cc11 + j, cb0, accumulate);
+            StoreAcc(cc11 + j + 8, cb1, accumulate);
         }
 
         // 不足 16 列的尾巴：交回单行内核（只覆盖各自列区间，不会与上面重叠）
@@ -1112,18 +1271,18 @@ internal static class GemmKernel
         if (rest <= 0)
             return;
 
-        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a4, b + j, c4 + j, k, rest, bStride, bias is null ? 0f : bias[4], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a5, b + j, c5 + j, k, rest, bStride, bias is null ? 0f : bias[5], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a6, b + j, c6 + j, k, rest, bStride, bias is null ? 0f : bias[6], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a7, b + j, c7 + j, k, rest, bStride, bias is null ? 0f : bias[7], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a8, b + j, c8 + j, k, rest, bStride, bias is null ? 0f : bias[8], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a9, b + j, c9 + j, k, rest, bStride, bias is null ? 0f : bias[9], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a10, b + j, cc10 + j, k, rest, bStride, bias is null ? 0f : bias[10], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a11, b + j, cc11 + j, k, rest, bStride, bias is null ? 0f : bias[11], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a4, b + j, c4 + j, k, rest, bStride, bias is null ? 0f : bias[4], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a5, b + j, c5 + j, k, rest, bStride, bias is null ? 0f : bias[5], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a6, b + j, c6 + j, k, rest, bStride, bias is null ? 0f : bias[6], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a7, b + j, c7 + j, k, rest, bStride, bias is null ? 0f : bias[7], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a8, b + j, c8 + j, k, rest, bStride, bias is null ? 0f : bias[8], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a9, b + j, c9 + j, k, rest, bStride, bias is null ? 0f : bias[9], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a10, b + j, cc10 + j, k, rest, bStride, bias is null ? 0f : bias[10], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a11, b + j, cc11 + j, k, rest, bStride, bias is null ? 0f : bias[11], columnBias is null ? null : columnBias + j, accumulate);
 
         if (scaled)
         {
@@ -1169,7 +1328,8 @@ internal static class GemmKernel
         int ldc,
         float* bias = null,
         float* columnBias = null,
-        float* columnScale = null)
+        float* columnScale = null,
+        bool accumulate = false)
     {
         float* a1 = a + aStride;
         float* a2 = a + 2 * aStride;
@@ -1260,18 +1420,18 @@ internal static class GemmKernel
                 c51 = Fma.MultiplyAdd(c51, s1, t1);
             }
 
-            Avx.Store(c + j, c00);
-            Avx.Store(c + j + 8, c01);
-            Avx.Store(c1 + j, c10);
-            Avx.Store(c1 + j + 8, c11);
-            Avx.Store(c2 + j, c20);
-            Avx.Store(c2 + j + 8, c21);
-            Avx.Store(c3 + j, c30);
-            Avx.Store(c3 + j + 8, c31);
-            Avx.Store(c4 + j, c40);
-            Avx.Store(c4 + j + 8, c41);
-            Avx.Store(c5 + j, c50);
-            Avx.Store(c5 + j + 8, c51);
+            StoreAcc(c + j, c00, accumulate);
+            StoreAcc(c + j + 8, c01, accumulate);
+            StoreAcc(c1 + j, c10, accumulate);
+            StoreAcc(c1 + j + 8, c11, accumulate);
+            StoreAcc(c2 + j, c20, accumulate);
+            StoreAcc(c2 + j + 8, c21, accumulate);
+            StoreAcc(c3 + j, c30, accumulate);
+            StoreAcc(c3 + j + 8, c31, accumulate);
+            StoreAcc(c4 + j, c40, accumulate);
+            StoreAcc(c4 + j + 8, c41, accumulate);
+            StoreAcc(c5 + j, c50, accumulate);
+            StoreAcc(c5 + j + 8, c51, accumulate);
         }
 
         // 不足 16 列的尾巴：交回单行内核（只覆盖各自列区间，不会与上面重叠）
@@ -1279,12 +1439,12 @@ internal static class GemmKernel
         if (rest <= 0)
             return;
 
-        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a4, b + j, c4 + j, k, rest, bStride, bias is null ? 0f : bias[4], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a5, b + j, c5 + j, k, rest, bStride, bias is null ? 0f : bias[5], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a4, b + j, c4 + j, k, rest, bStride, bias is null ? 0f : bias[4], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a5, b + j, c5 + j, k, rest, bStride, bias is null ? 0f : bias[5], columnBias is null ? null : columnBias + j, accumulate);
 
         if (scaled)
         {
@@ -1322,7 +1482,8 @@ internal static class GemmKernel
         int ldc,
         float* bias = null,
         float* columnBias = null,
-        float* columnScale = null)
+        float* columnScale = null,
+        bool accumulate = false)
     {
         float* a1 = a + aStride;
         float* a2 = a + 2 * aStride;
@@ -1398,14 +1559,14 @@ internal static class GemmKernel
                 c31 = Fma.MultiplyAdd(c31, s1, t1);
             }
 
-            Avx.Store(c + j, c00);
-            Avx.Store(c + j + 8, c01);
-            Avx.Store(c1 + j, c10);
-            Avx.Store(c1 + j + 8, c11);
-            Avx.Store(c2 + j, c20);
-            Avx.Store(c2 + j + 8, c21);
-            Avx.Store(c3 + j, c30);
-            Avx.Store(c3 + j + 8, c31);
+            StoreAcc(c + j, c00, accumulate);
+            StoreAcc(c + j + 8, c01, accumulate);
+            StoreAcc(c1 + j, c10, accumulate);
+            StoreAcc(c1 + j + 8, c11, accumulate);
+            StoreAcc(c2 + j, c20, accumulate);
+            StoreAcc(c2 + j + 8, c21, accumulate);
+            StoreAcc(c3 + j, c30, accumulate);
+            StoreAcc(c3 + j + 8, c31, accumulate);
         }
 
         // 不足 16 列的尾巴：交回单行内核（只覆盖各自的列区间，不会和上面重叠）
@@ -1413,10 +1574,10 @@ internal static class GemmKernel
         if (rest <= 0)
             return;
 
-        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j);
-        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j);
+        MultiplyRow(a, b + j, c + j, k, rest, bStride, bias is null ? 0f : bias[0], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a1, b + j, c1 + j, k, rest, bStride, bias is null ? 0f : bias[1], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a2, b + j, c2 + j, k, rest, bStride, bias is null ? 0f : bias[2], columnBias is null ? null : columnBias + j, accumulate);
+        MultiplyRow(a3, b + j, c3 + j, k, rest, bStride, bias is null ? 0f : bias[3], columnBias is null ? null : columnBias + j, accumulate);
 
         if (scaled)
         {
@@ -1482,13 +1643,15 @@ internal static class GemmKernel
     /// </para>
     /// </summary>
     private static unsafe void MultiplyRow(
-        float* a, float* b, float* c, int k, int width, int bStride, float bias = 0f, float* columnBias = null)
+        float* a, float* b, float* c, int k, int width, int bStride, float bias = 0f, float* columnBias = null,
+        bool accumulate = false)
     {
         int j = 0;
 
         // AVX2+FMA：256 位、8 路 F32，显式 FMA 融合。
         // Vector<float> 不保证被 JIT 融成 FMA，浮点语义上也不能随便融，所以这里手写。
-        if (Avx2.IsSupported && Fma.IsSupported)
+        // K 分块的累加态走下面的通用路径（AVX2 版是整块覆盖写，不支持 +=）。
+        if (!accumulate && Avx2.IsSupported && Fma.IsSupported)
             j = MultiplyRowAvx2(a, b, c, k, width, bStride, bias, columnBias);
 
         int vw = Vector<float>.Count;
@@ -1502,6 +1665,9 @@ internal static class GemmKernel
                 ? new Vector<float>(bias)
                 : Unsafe.ReadUnaligned<Vector<float>>(columnBias + j);
 
+            if (accumulate)
+                acc += Unsafe.ReadUnaligned<Vector<float>>(c + j);
+
             for (int t = 0; t < k; t++)
                 acc += new Vector<float>(a[t]) * Unsafe.ReadUnaligned<Vector<float>>(b + (long)t * bStride + j);
 
@@ -1511,6 +1677,8 @@ internal static class GemmKernel
         for (; j < width; j++)
         {
             float sum = columnBias is null ? bias : columnBias[j];
+            if (accumulate)
+                sum += c[j];
             for (int t = 0; t < k; t++)
                 sum += a[t] * b[(long)t * bStride + j];
             c[j] = sum;

@@ -59,7 +59,7 @@ internal static class MatMulArgMaxTests
 
             byte[] inputBytes = File.ReadAllBytes(Path.Combine(directory, $"argmax_{tag}_x.f32"));
             var input = Tensor.Allocate(new TensorShape(rows, inputBytes.Length / sizeof(float) / rows), DType.F32);
-            inputBytes.CopyTo(input.Buffer, 0);
+            inputBytes.AsSpan().CopyTo(input.Bytes());
             net.SetInput("x", input);
 
             var actual = net.Forward().AsSpan<long>();

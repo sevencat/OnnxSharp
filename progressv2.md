@@ -6,9 +6,11 @@
 > `(Get-Counter '\Processor Information(_Total)\% Processor Performance') > 80%`。
 
 - 立项：2026-11-15
-- 当前阶段：**P6'（含余项）、P4、P3、P5 全部收口；GEMM 侧已无 >1% 单点。
-  P8 已实现但收益未判定（本机噪声压过信号）；yolo A/B/C 实测命中 0 层、已回退。
-  下一个要么做「C 写面板」（0.6%）、要么立「s2 层卷积」（stride-2 Winograd / NCHWc）**
+- 当前阶段：**rfdetr 主线收工**（P6' P4 P3 P5 P8 P9 全部收口，累计 −9.8% −4.5% −2.0% +2.2% +2.2%）；
+  MatMul 复核后确认**已跑到峰值 92.5%，没有可立项的大项**（`bench.md` / `planv2 §P9.6`）。
+  **转入 yolo：局部 NCHWc 的三个前置问题已实测通过**（reorder 5 处 / 0.336 ms、块宽 16、
+  `BufferAllocator` 零改动，`bench.md §22`），下一步是 **P10 阶段 1——只做 s2 的 7 层**，
+  验收「107 → ≥170 GMAC/s」，拿不到 1.5× 就停（`planv2 §P7.7`）。
 
 ---
 
@@ -26,10 +28,13 @@
 | P6 | 并行粒度按线程数自适应 | **前提证伪**，降为观察项 | ~~结构性~~ | 1→2→4 近线性 |
 | P6' | GEMM 微内核 70~74% → 85% | **完成并关闭**（MR=6 + MR=12；余项 A 打包实测负收益） | ~~-13%~~ 上限 -10% | 打包路径 **92.2%**，端到端 **-9.8%**（246.0→221.8） |
 | — | 内存复用（ORT memory pattern 对应项） | **完成**（修 `Fit` 缩容 bug） | 0（隐患消除） | 54.8→1.4 MB/帧 |
-| P8 | QK→Softmax→PV 分块融合 | **已实现，收益未判定**（本机噪声 > 信号） | −4% | 数值 max\|diff\| 1.19e-7；待同进程 A/B |
+| P8 | QK→Softmax→PV 分块融合 | **完成并采纳**（`bench.md §20`） | **+2.2%** | 配对中位 1.022，噪声地板 1.6% |
+| — | `ab` 同进程交替 A/B 工具 | **完成**（`bench.md §20.1/20.2`） | — | 自检同配置 1.0% 跨度，可辨 ≥1% 信号 |
+| P9 | attention 内核（4 步 + flash 兜底） | **完成 3/4 并关闭**（`bench.md §21`） | 目标 −4.6% | **+2.2%**（P9.1 中性 · P9.2 +0.6% · P9.3 +1.0% 逐位相同）；P9.4/9.5 按天花板关闭 |
 | P7-A/B | yolo Conv 去物化 + 行块 4→8 | **已否决并回退**（命中 0 层，`bench.md §19`） | ~~−3%~~ | 够得着的两层 −21%，但 yolo 里被 Winograd 全接走 |
 | P7-C | yolo ic 块外提 | **不启动**（前提同 A/B，命中面为空集） | — | — |
-| P7.7 | yolo 改走 NCHWc | **定调，暂缓实施**（`planv2 §P7.7`） | yolo ~−25% | — |
+| P7.7 | yolo 改走 NCHWc | **阶段 1+2 完成并采纳**（`bench.md §22` 立项 / `§23` s2 / `§24` s1） | yolo −14% ~ −24% | **30 层/帧命中，单层 220 GMAC/s**；端到端 **−21.2% / −25.1% / −23.6% / −27.0% / −27.6%**（11n/8n/11s/8s/11m） |
+| P10 | yolo 的 NCHWc 内核（s2 + s1） | **完成**：泛化到 stride 1，指令数不变 | — | s2 204、s1 220 GMAC/s（对照 88~184）；reorder 占 9.5% |
 
 目标线（4 线程 median）：rfdetr-small **262.5 → ≤ 210**、yolo11n **39.1 → ≤ 27**。
 
@@ -325,9 +330,13 @@ v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→
      87 个 conv 最大单个 1.94 ms → 是「中等尺寸 conv 的效率」问题。
      **A/B（去物化 + 行块 8）已测死**（`bench.md §19`：命中 0 层，3×3/s1 全在 Winograd 手里，
      且 Winograd 199 GMAC/s 比放开准入后的打包快 38%）；C 同前提，不启动。
-     2026-11-16 定调：**yolo 现在不动，将来直接上 NCHWc**（`planv2 §P7.7`：局部 c 布局 Conv，
+     2026-11-16 定调：**yolo 现在直接上 NCHWc**（`planv2 §P7.7`：局部 c 布局 Conv，
      只覆盖 s2 层与 1×1，边界插 reorder；与 §P7.4 否决的「全图传播」不是一回事）。
-     收益上限 ~25%（对 ORT 从 1.59× 拉到 1.2× 量级）；立项门槛是先把 <5% 的测量问题解决。
+     收益上限 ~25%（对 ORT 从 1.59× 拉到 1.2× 量级）。
+     **阶段 1（s2 的 7 层）已完成并采纳**：内核 1.82×、端到端 −5.5% / −3.9%（`bench.md §23`）。
+     **阶段 2（泛化到 stride 1）已完成并采纳**：30 层/帧命中、单层 220 GMAC/s、
+     端到端 **−21% ~ −28%**（`bench.md §24`）。图级布局传播经实测降级为可选项（上限 3~8%）。
+     下一步候选：1×1 的 c 内核（45 层 / 10.19 ms）、`oc%32!=0` 的层、blocked 缓冲按行带流式化。
    - **`Operators.md` 的 dtype 矩阵自动生成**：把规范的 `T` 约束接进 `GetMemoryShapes` 的校验，
      不做性能、只减少「某 dtype 悄悄走错分支」这类 bug（不排期）。
    - **测量工具**：给 `bench` 加同进程交替 A/B（两次 `Bind` 换配置跑同一份输入），
@@ -337,8 +346,220 @@ v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→
 
 ## 6. 日志
 
+### 2026-11-16（**张量缓冲 64B 对齐**：1×1 124 → 138 GMAC/s，−1.2 ms，`bench.md §30`）
+
+- 起因是 P13 第一步「用 gemmbench 扫真实窄 m 形状」：发现**同一批形状**在图内比微基准慢 12~15%，
+  而 `--misalign 4`（起点推 16 字节）能精确复现这个跌幅 ⇒ 怀疑指针对齐。
+- 新增诊断 `ONNXSHARP_GEMM_ALIGN=1`，量出图里 GEMM 的 64 字节对齐率 **A 18% / B 8% / C 0%**。
+  根因：`Tensor.Fit` 的 `new byte[need]` 只保证 8 字节对齐。
+- 修复：`Tensor.Alignment = 64`，分配 `need+64` 并放 **POH**（GC 不搬），`ByteOffset` 推到对齐边界；
+  新增 `Bytes()`（含偏移的字节视图），改掉 5 处「假设偏移为 0」的裸写（`OnnxFile` 三条解码路径、
+  `SafeTensorFormat`、`Paraformer` 三处 `Buffer.BlockCopy`、`Tensor.Clone`）与 5 个测试用例的同类写法。
+- 过程中踩坑并定位：第一版改动后有 5 个数值用例失败（quant / argmax / attention / yunet-int8 / asr），
+  `Alignment=1` 复跑全恢复 ⇒ 确认是「写端假设偏移 0」而不是内核算错。
+- 收益（同会话交替 A/B，min ms）：yolo11n 29.9/29.2/29.9 → **28.4/28.5/28.6**；yolov11s 77.2 → 75.9；
+  rfdetr-small 221.5 → 219.7。逐路径只动 1×1 GEMM（9.34 → 8.44），Im2Col/PackedConv 不变（它们本来就对齐）。
+- 四引擎刷新：yolo11n **28.9 / 23.5 / 45.9 / 29.3**，与 ORT 的差距 1.26× → **1.23×**。
+- 回归：116/118（2 skipped）、0 failed；`alloc` 仍 116 KB/iter（缓冲复用，没变多）。
+- 残留写进 P13：B 仍只有 61% 对齐（激活多是视图张量）；窄 m 的真实瓶颈要先分清内存屋顶与级联。
+
+### 2026-11-16（拆开 4 条 conv 路径：**P12 前提否证**，肉在 1×1 的窄 m，`bench.md §29`）
+
+- 把 `PackedConv` / `Im2Col` / `Winograd` 补上「打包 vs 内核」+ 墙钟，复用手写的 `NchwcConv`
+  三段计时（`ONNXSHARP_NCHWC_PROF`）。四条路径首次与 op 级 `Conv` 对上：**9.83 + 10.46 + 2.02 + 1.53
+  = 23.84 vs 24.0（差 0.7%）**。
+- **关键发现：3×3 不是 im2col 打包浪费**。14.0 ms 里 75% 走 NCHWc，内核 9.44 ms、reorder 仅 9.8%；
+  整体 **150 GMAC/s = 4 线程峰值 81%**。全部打包合计 **1.7 ms（5.7% 帧）** → direct conv 上限就这么点，结案。
+- Winograd **0 次命中**（3×3 s1 的空间都 > `MaxSpatialPixels`=4096），现有实现是标量变换，打不过 NCHWc。
+- 真正的差口：**1×1 = 136 GMAC/s（模型内）vs 150~160（gemmbench 同形状）vs 185（峰值）**，
+  窄 m（16/32/64 行）＋ epilogue 吃掉 ~2.2 ms；另有首层 `3→16` 只 42.5 GMAC/s、独占 1.04 ms（3.6%）。
+  ⇒ 新候选 **P13**。
+- 方法学补记：逐任务计时在多线程下是「CPU 累加 ≈ 墙钟 × 占用核数」，所以 `ConvProf` 现在同时打
+  墙钟和任务累计两个数；`NchwcConv` 的 profile 也改成预热后清零并按帧归一。
+- 零仪表开销校验：`ONNXSHARP_CONV_PROF=0` 时 bench min 30.3 / median 30.8（同机 29.6 / 30.2，噪声内）；
+  测试 116/118（2 skipped）。
+- 顺手修了 `bench.md` 的章节顺序（§28 原本被插到 §27 前面）。
+
+### 2026-11-16（四引擎同会话复测：ORT 领先 7~26%，差口在 3×3，`bench.md §28`）
+
+- PATH 上的 `python` 是失效 shim（exit 49），改用 `E:\misedir\installs\python\3.11.17\python.exe`
+  （ort 1.32.0 / cv2 5.0.0）才跑通 `bench/run_all.py`。
+- 4 线程、iters 30 / warmup 10 / rounds 2（median，min 差 <1%）：
+  yolo11n **29.6** vs ORT **23.5** vs OpenCV 46.4 vs SimdYolo 29.9；yolov8n 34.4/27.8；
+  yolov8s 87.4/76.4；yolo11s 77.2/63.5；rfdetr-small 200.0/187.2。
+  ⇒ **ORT 全面领先 7~26%**（1.07~1.26×），我们与 SimdYolo 打平。
+- OpenCV 4 线程崩到 46.4（16 线程历史是 26.5）—— 两套口径不可混比。
+- 差距定位：`bench min 29.8 ↔ sum-of-min 29.4` 闭合，Conv 24.2（84%），非卷积 4.7；
+  1×1 已封板（10.9 ms、87~90% 峰值），**6 ms 的差只能出在 3×3 的 13.3 ms 上** → P12 依据成立。
+- 记一条方法学警告：`ort_inspect.py --profile` 的逐算子合计 37.25 ms vs 同机 bench 23.5（1.58×），
+  ORT 的 profiling 开销极重，只能看相对占比，不能跨引擎加总对比。
+
+### 2026-11-16（修仪表：`ConvProf` 三处 bug，帧预算重算，`bench.md §27`）
+
+- 定位到 `§25.5`「三个仪表差 15 倍」的真凶不在内核，在仪表本身：
+  ① `ProfileAll` 先跑 5 帧预热但 `ConvProf` 不清零，除数只有 `iters`(12) → 每帧次数虚高 1.42×；
+  ② 表头「pointwise 整段」打印的是**全进程累计值**（217 ms 是 17 帧之和），压根没除帧数；
+  ③ `Capacity=4096` 溢出静默丢弃。
+- 修法：`ProfileAll` 加 `onMeasurementStart` 回调（`profile` 传 `ConvProf.Reset`）；
+  `Take(frames)` 内部除帧数；`Capacity` → 16384 + `dropped` 警告。
+- **修正后 yolo11n 帧预算（4 线程，sum-of-min 28.9 ms / bench 中位 29.9 ms，两口径差 3.5%）**：
+  1×1 GEMM **9.57**（33%）+ 融合 SiLU 1.35（5%）+ 3×3（im2col）**13.3**（46%）+ 非卷积 4.7（16%）。
+  `§25.1` 的「1×1 = 15.5 ms / 49%」作废 —— 实际 10.9 ms / 38%。
+- 口径咬合：单形状 `128×192×1600` 表内 0.25 ms ↔ `gemmbench` 0.212 ms（86%）；`pointwise 9.57`
+  vs `GEMM 9.56` → 非 GEMM 开销 0.01 ms（1×1 的账全在 GEMM 里）。
+- 结论：**GEMM 封板，第一块肉变成 3×3 的 im2col（13.3 ms / 46%），而它现在没有分阶段计时**。
+  下一步先给 im2col 补「打包 vs GEMM」两段计时，再决定 direct conv / NCHWc。
+- 回归：测试 116/118（2 skipped，基线一致）。
+
+### 2026-11-16（动手：K 分块照 MLAS 落地 → **负收益，默认关**，`bench.md §26`）
+
+- 用户拍板「ORT 这么做的就照做」，于是把 `MlasSgemmOperation` 的循环形状（N 段 → K 块 →
+  重打 PanelB → `ZeroMode` 累加）落进 `GemmKernel`：`MultiplyColumnRange` / `MultiplyRowBlock` /
+  `MultiplyPacked.Block` 三处驱动 + 四个内核加 `accumulate` 形参，`ONNXSHARP_GEMM_KC` 控制块高。
+- **A/B 全面变慢 12~22%**（128×192×1600：371 → 324 GFLOPS；1024×1280×1280：374 → 291）。
+  判因：MLAS 分块是为「定长栈缓冲免分配」，我们用 `ArrayPool`，前提不成立；每块的 C 读改写
+  是纯额外开销。**P11 结案，不立项，开关默认 0。**
+- 连带把 `§25.5` 的仪表矛盾解决了一半：`gemmbench` 现在对热形状报 0.212 ms / 371 GFLOPS，
+  与模型内 `ConvProf` 的 0.24 ms 自洽 → **1×1 GEMM 已在 4 线程峰值 87~90%，GEMM 方向封板**；
+  此前 1.39 ms / 28 GMAC/s 的读数是坏数据。
+- 仍待修：`ConvProf` 的「每帧贡献」归一化除错了帧数（累计值/迭代数对不上），所以
+  `§25.1` 的「1×1 = 15.5 ms」不可引用；按 185 GMAC/s 反推实际约 5 ms/帧。帧预算暂时只认
+  `profile --top` 的 sum-of-min。
+- 回归：测试 116/118（2 skipped，基线一致，含 yolo11n 与 ORT golden 的端到端比对）；
+  模型 `bench` 中位 29.9 ms / min 29.4 ms（与 §24 的 30.1/31.7 同档，无回退）。
+
+### 2026-11-16（更晚：1×1 的账，`bench.md §25`）
+
+- 3×3 收完后先算「剩下的钱在谁身上」，新增仪表 `ONNXSHARP_CONV_PROF=1`（`ConvProf`：
+  pointwise 整段 / 其中的 GEMM / 卷积后融合激活，外加逐形状「每帧贡献」聚合）。
+- 帧预算（yolo11n 31.7 ms sum-of-min）：**1×1 GEMM 15.5 ms（49%）**、3×3 ~10.5 ms（33%）、
+  融合 SiLU 3.7 ms（12%）、非卷积 ~6 ms。pointwise 的非 GEMM 开销只有 0.13 ms（0.4%）
+  —— 包装不是问题，GEMM 就是全部。
+- 大形状 1×1 的 GEMM 已经在 136~161 GMAC/s（峰值 213 的 65~77%），没什么可榨；
+  `64×128×400` 这类小形状因为低于 `ParallelThreshold` 走串行只有 40 GMAC/s。
+- 上一轮「1×1 = 10.19 ms / 45 层」作废（逐层 min 手工归属偏小），改引用 15.5 ms。
+- 两个异常挂着没下结论：`32×32×25600` 就地 2.40 ms vs 独立 0.309 ms（且同层 profile 只报
+  0.40 ms，两个仪表打架）；降阈值的 A/B 被 CodeBuddy 占 30% CPU 搞成噪声地板 48.6%、判不出。
+- 回归：测试 116/118（与基线一致），CLI 零警告。
+- 下一步两个候选：(A) 1×1 走 blocked 布局（与 3×3 同布局，链上免 reorder）；
+  (B) 把 SiLU 熔进 GEMM 的 C 写回（省一趟读+写，约 2 ms = 6%，但要动全库最精细的代码）。
+
+### 2026-11-16（定调：**参照 ORT**，放弃 B、降级 A，`bench.md §25.4`）
+
+- 决定：**(B) SiLU 熔进 GEMM 的 C 写回 —— 放弃**；(A) 1×1 blocked —— 降级为「ORT 都没试过」的
+  实验，不再当作下一步主线。改为主张「优先对齐 ORT 的做法」。
+- 依据（读 ORT main 的 `mlas/lib/{convolve,activate,sgemm}.cpp`）：
+  - 1×1 conv：`MlasConvPrepare` → `MlasConvAlgorithmGemmDirect`，`WorkingBufferSize = 0`，
+    直接 `MlasGemm(oc × pixels × ic)` —— 和我们 `Pointwise` 一模一样。
+  - 激活：GEMM 之后单独一趟 `MlasActivation(Activation, Output, Bias, oc, pixels, ldc)`，
+    微内核里没有任何激活；融合清单只有 Identity/Relu/LeakyRelu/Tanh/Logistic/Clip/
+    HardSigmoid/HardSwish，**没有 SiLU**。
+  - 微内核：`MLAS_SGEMM_TRANSA_ROWS = 12`、B 面板 16 列一块打包、每线程栈上面板、K 方向按
+    `STRIDEK` 滚动 —— 我们 `Multiply12Rows` + `SelectColumnBlock`=16 + 每线程打包，形状参数一致。
+  - 并行：`Complexity = oc × OutputSize × K` 对比 `MLAS_SGEMM_THREAD_COMPLEXITY`，再按
+    `STRIDEN_THREAD_ALIGN` 对齐切 N 段 —— 与我们的 colBlock=16 + `ParallelThreshold` 同思路。
+- 推论：**架构层面我们已经和 ORT 同构**，快慢差在微内核深度（k 展开、提前 load 的软件流水 +
+  K 分块滚动让面板留在 L1），不在「有没有某个专用内核」。下一轮实验应放在
+  `GemmKernel` 的 K 分块与 k 展开上，目标把 1×1 的 136~161 GMAC/s 推向 190+。
+  `MLAS_SGEMM_STRIDEK` 的具体值不在 `sgemm.cpp` 里，KC 取值得自己在 `gemmbench` 上扫。
+- **前置阻塞（`bench.md §25.5`）**：动手前复核产能时发现三个仪表对不上 —— 同一形状模型内
+  `ConvProf` 0.25 ms / `gemmbench` 1.39 ms / `convbench` 1.94 ms，`profile --top` 与 `ConvProf`
+  也差 15 倍；当次 `profile` 的 mean 193.3 ms 是 sum-of-min 38.8 ms 的 5 倍（机器满负荷）。
+  在安静窗口把「单层 in-model 计时 ↔ gemmbench 同形状」对齐之前，**不基于 §25.1 的
+  「1×1 = 15.5 ms / 49%」立项**。
+
+
+### 2026-11-16（深夜：P7.7 阶段 2 —— 泛化到 stride 1，端到端 −21% ~ −28%）
+
+- 先给 `TryConv` 加了分阶段计时（`ONNXSHARP_NCHWC_PROF=1`，`profile` 末尾打印每次调用与
+  reorder 占比），量出**阶段 1 只有 6 层命中、reorder 占 NCHWc 时间 18.9%、摊到整帧 1.0 ms（2.9%）**。
+- 按这个账，`§23.7` 原定「下一步做图级布局传播」被推翻：`dump-graph` 显示每个 s2 层的消费者是
+  3×3/s1 的 Conv 加远处的 Concat，要吃掉那 3% 得把 Concat/Split/MaxPool 和邻居卷积全 c 化。
+  **收益 3%、成本数天 —— 排序错了。** 改为「先把内核覆盖面扩到 stride 1」。
+- 实现：`HaloPad(stride)`（stride2 → 左上 1 像素，stride1 → 四周各 1 像素）+ `PackInput` 多清
+  最底一行/最右一列 + 内核把硬编码的 `2` 换成 `step`（`pix = step*Block`）。**指令数不变**，
+  所以 stride1 与 stride2 同速。同时把 `InferShapes` 与 `Forward` 的两份手写条件合并成
+  `NchwcConv.Dispatch()` 单点判据（申请 temp 与分派内核不能各写一份）。
+- 微基准（s1）：64→64 160² **220.6**、128→128 80² **220.8**、256→256 40² **220.8**、
+  256→256 20² 179.3（对照 im2col 106~159、Winograd 102~184、真模型里的 packed 120~150）。
+  奇数边长 101×97 例外：`ow=101` 有 5 个像素走尾路径，实测 110.7（比 im2col 慢 18%），真模型不常见。
+- 端到端 `ab`（配对中位）：yolo11n 38.6→31.8（**1.212**）、yolov8n 45.9→36.6（**1.251**）、
+  yolov11s 1.236、yolov8s 1.270、yolo11m 1.276、yolov5su **1.298**；`max|d|` 相对 1.6e-5，
+  `alloc 129 KB/iter`。yunet（`oc=8/16`，一层的 `oc%32` 都不满足）输出**逐位相同**、判定噪声内 —— 没命中就没风险。
+- 代价记账：blocked 输入缓冲 160² 单块 16.8 MB（temp 池按索引复用，峰值 ≈ 2 块）；
+  1080p 级输入会到 100 MB 量级 → 将来要么按行带流式化，要么给 `Tensor` 加 blocked 视图。
+- 回归：测试 116/118（1 个 argmax 计时用例受机器负载偶发失败，复跑通过）。
+
+### 2026-11-16（夜：P7.7 阶段 1 完成）
+
+- **s2 的 NCHWc16 内核已落地并采纳**（细节 `bench.md §23`）。新文件
+  `src/OnnxSharp/Kernels/NchwcConv.cs`：输入 `[C/16][H+1][W+1][16]`（左上 halo）、输出
+  `[OC/16][OH][OW][16]`、权重 `[OC/16][IC/16][9][icLane][ocLane]`（弱表缓存），2 oc 块 ×
+  8 像素 = **16 个 `zmm`** 累加器。接入点是 `ConvLayer.GetMemoryShapes` 加两块 temp +
+  `Forward` 里排在 Winograd 之前的分派分支。
+- **微基准（MAC 加权，yolo11n 的 7 个 s2 层）**：112.3 → **204.1 GMAC/s（1.82×）**，
+  单层 174~220（对照 im2col/packed 88~138）。判据「≥170 / 1.5×」通过。
+- **端到端 `ab`**：yolo11n 36.4 → 34.5 ms（配对中位 **1.055**，范围 1.047~1.057）；
+  yolov8n 42.5 → 40.8（**1.039**）。等价性 `max|d|` 相对 2.2e-5（累加顺序）。
+- **三个坑，都记进 `bench.md §23`**：
+  1. `CanUse` 必须要求 `h`/`w` 偶数 —— 只有左上 halo，奇数边长会多读一列/一行（`101×97`
+     的 `max|d|=24`）。`2*oh==h && 2*ow==w` 同时写进 `TryConv` 兜底。
+  2. reorder 第一版是「lane 外层逐元素写 64 字节块」→ 16× 写放大，320² 单层 **3.72 ms**
+     （比 conv 还贵）。换成 8×8 转置内核（`UnpackLow/High + Shuffle + Permute2x128`，
+     打包与解包共用）后 **0.19 ms**。
+  3. **进程里第一个 bench 配置永远不可信**：同一形状排第一 14.4 GMAC/s、排第二 92.5，
+     与 `DOTNET_TieredCompilation/TieredPGO/ReadyToRun` 全关无关，与形状无关。
+     `convbench` 已内置「首个配置读数丢弃」（自动插一个 `128→128 20²` 打头），现在裸跑即稳。
+- **端到端只有 −5.5% 而非推算 −8.4% 的根因**：阶段 1 没做布局传播，reorder 是「每层进、每层出」
+  共 14 次，in situ 约 1.3~1.5 ms（微基准 0.47 ms 是缓冲滚烫的乐观值）。`§22.1` 的 0.336 ms
+  只能引用在**传播之后**。→ 阶段 2 先做传播（`Fit` 带 layout、`Concat`/`Split`/`MaxPool`/`Resize`
+  的 c 版、`GetLayouts` 时间表），再谈 1×1 的 c 内核。
+
+### 2026-11-16（下午续）
+
+- **yolo 局部 NCHWc 的三个前置问题全部量完，结论是立项**（细节 `bench.md §22`）。
+  1. **reorder 边界 = 5 处 / 10.5 MB / 0.336 ms（端到端 0.9%）**，不是先前估的 18 处。
+     在 ONNX 图上做布局传播（新增常驻工具 `bench/layout_probe.py`）：`Concat`×23 与 `Split`×11
+     的通道数都是 16 的倍数，块序列直接拼接，免 reorder；C2PSA 的 `Transpose`/`MatMul`/`Softmax`
+     前面本来就有一个 `Reshape` 打回 NCHW，attention 整段保持 plain，不额外制造边界。
+     5 处 reorder **全是 `Reshape`**（C2PSA 入口 400 KB + head 的 P3/P4/P5 + DFL）。
+     就算阶段 1 不做 `MaxPool`/`Resize` 的 c 版，也只多 5 处、+0.13 ms。
+  2. **块宽 = 16**（1 个 `zmm`），86/88 个 conv 的 `oc % 16 == 0`；块宽 32 只有 70/88，
+     16 个 `oc=48/80/112` 要补一半 → 否决。两个例外排除在 c 之外：`ic=3` 首层（读 NCHW、写 c，
+     不必补到 16）与 `oc=8` 的 C3k2 瓶颈层（补到 16 是 2× 空转，保持 NCHW 更便宜）。
+     注意两个会误导人的平均值：按 conv 算术平均填充 26%、按 MAC 加权 117% —— 后者 95% 来自
+     首层的 `ic=3`，而首层根本不需要 c 输入。
+  3. **`BufferAllocator` 零改动**：`Layout` 枚举 / `Tensor.Layout` / `Arg.Layout` /
+     `LayerInfo.GetLayouts` 早已预留；槽只按「区间不重叠 + 字节够大」复用，与布局无关；
+     `Tensor.Fit` 每次复位 `Layout = NCHW`、`Strides = null`，槽复用不会串布局。
+  收益推算（目标吞吐是假设）：conv 31.78 ms = 3×3/s1 **13.44**（88.9 GMAC/s）/ s2 8.15（106.7）/
+  1×1 10.19（114.1）。s2→170 + 1×1→150 保守 −5.1 ms，端到端 **−14% ~ −24%**。
+  旁证比推算硬：OpenCV dnn 走 `NC8HW8`（块宽只有 8）实测 **28.6 ms**，比我们快 28%。
+
+- **顺带补了 §19 的盲区**：§19 整节只盯 s2（因为那是 A/B/C 的命中面），但 conv 里最大的一块是
+  **3×3/s1 的 13.44 ms** —— Winograd 只接了空间 ≤4096 的层（199 GMAC/s），160²/80² 的十几个层
+  退回 im2col，把家族平均拉到 89。新增工具 `bench/conv_family.py` 做这个分解。
+  **教训**：算「某家族的效率」不能只看该家族里最大的那层，要把没进优化路径的中小层一起算。
+
 ### 2026-11-16
 
+- **新增 `ab` 子命令：同进程交替 A/B（`bench.md §20`）**。两个引擎放同一进程，逐轮交替、
+  每轮交换先后顺序，每轮取 min 后看**配对比值的中位数**，噪声地板取 `max(1%, 3×MAD)`；
+  另带图算子直方图 diff（确认开关真改了图）与逐输出 max/mean/p99/>1e-3 计数 + 最差下标。
+  自检（两侧同配置，6 轮）：比值 1.001 ~ 1.011，判定「噪声内」→ **工具能分辨的最小信号约 1%**。
+  为此把 `GraphFusion.AttentionFusionMaxSeq` 与 `AttentionOps.BlockKernelMinSeq` 改成可写属性
+  （后者由层在构造时捕获，否则第二个引擎会覆盖第一个）。
+- **P8 判定：融合比不融合快 2.2%，采纳**。`attn_fuse=0` vs `4096`，6 轮交替：
+  A min 225.5 / B min 220.8 ms，配对中位 **1.022**，跨度 2.9%，噪声地板 1.6%（另一次跑出 1.055，
+  取保守值）。图上 `FusedAttention +12`、`MatMul −24`、`Softmax −12`（664 → 556 算子）。
+- **P8 数值差异归因（重要）**：融合前后 `dets` 有 108/1200 个值变化 >1e-3、max 0.5。
+  关键对照是「同为融合、只把块内核换成逐行内核」→ 60/1200、max 0.47，**同量级同形态**
+  （相邻 query 的 det/label 成对翻转）。结论：12 层 transformer 把 1e-7 的求和顺序差放大到 1e-3，
+  top-k 近邻换序，**不是 P8 的 bug**。故默认开启。
+- **新热点**：12 个 `FusedAttention` 各 7.2 ms = **端到端 40%**，804 MMAC/层 →
+  **112 GMAC/s**（同机 GEMM 峰值 197 的 57%）。下一步是 flash-attention 式（Q 分块 + 在线
+  softmax、S 块不落地），上限 `7.2 → 4.2 ms` ≈ 端到端 −16%，属新立项。
+  **↑ 这条当天就被推翻了，见下面 P9 的三条日志（attention 实为 16.4%，不是 40%）。**
 - **yolo A/B（Conv 去物化 + 行块 4→8）否决并回退（`bench.md §19`）**。A 做出 `Multiply8Direct`
   + `TryTapOffsets`（面板完全不物化，跨行/贴边回退打包），B 做出 `Multiply8`（19 个 YMM）
   与按层解析的行块，并把准入从 `K ≤ 2048` 放开到 `K ≤ 4096`。单层交替 5 轮取 min：
@@ -370,7 +591,7 @@ v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→
   `--btrans`（K^T 视图 B）、`MMv` trace 补 stride。
 - **新缺口：QK/PV 在图里比同参数探针慢 1.8×**（1.73 vs 0.95 ms、1.03 vs 0.54 ms，
   12 层 33.1 ms）。不是打包/派发，而是每层 6.3 MB attention 矩阵往返（25 MB/层，L2 1 MB）。
-  候选 P8「QK→Softmax→PV 分块融合」，上限 −4%，未排期。
+  候选 P8「QK→Softmax→PV 分块融合」，上限 −4%，未排期。→ **2026-11-16 已做成并判定 +2.2%（§20）。**
 - **否决并用回退的微优化**：`PackColumns` 的 `bColStride != 1` 分支改「按行优先」，
   微基准 5.314 → 0.728 ms（`bColStride==k`），真实 `bColStride=384` 下 0.958 vs 0.952 无差 ——
   已回退，`--btrans` 留作探针。回归：单测 116/118（2 skipped，0 失败）、rfdetr 端到端 min 212.2。
@@ -389,6 +610,41 @@ v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→
   测量教训：多引擎同会话时「后跑的被余热拖慢」，本轮出现 ORT rfdetr median 254.8 / min 189.9、
   ours 337.9 / 243.1 这种 min–median 差 100 ms 的自相矛盾数据 → **该轮作废**，
   改为每引擎独立会话 + 冷却到 perf 137% + 单引擎最好值。
+
+- **P9 执行（3/4 步，累计 +2.2%，`bench.md §21`）**。分步计划见 `planv2 §P9`，四步里做完三步：
+  **P9.1** 把 `ScoreBudget` 旋钮化（`ONNXSHARP_ATTN_SCORE_BUDGET`）后扫 128/256/512/1024 KB，
+  三组配对 0.991~0.993 → **512 已是最优，默认不变**（「超出 L2 会有悬崖」的猜想不成立：分块内核
+  是算术受限，不是带宽受限）。**P9.2** softmax 的 `1/Σ` 折到 PV 之后（S 只存 exp 值），
+  端到端中位 1.007、段内 `soft+pv` 稳定 −3~4%，数值 `max|d|=9.3e-5`、0 翻转 → 保留。
+  **P9.3** `K^T`/`V` 面板按 `(b,h)` 只打一次（并行区间连续，记住上次的 `bh` 即可，无需共享），
+  中位 **1.010** 且 **`max|d| = 0` 逐位相同**；顺带发现 `V` 复用也值 ~12 µs/块。
+  累计 `ab`（两项全关 vs 全开）**1.022，跨度 0.7%，6 轮同向**。
+- **口径纠正（重要）：attention 只占 16.4%，不是 40%**。`ONNXSHARP_ATTN_TRACE=1` 新增 `[attnthr]`
+  探针后发现 12 个 `FusedAttention` **不同构**：只有 3 个是 `b=1,t=1028`（811 MMAC / 6.0~6.6 ms /
+  134 GMAC/s），另 9 个是 `b=4,t=257`（窗口 16×16+1，203 MMAC / 1.6~1.7 ms / 127 GMAC/s）。
+  两族吞吐一致，**没有并行退化**——「12 层各 7.2 ms」是把 3 个大层当成 12 层。
+  `profile` sum-of-min 里 attention 合计 35.5 ms / 219 = **16.4%**。
+  后果：flash 式重写的收益上限从 −16% 修正为 **不到 −5%**。
+- **P9.4 / P9.5 按天花板关闭**。`gemmbench` 同 16.7 MFLOP：`127×64×1028`（QK 形状）222 GFLOPS、
+  `127×1028×64`（PV 形状）334 GFLOPS → **纯 GEMM 就复现了 QK/PV 的 1.5× 差距**，与打包/softmax/
+  S 落地无关，是 k=64 时序言/尾声摊不掉。补齐要新写短 K 微内核，收益上限 2.5%，
+  而 P6' 已判定微内核侧无 >1% 单点改善 → 关闭。flash 式上限 <2% → 关闭。
+  **rfdetr 的 attention 侧到此收工。**
+- **「下一个大项是 MatMul（64%）」这句是错的，当天撤回**。同口径 `profile`（4 线程 3 iter、
+  sum-of-min 199.8）：MatMul 115 个 / 124.2 ms（62%），但主体是 12 层 MLP ——
+  `fc1` 3.2 ms×12 + `fc2` 2.91 ms×12 = **73.7 ms / 29.1 GFLOP = 395 GFLOPS = 4 线程峰值的 92.5%**，
+  q/k/v 的 36 个投影也在同一档（~379）。**剩余 8% 且要求打赢峰值 → 不是「可做」，是「已做完」。**
+  同时撤回「要靠 NCHWc」：NCHWc 对 2D MatMul 零收益（§P7.4 自己论证过），§P7.7 的 NCHWc
+  是 **yolo 局部 conv** 的路线，与 MatMul 无关；**yolo11n 只有 2 个 MatMul（C2PSA 内）**，
+  MatMul 这条线是 rfdetr 专属，做了对 yolo 一点帮助都没有。
+  含义：rfdetr 主线**不再有可立项的大项**，剩下的是 Conv 79%→1.2%、attention 63%→5%（已判定不划算）、
+  其余 ~32 ms 的逐元素/格/LN 碎块。
+- **收工清理**：删掉一次性 `[attnthr]` 探针（`TraceBlocks` 门控下的 `ConcurrentDictionary` +
+  `Stopwatch`）。复测：单测 **116/118**（同基线）、`bench` 4 线程 min 222.7 / median 228.7 ms、
+  累计 `ab` 6 轮同向中位 **1.016**（1.011~1.021，地板 1.0%，`out1 max|d|=3.86e-5`、0/900 翻转）
+  → 与 §21.5 的 1.022 同向，幅度随机器状态浮动，结论不变。
+  坑记一笔：`ab`/`bench` **不显式设 `ONNXSHARP_THREADS=4`** 会用满核，绝对耗时掉到 140 ms 量级、
+  配对跨度 7.8%，直接误判成「噪声内」。
 
 ### 2026-11-15
 

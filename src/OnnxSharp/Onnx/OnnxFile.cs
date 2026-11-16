@@ -296,7 +296,7 @@ internal sealed class OnnxFile
             if (raw.Length < need)
                 throw new OnnxSharpException(
                     $"tensor '{debugName}' raw_data is {raw.Length} bytes, {need} needed ({shape} {dtype})");
-            raw.Span[..need].CopyTo(tensor.Buffer);
+            raw.Span[..need].CopyTo(tensor.Bytes());
             return tensor;
         }
 
@@ -353,7 +353,7 @@ internal sealed class OnnxFile
                 {
                     var data = proto.Ints(5);
                     Expect(data.Length, need, debugName, "int32_data");
-                    var bytes = tensor.Buffer.AsSpan(0, need);
+                    var bytes = tensor.Bytes();
                     for (int i = 0; i < bytes.Length; i++)
                     {
                         if (dtype == DType.Bool)
@@ -426,7 +426,7 @@ internal sealed class OnnxFile
         using var stream = File.OpenRead(full);
         stream.Seek(offset, SeekOrigin.Begin);
 
-        var destination = tensor.Buffer.AsSpan(0, need);
+        var destination = tensor.Bytes()[..need];
         int total = 0;
         while (total < destination.Length)
         {

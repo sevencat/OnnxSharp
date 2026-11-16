@@ -152,7 +152,7 @@ internal static partial class SafeTensorFormat
             dims[i] = checked((int)info.Shape[i]);
 
         var tensor = Tensor.Allocate(new TensorShape(dims), dtype);
-        raw.AsSpan(0, Math.Min(raw.Length, tensor.Buffer.Length)).CopyTo(tensor.Buffer);
+        raw.AsSpan(0, Math.Min(raw.Length, tensor.ByteLength)).CopyTo(tensor.Bytes());
         return tensor;
     }
 

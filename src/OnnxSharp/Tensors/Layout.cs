@@ -15,6 +15,17 @@ namespace OnnxSharp.Tensors;
 /// </summary>
 public enum Layout
 {
-    /// <summary>NCHW 直通（唯一已实现布局）。</summary>
+    /// <summary>NCHW 直通（默认布局，其余算子全部按它实现）。</summary>
     NCHW = 0,
+
+    /// <summary>
+    /// 通道分块 16：物理顺序 <c>[C/16][H][W][16]</c>，同一个像素的 16 个通道连续
+    /// （正好 1 个 <c>zmm</c>）。逻辑形状仍是 NCHW，元素数不变，只是顺序不同。
+    /// <para>
+    /// 只有 <see cref="Kernels.NchwcConv"/> 认识它；进出该布局的算子必须显式
+    /// reorder（<see cref="Kernels.NchwcConv.PackInput"/> / <see cref="Kernels.NchwcConv.UnpackOutput"/>）。
+    /// 阶段 1 仅 yolo 的 3×3/s2 层使用。
+    /// </para>
+    /// </summary>
+    NCHWc16 = 1,
 }

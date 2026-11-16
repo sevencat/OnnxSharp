@@ -90,7 +90,7 @@ internal static class OnnxReaderTests
         Assert.Equal(DType.Bool, decoded.DType, "dtype");
         Assert.Equal(new TensorShape(3), decoded.Shape, "shape");
         Assert.Equal(3, decoded.ByteLength, "bool is 1 byte each");
-        var bytes = decoded.Buffer.AsSpan(0, 3).ToArray();
+        var bytes = decoded.Bytes()[..3].ToArray();
         Assert.Equal((byte)0, bytes[0], "0 -> false");
         Assert.Equal((byte)1, bytes[1], "1 -> true");
         Assert.Equal((byte)1, bytes[2], "2 -> true (non-zero)");

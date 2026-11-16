@@ -86,7 +86,7 @@ internal static class QuantOpsTests
         var input = Tensor.Allocate(new TensorShape(2, 4), DType.F32);
 
         byte[] inputBytes = File.ReadAllBytes(Path.Combine(directory, "quant_x.f32"));
-        inputBytes.CopyTo(input.Buffer, 0);
+        inputBytes.AsSpan().CopyTo(input.Bytes());
 
         net.SetInput("x", input);
         var output = net.Forward().AsSpan<float>();

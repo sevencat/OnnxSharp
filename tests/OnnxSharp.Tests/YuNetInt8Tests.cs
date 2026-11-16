@@ -45,7 +45,7 @@ internal static class YuNetInt8Tests
         var net = Net.ReadModel(model);
 
         var input = Tensor.Allocate(new TensorShape(1, 3, 640, 640), DType.F32);
-        File.ReadAllBytes(Path.Combine(fixture, "yunet_input.f32")).CopyTo(input.Buffer, 0);
+        File.ReadAllBytes(Path.Combine(fixture, "yunet_input.f32")).AsSpan().CopyTo(input.Bytes());
         net.SetInput(net.InputNames[0], input);
 
         var outputs = net.ForwardAll();

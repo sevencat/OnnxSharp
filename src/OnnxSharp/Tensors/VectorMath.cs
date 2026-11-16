@@ -242,11 +242,8 @@ internal static unsafe class VectorMath
             dst[i] = src[i] * factor;
     }
 
-    /// <summary>
-    /// 一行 Softmax（连续内存、行首指针已知时用）：一趟求 max，
-    /// 一趟算 exp 顺便求和并落盘，最后一趟乘 1/Σ。
-    /// </summary>
-    public static void SoftmaxRow(float* src, float* dst, int length)
+    /// <summary>一行求最大值（连续内存）。Softmax 的第一趟，单独暴露给「归一化后置」的调用方。</summary>
+    public static float MaxRow(float* src, int length)
     {
         float max = float.NegativeInfinity;
 
@@ -270,6 +267,21 @@ internal static unsafe class VectorMath
                 max = MathF.Max(max, src[i]);
         }
 
+        return max;
+    }
+
+    /// <summary>
+    /// 一行 Softmax（连续内存、行首指针已知时用）：一趟求 max，
+    /// 一趟算 exp 顺便求和并落盘，最后一趟乘 1/Σ。
+    /// <para>
+    /// 最后一趟（<see cref="Scale"/>）在 attention 里可以省掉：调用方改用
+    /// <see cref="MaxRow"/> + <see cref="SumExp"/> 拿到 Σ，把 <c>1/Σ</c> 乘到 PV 之后的
+    /// 输出行上（每行只有 D 个值而不是 T 个）。数学等价，见 <c>AttentionOps</c>。
+    /// </para>
+    /// </summary>
+    public static void SoftmaxRow(float* src, float* dst, int length)
+    {
+        float max = MaxRow(src, length);
         float sum = SumExp(src, dst, length, max);
         Scale(dst, dst, length, 1f / sum);
     }

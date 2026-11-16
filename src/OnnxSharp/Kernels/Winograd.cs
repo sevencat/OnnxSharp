@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -110,7 +111,13 @@ internal static unsafe class Winograd
 
         var transformed = WeightCache.GetValue(weight, w => TransformWeights(w, outChannels, channels));
 
+        long t0 = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
+
         Run(input, transformed, bias, output, batches, channels, outChannels, inH, inW);
+
+        if (ConvProf.On)
+            ConvProf.AddWinograd(Stopwatch.GetTimestamp() - t0);
+
         return true;
     }
 

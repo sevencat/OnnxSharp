@@ -165,6 +165,24 @@ internal static class DnnOps
             }
 
             outShapes.Add(new TensorShape(dims));
+
+            // NCHWc16（planv2 §P7.7）：命中 3×3/pad1、stride 1 或 2 且通道对齐时，
+            // 额外申请 blocked 输入/输出两块缓冲。判定条件与 Forward 里的 TryConv 同源（Dispatch）。
+            if (input.Rank == 4 && input.Dims[0] == 1)
+            {
+                Resolve(input, out var nchwcStrides, out var nchwcDilations, out var nchwcPads);
+
+                if (Kernels.NchwcConv.Dispatch(channels, dims[1], input.Dims[2], input.Dims[3], dims[2], dims[3],
+                        weight.Dims[2], weight.Dims[3], _group,
+                        nchwcStrides[0], nchwcStrides[1], nchwcDilations[0], nchwcDilations[1],
+                        nchwcPads[0], nchwcPads[1]))
+                {
+                    tempShapes.Add(new TensorShape((int)Kernels.NchwcConv.BlockedInputCount(
+                        channels, input.Dims[2], input.Dims[3], nchwcStrides[0])));
+                    tempShapes.Add(new TensorShape(
+                        (int)Kernels.NchwcConv.BlockedOutputCount(dims[1], dims[2], dims[3])));
+                }
+            }
         }
 
         /// <summary>
@@ -401,6 +419,20 @@ internal static class DnnOps
                 return;
             }
 
+            // 3×3 / s2 / pad1 走 NCHWc16 直接卷积（planv2 §P7.7 阶段 1）：blocked 布局下
+            // 一次 zmm 载入就是「16 个通道」，16 个累加器全压在寄存器里，实测 165~220 GMAC/s，
+            // 是同一形状上面板式（88~138）的 1.6~2.4 倍。代价是每层进出一次 reorder。
+            if (Kernels.NchwcConv.TryConv(
+                    input, weight, bias, output,
+                    _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1],
+                    temps.Count > 1 ? temps[0] : null,
+                    temps.Count > 1 ? temps[1] : null))
+            {
+                if (FusedActivation is { } nchwcActivation)
+                    TensorOps.ElementWiseUnary(nchwcActivation, output, output);
+                return;
+            }
+
             // 3×3 / s1 / pad1 优先走 Winograd F(2,3)（乘法量只有 4/9），
             // 其次走面板式直接卷积（不物化整幅 im2col），都不适用再回退 im2col
             if (!Kernels.Winograd.TryConv3x3(
@@ -422,7 +454,12 @@ internal static class DnnOps
             // 结果更慢 26ms：多出来的调用把 16 个累加器 YMM 全挤出寄存器，
             // 主循环退化。所以这里保持在 GEMM 之外、但紧贴着的就地一趟。
             if (FusedActivation is { } activation)
+            {
+                long ta = Kernels.ConvProf.On ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 TensorOps.ElementWiseUnary(activation, output, output);
+                if (Kernels.ConvProf.On)
+                    Kernels.ConvProf.AddAct(System.Diagnostics.Stopwatch.GetTimestamp() - ta);
+            }
         }
     }
 

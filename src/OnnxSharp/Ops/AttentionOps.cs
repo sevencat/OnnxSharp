@@ -60,6 +60,73 @@ internal static class AttentionOps
             ? blockSeq
             : 128;
 
+    /// <summary>
+    /// 分块内核里**每块分数矩阵 S 的预算字节数**，决定行块宽度
+    /// （<c>rowBlock = clamp(budget / (T·4), 8, 256)</c>）。
+    /// <para>
+    /// 它不是一个「越大越好的缓存参数」：块本身在 L2 里，但**同时**还要装 Q 行块、
+    /// K 平面与 V 平面（各 <c>T·D·4</c>）。rf-detr 的 T=1028 时
+    /// <c>522 KB + 32 KB + 263 KB + 263 KB = 1.08 MB &gt; L2(1 MB/核)</c>，
+    /// 已经在溢出点上，所以这个值要实测扫，不能推。
+    /// </para>
+    /// <para>
+    /// <c>ONNXSHARP_ATTN_SCORE_BUDGET</c>（单位 KB）设默认；与
+    /// <see cref="BlockKernelMinSeq"/> 一样是**建层时快照**，供 <c>ab</c> 同进程 A/B。
+    /// </para>
+    /// </summary>
+    internal static int ScoreBudget
+    {
+        get => _scoreBudget;
+        set => _scoreBudget = value > 0 ? value : 512 * 1024;
+    }
+
+    private static int _scoreBudget =
+        int.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_SCORE_BUDGET"), out int budgetKb)
+            && budgetKb > 0
+            ? budgetKb * 1024
+            : 512 * 1024;
+
+    /// <summary>
+    /// 分块内核里把 softmax 的 <c>1/Σ</c> **折到 PV 之后**（乘在输出行的 D 个值上），
+    /// 而不是先对整行 T 个分数做归一化再乘 V。
+    /// <para>
+    /// 数学等价：<c>Σ_j (e_j/Σ)·v_j</c> ≡ <c>(1/Σ)·Σ_j e_j·v_j</c>，只差浮点重结合（1e-7 级）。
+    /// 省掉的是每块一次 522 KB 读 + 522 KB 写的 <c>Scale</c> 趟（T=1028 时占 soft 的三分之一）。
+    /// </para>
+    /// <para><c>ONNXSHARP_ATTN_LAZY_SOFTMAX=0</c> 可一键回退到就地归一化。</para>
+    /// </summary>
+    internal static bool LazySoftmax
+    {
+        get => _lazySoftmax;
+        set => _lazySoftmax = value;
+    }
+
+    private static bool _lazySoftmax =
+        Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_LAZY_SOFTMAX") is not "0";
+
+    /// <summary>
+    /// 分块内核里把 <c>K^T</c> 与 <c>V</c> 的面板**按 <c>(b,h)</c> 只打一次**，
+    /// 供该头的所有行块复用（原来是每块重打一遍）。
+    /// <para>
+    /// 并行区间是连续的 <c>index = bh·rowBlocks + block</c>，所以每个工作线程的区间天然
+    /// 落在少数几个 <c>bh</c> 上 —— 用「记住上次的 bh」就能拿到几乎全部的复用，
+    /// 不需要跨线程共享面板（那要同步，且 6 份面板会一起挤 L2）。
+    /// </para>
+    /// <para>
+    /// 代价是每线程多两份面板（<c>T·D·4</c> × 2 ≈ 526 KB @ T=1028/D=64），会挤 L2 ——
+    /// 与 <see cref="ScoreBudget"/> 互相影响，两者都要实测。
+    /// </para>
+    /// <para><c>ONNXSHARP_ATTN_PACK_REUSE=0</c> 可一键回退。</para>
+    /// </summary>
+    internal static bool PackReuse
+    {
+        get => _packReuse;
+        set => _packReuse = value;
+    }
+
+    private static bool _packReuse =
+        Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_PACK_REUSE") is not "0";
+
     public static void Register()
         => LayerRegistry.Register("FusedAttention", p => new AttentionLayer(p));
 
@@ -72,6 +139,15 @@ internal static class AttentionOps
         /// <summary>本层构造时的 <see cref="AttentionOps.BlockKernelMinSeq"/>（引擎级快照）。</summary>
         private readonly int _blockMinSeq;
 
+        /// <summary>本层构造时的 <see cref="AttentionOps.ScoreBudget"/>（引擎级快照）。</summary>
+        private readonly int _scoreBudget;
+
+        /// <summary>本层构造时的 <see cref="AttentionOps.LazySoftmax"/>（引擎级快照）。</summary>
+        private readonly bool _lazySoftmax;
+
+        /// <summary>本层构造时的 <see cref="AttentionOps.PackReuse"/>（引擎级快照）。</summary>
+        private readonly bool _packReuse;
+
         public AttentionLayer(LayerParams parameters)
         {
             Type = parameters.Type;
@@ -80,6 +156,9 @@ internal static class AttentionOps
             _heads = (int)parameters.GetInt("heads", 0);
             _outputHeadSpace = parameters.GetInt("output_head_space", 0) != 0;
             _blockMinSeq = BlockKernelMinSeq;
+            _scoreBudget = ScoreBudget;
+            _lazySoftmax = LazySoftmax;
+            _packReuse = PackReuse;
         }
 
         private (int B, int H, int T, int D) Resolve(IReadOnlyList<TensorShape> shapes)
@@ -399,9 +478,9 @@ internal static class AttentionOps
             int plane = checked(t * d);
             int outputStride = _outputHeadSpace ? d : width;
 
-            // 每块 S 的目标大小：512 KB 给分数矩阵，剩下半个 L2 留给 K/V 平面（各 t·d·4）
-            const int ScoreBudget = 512 * 1024;
-            int rowBlock = Math.Clamp(ScoreBudget / (t * sizeof(float)), 8, 256);
+            // 每块 S 的目标大小：默认 512 KB 给分数矩阵，剩下留给 K/V 平面（各 t·d·4）；
+            // 溢出点上要实测扫，见 AttentionOps.ScoreBudget 的注释。
+            int rowBlock = Math.Clamp(_scoreBudget / (t * sizeof(float)), 8, 256);
             int rowBlocks = (t + rowBlock - 1) / rowBlock;
 
             int qBlockCount = checked(rowBlock * d);
@@ -411,13 +490,23 @@ internal static class AttentionOps
             {
                 float[] qBuffer = ArrayPool<float>.Shared.Rent(qBlockCount);
                 float[] sBuffer = ArrayPool<float>.Shared.Rent(scoreBlockCount);
+                float[] sumBuffer = ArrayPool<float>.Shared.Rent(rowBlock);
+                float[] ktBuffer = ArrayPool<float>.Shared.Rent(GemmKernel.PackedPanelSize(d, t));
+                float[] vBuffer = ArrayPool<float>.Shared.Rent(GemmKernel.PackedPanelSize(t, d));
 
                 try
                 {
                     fixed (float* pq = qBuffer)
                     fixed (float* ps = sBuffer)
+                    fixed (float* pinv = sumBuffer)
+                    fixed (float* pkey = keyBuffer)
                     {
                         long accCopy = 0, accQk = 0, accSoft = 0, accPv = 0, accBlocks = 0;
+
+                        // 面板按 (b,h) 复用：区间在 index 上是连续的，所以只需记住上一次的 bh
+                        GemmKernel.PackedB? ktPanel = null;
+                        GemmKernel.PackedB? vPanel = null;
+                        int cachedBh = -1;
 
                         for (int index = begin; index < end; index++)
                         {
@@ -445,18 +534,41 @@ internal static class AttentionOps
 
                             long t1 = TraceBlocks ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-                            // S 块 = Q块·K^T：[rows][t]，B 源是 [T][D] 的 K 平面（行距 1、列距 d）
-                            GemmKernel.MultiplyFromSource(
-                                new ReadOnlySpan<float>(pq, qBlockCount),
-                                keyBuffer,
-                                bh * plane,
-                                d,
-                                1,
-                                d,
-                                t,
-                                new Span<float>(ps, scoreBlockCount),
-                                rows,
-                                t);
+                            if (_packReuse && bh != cachedBh)
+                            {
+                                // K^T：[k=d][n=t]，源是 [T][D] 的 K 平面（行距 1、列距 d）
+                                ktPanel = GemmKernel.PackFromSource(pkey + (long)bh * plane, d, 1, d, t, ktBuffer);
+
+                                // V：[k=t][n=d]，源是 [T][D]（行距 vStrideT）
+                                vPanel = GemmKernel.PackFromSource(sourceV + planeBase, t, vStrideT, 1, d, vBuffer);
+                                cachedBh = bh;
+                            }
+
+                            // S 块 = Q块·K^T：[rows][t]
+                            if (_packReuse)
+                            {
+                                GemmKernel.MultiplyPacked(
+                                    new ReadOnlySpan<float>(pq, qBlockCount),
+                                    ktPanel!,
+                                    new Span<float>(ps, scoreBlockCount),
+                                    rows,
+                                    t,
+                                    parallel: false);
+                            }
+                            else
+                            {
+                                GemmKernel.MultiplyFromSource(
+                                    new ReadOnlySpan<float>(pq, qBlockCount),
+                                    keyBuffer,
+                                    bh * plane,
+                                    d,
+                                    1,
+                                    d,
+                                    t,
+                                    new Span<float>(ps, scoreBlockCount),
+                                    rows,
+                                    t);
+                            }
 
                             long t2 = TraceBlocks ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
@@ -474,26 +586,58 @@ internal static class AttentionOps
                             for (int r = 0; r < rows; r++)
                             {
                                 float* sRow = ps + (long)r * t;
-                                VectorMath.SoftmaxRow(sRow, sRow, t);
+
+                                if (_lazySoftmax)
+                                {
+                                    // 只出 exp 值与 Σ；1/Σ 等 PV 之后乘到输出行（D 个值）上
+                                    float max = VectorMath.MaxRow(sRow, t);
+                                    pinv[r] = 1f / VectorMath.SumExp(sRow, sRow, t, max);
+                                }
+                                else
+                                {
+                                    VectorMath.SoftmaxRow(sRow, sRow, t);
+                                }
                             }
 
                             long t3 = TraceBlocks ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-                            // O = S块·V：[rows][d]，V 直接从（可能带 stride 的）源打包
+                            // O = S块·V：[rows][d]
                             int offset = _outputHeadSpace
                                 ? bh * t * d + r0 * d
                                 : (bi * t + r0) * width + hi * d;
 
-                            GemmKernel.MultiplyFromSource(
-                                new ReadOnlySpan<float>(ps, scoreBlockCount),
-                                sourceV + planeBase,
-                                t,
-                                vStrideT,
-                                1,
-                                d,
-                                new Span<float>(destination + offset, outputLength - offset),
-                                rows,
-                                outputStride);
+                            if (_packReuse)
+                            {
+                                GemmKernel.MultiplyPacked(
+                                    new ReadOnlySpan<float>(ps, scoreBlockCount),
+                                    vPanel!,
+                                    new Span<float>(destination + offset, outputLength - offset),
+                                    rows,
+                                    outputStride,
+                                    parallel: false);
+                            }
+                            else
+                            {
+                                GemmKernel.MultiplyFromSource(
+                                    new ReadOnlySpan<float>(ps, scoreBlockCount),
+                                    sourceV + planeBase,
+                                    t,
+                                    vStrideT,
+                                    1,
+                                    d,
+                                    new Span<float>(destination + offset, outputLength - offset),
+                                    rows,
+                                    outputStride);
+                            }
+
+                            if (_lazySoftmax)
+                            {
+                                for (int r = 0; r < rows; r++)
+                                {
+                                    float* outRow = destination + offset + (long)r * outputStride;
+                                    VectorMath.Scale(outRow, outRow, d, pinv[r]);
+                                }
+                            }
 
                             if (TraceBlocks)
                             {
@@ -524,6 +668,9 @@ internal static class AttentionOps
                 {
                     ArrayPool<float>.Shared.Return(qBuffer);
                     ArrayPool<float>.Shared.Return(sBuffer);
+                    ArrayPool<float>.Shared.Return(sumBuffer);
+                    ArrayPool<float>.Shared.Return(ktBuffer);
+                    ArrayPool<float>.Shared.Return(vBuffer);
                 }
             });
         }

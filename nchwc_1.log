@@ -1,0 +1,4 @@
+threads : 4
+iters   : 20
+
+ic=32   oc=64   160x160 k3s2p1 -> 80x80  im2col    5.08 ms (  23.2 GMAC/s)  packed    3.27 ms (  36.1)  winograd     --  nchwc    9.53 ms (  12.4) +reorder   0.87  max|d|=1.1E-005

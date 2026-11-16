@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 
@@ -123,7 +124,7 @@ public sealed class ParaformerRecognizer
         watch.Restart();
 
         var speech = Tensor.Allocate(new TensorShape(1, frames, dim), DType.F32);
-        Buffer.BlockCopy(features.Values, 0, speech.Buffer, 0, features.Values.Length * sizeof(float));
+        features.Values.AsSpan().CopyTo(MemoryMarshal.Cast<byte, float>(speech.Bytes()));
 
         var lengths = Tensor.Allocate(new TensorShape(1), DType.I32);
         lengths.AsSpan<int>()[0] = frames;
@@ -188,7 +189,7 @@ public sealed class ParaformerRecognizer
         watch.Restart();
 
         var memory = Tensor.Allocate(new TensorShape(1, tokenCount, hiddenDim), DType.F32);
-        Buffer.BlockCopy(cif.Tokens, 0, memory.Buffer, 0, cif.Tokens.Length * sizeof(float));
+        cif.Tokens.AsSpan().CopyTo(MemoryMarshal.Cast<byte, float>(memory.Bytes()));
 
         var maxLength = Tensor.Allocate(TensorShape.Scalar, DType.I64);
         maxLength.AsSpan<long>()[0] = tokenCount;
@@ -197,7 +198,7 @@ public sealed class ParaformerRecognizer
         tokenNum.AsSpan<int>()[0] = tokenCount;
 
         var encKv = Tensor.Allocate(new TensorShape(1, encLength, hiddenDim), DType.U8);
-        Buffer.BlockCopy(encQuantized, 0, encKv.Buffer, 0, encQuantized.Length);
+        encQuantized.AsSpan().CopyTo(encKv.Bytes());
 
         var encScaleTensor = Tensor.Allocate(TensorShape.Scalar, DType.F32);
         encScaleTensor.AsSpan<float>()[0] = encScale;

@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -210,6 +211,8 @@ internal static class PackedConv
         int tasks = batches * groups * panels;
         int weightStride = packed.Blocks * kernelSize * RowBlock;
 
+        long tWall = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
+
         ParallelRange.For(tasks, (begin, end) =>
         {
             var src = input.AsSpan<float>();
@@ -238,14 +241,24 @@ internal static class PackedConv
 
                         float* inBase = psrc + ((long)b * channels + g * inPerGroup) * inH * inW;
 
+                        long t0 = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
+
                         PackPanel(inBase, ppack, inH, inW, inPerGroup, kernelH, kernelW,
                             strideH, strideW, dilH, dilW, padT, padL, outW, start, take);
+
+                        long tPack = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
 
                         Multiply(
                             pweights + (long)g * weightStride, kernelSize, ppack,
                             pdst + ((long)b * outChannels + g * outPerGroup) * spatial,
                             spatial, start, take,
                             pbias + g * outPerGroup, outPerGroup);
+
+                        if (ConvProf.On)
+                        {
+                            long tEnd = Stopwatch.GetTimestamp();
+                            ConvProf.AddPacked(tEnd - t0, tPack - t0, tEnd - tPack);
+                        }
                     }
                 }
             }
@@ -254,6 +267,9 @@ internal static class PackedConv
                 ArrayPool<float>.Shared.Return(pool);
             }
         });
+
+        if (ConvProf.On)
+            ConvProf.AddPackedWall(Stopwatch.GetTimestamp() - tWall);
     }
 
     /// <summary>

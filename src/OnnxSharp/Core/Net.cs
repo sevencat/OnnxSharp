@@ -182,7 +182,8 @@ public sealed class Net
     /// 每个算子的最小值基本不会同时出现。
     /// </para>
     /// </summary>
-    public IReadOnlyList<OpTiming> ProfileAll(int iters = 2, int warmup = 0, bool allocation = false)
+    public IReadOnlyList<OpTiming> ProfileAll(
+        int iters = 2, int warmup = 0, bool allocation = false, Action? onMeasurementStart = null)
     {
         if (_impl.MainGraph is not { } graph)
             throw new OnnxSharpException("model is not loaded");
@@ -191,6 +192,9 @@ public sealed class Net
 
         for (int i = 0; i < Math.Max(0, warmup); i++)
             Interpreter.Run(_impl, graph, executeLayers: true);
+
+        // 预热的帧不算进测量：下游仪表（如 ConvProf）在这里清零，保证「分子帧数 = 分母帧数」。
+        onMeasurementStart?.Invoke();
 
         var sum = new Dictionary<LayerInfo, (double Milliseconds, int Calls)>();
         var min = new Dictionary<LayerInfo, double>();

@@ -6,6 +6,7 @@ using System.Text.Json;
 using OnnxSharp.Core;
 using OnnxSharp.Ocr.PaddleOCR;
 using OnnxSharp.Onnx;
+using OnnxSharp.Ops;
 using OnnxSharp.Sam3;
 using OnnxSharp.Speech;
 using OnnxSharp.Speech.Paraformer;
@@ -30,6 +31,7 @@ return args[0].ToLowerInvariant() switch
     "dump-graph" => DumpGraph(args),
     "run" => Run(args),
     "bench" => Bench(args),
+    "ab" => Ab(args),
     "profile" => Profile(args),
     "detect" => Detect(args),
     "face" => Face(args),
@@ -60,6 +62,11 @@ static int Usage()
     Console.WriteLine("                                      # 跑一次前向，打印输出统计/耗时");
     Console.WriteLine("  OnnxSharp.Cli bench <model.onnx> --input <file.bin> [--iters N] [--warmup N]");
     Console.WriteLine("                                      # 计时迭代");
+    Console.WriteLine("  OnnxSharp.Cli ab <model.onnx> --input <file.bin> --a K=V[,K=V] --b K=V[,...]");
+    Console.WriteLine("                [--iters N] [--rounds N] [--warmup N] [--no-check]");
+    Console.WriteLine("                                      # 同进程交替 A/B：唯一能测出 <5% 收益的口径");
+    Console.WriteLine("                                      # K: attn_fuse | attn_block | attn_budget | " +
+                      "attn_lazy_soft | attn_pack_reuse | gemm_threshold");
     Console.WriteLine("  OnnxSharp.Cli profile <model.onnx> --input <file.bin> [--iters N] [--top N]");
     Console.WriteLine("                                      # 逐算子耗时排行（找热点）");
     Console.WriteLine("  OnnxSharp.Cli detect <yolo.onnx> <image> [--conf 0.25] [--iou 0.45] [--out marked.jpg]");
@@ -402,6 +409,418 @@ static int Bench(string[] args)
     Console.WriteLine($"gc        : gen0 {GC.CollectionCount(0) - g0}  gen1 {GC.CollectionCount(1) - g1}  gen2 {GC.CollectionCount(2) - g2}  (共 {iters} 次推理)");
     Console.WriteLine($"gc pause  : {gcMsPerIter:F1} ms/iter ({gcMsPerIter / Math.Max(1e-9, samples[iters / 2]) * 100:F0}% of median)");
     return 0;
+}
+
+/// <summary>
+/// 同进程交替 A/B：<b>唯一</b>能测出 5% 以下差异的口径。
+/// <para>
+/// 分开跑两次进程的绝对值在本机会差到 2~3 倍（IDE 抢核、温度墙），而两个引擎放在同一个进程里
+/// 逐轮交替、每轮交换先后顺序，可以把「同一时刻的机器状态」对齐，剩下的差异才归因到配置上。
+/// </para>
+/// <para>
+/// 两套配置各自建一个引擎（融合发生在建图期，只能重建），跑同一份输入，输出逐元素比对，
+/// 最后给出<b>配对比值</b>（每轮 min 之比）的中位数 —— 平均值会被单个后台尖峰带偏。
+/// </para>
+/// </summary>
+static int Ab(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: ab <model.onnx> --input <file.bin> --a K=V[,K=V] --b K=V[,...]");
+        Console.Error.WriteLine("          [--iters N] [--rounds N] [--warmup N] [--no-check]");
+        Console.Error.WriteLine("       K ∈ ONNXSHARP_ATTN_FUSE_MAXSEQ | ONNXSHARP_ATTN_BLOCK_SEQ | " +
+                                "ONNXSHARP_ATTN_SCORE_BUDGET(KB) | ONNXSHARP_ATTN_LAZY_SOFTMAX | " +
+                                "ONNXSHARP_ATTN_PACK_REUSE | ONNXSHARP_GEMM_THRESHOLD | ONNXSHARP_NCHWC");
+        return 2;
+    }
+
+    string path = args[1];
+    var options = ParseOptions(args, 2);
+    if (!File.Exists(path))
+    {
+        Console.Error.WriteLine($"model not found: {path}");
+        return 2;
+    }
+
+    if (options.Inputs.Count == 0)
+    {
+        Console.Error.WriteLine("no --input given");
+        return 2;
+    }
+
+    var knobs = AbKnobs();
+    var defaults = knobs.Select(k => k.Default()).ToArray();
+
+    List<(string Key, string Value)> configA, configB;
+    try
+    {
+        configA = ParseAbConfig(options.GetString("--a"), "--a", knobs);
+        configB = ParseAbConfig(options.GetString("--b"), "--b", knobs);
+    }
+    catch (FormatException error)
+    {
+        Console.Error.WriteLine(error.Message);
+        return 2;
+    }
+
+    int iters = Math.Max(1, options.GetInt("--iters", 5));
+    int rounds = Math.Max(1, options.GetInt("--rounds", 5));
+    // 预热必须够多：前 2~3 次是 tier-0 代码，第一轮能虚高 19%（实测 247.8 vs 208.5）。
+    int warmup = Math.Max(0, options.GetInt("--warmup", 4));
+    bool check = !options.Has("--no-check");
+
+    ApplyAbConfig(configA, knobs, defaults);
+    var netA = LoadModel(path, options);
+    BindInputs(netA, options.Inputs, SingleShape(options), NamedShapes(options));
+
+    ApplyAbConfig(configB, knobs, defaults);
+    var netB = LoadModel(path, options);
+    BindInputs(netB, options.Inputs, SingleShape(options), NamedShapes(options));
+
+    Console.WriteLine($"model     : {path}");
+    Console.WriteLine($"config A  : {DescribeAbConfig(configA, knobs, defaults)}");
+    Console.WriteLine($"config B  : {DescribeAbConfig(configB, knobs, defaults)}");
+    PrintAbGraphDiff(netA, netB);
+    Console.WriteLine($"iters     : {iters}  rounds {rounds}  (warmup {warmup})");
+    Console.WriteLine();
+
+    if (check)
+    {
+        ApplyAbConfig(configA, knobs, defaults);
+        var outA = netA.ForwardAll();
+        ApplyAbConfig(configB, knobs, defaults);
+        var outB = netB.ForwardAll();
+
+        PrintAbOutputDiff(outA, outB);
+        Console.WriteLine();
+    }
+
+    for (int i = 0; i < warmup; i++)
+    {
+        ApplyAbConfig(configA, knobs, defaults);
+        netA.ForwardAll();
+        ApplyAbConfig(configB, knobs, defaults);
+        netB.ForwardAll();
+    }
+
+    // 每轮：两个引擎交替各跑 iters 次，依次序每轮对调一次（A→B / B→A），
+    // 抵消「先跑的那个吃到更凉/更热的机器」这种系统性偏差。
+    var roundA = new double[rounds];
+    var roundB = new double[rounds];
+    var samplesA = new List<double>(rounds * iters);
+    var samplesB = new List<double>(rounds * iters);
+
+    var watch = new System.Diagnostics.Stopwatch();
+
+    for (int r = 0; r < rounds; r++)
+    {
+        bool aFirst = (r & 1) == 0;
+        double bestA = double.MaxValue, bestB = double.MaxValue;
+
+        for (int i = 0; i < iters; i++)
+        {
+            if (aFirst)
+            {
+                bestA = Math.Min(bestA, AbTime(netA, configA, knobs, defaults, watch, samplesA));
+                bestB = Math.Min(bestB, AbTime(netB, configB, knobs, defaults, watch, samplesB));
+            }
+            else
+            {
+                bestB = Math.Min(bestB, AbTime(netB, configB, knobs, defaults, watch, samplesB));
+                bestA = Math.Min(bestA, AbTime(netA, configA, knobs, defaults, watch, samplesA));
+            }
+        }
+
+        roundA[r] = bestA;
+        roundB[r] = bestB;
+    }
+
+    var ratios = new double[rounds];
+    for (int r = 0; r < rounds; r++)
+        ratios[r] = roundA[r] / roundB[r];
+
+    double[] sortedRatios = (double[])ratios.Clone();
+    Array.Sort(sortedRatios);
+
+    double[] sortedA = samplesA.ToArray();
+    double[] sortedB = samplesB.ToArray();
+    Array.Sort(sortedA);
+    Array.Sort(sortedB);
+
+    Console.WriteLine($"{"round",6}{"A min",10}{"B min",10}{"A/B",8}   顺序");
+    for (int r = 0; r < rounds; r++)
+        Console.WriteLine($"{r + 1,6}{roundA[r],10:F1}{roundB[r],10:F1}{ratios[r],8:F3}   {((r & 1) == 0 ? "A→B" : "B→A")}");
+
+    Console.WriteLine();
+    Console.WriteLine($"{"",6}{"min",10}{"median",10}{"mean",10}");
+    Console.WriteLine($"{"A",6}{sortedA[0],10:F1}{sortedA[sortedA.Length / 2],10:F1}{sortedA.Average(),10:F1}");
+    Console.WriteLine($"{"B",6}{sortedB[0],10:F1}{sortedB[sortedB.Length / 2],10:F1}{sortedB.Average(),10:F1}");
+
+    double paired = sortedRatios[rounds / 2];
+    double spread = sortedRatios[^1] - sortedRatios[0];
+
+    // 噪声地板用 MAD（中位绝对偏差）估：单个后台尖峰只会污染一轮，不该把结论带成「不可判定」。
+    var deviations = ratios.Select(r => Math.Abs(r - paired)).OrderBy(d => d).ToArray();
+    double mad = deviations[deviations.Length / 2];
+    double floor = Math.Max(0.01, 3.0 * mad);   // 至少 1%：再小就没有工程意义
+
+    Console.WriteLine();
+    Console.WriteLine($"paired    : A/B 中位 {paired:F3}（范围 {sortedRatios[0]:F3} ~ {sortedRatios[^1]:F3}，" +
+                      $"跨度 {spread * 100:F1}%）  噪声地板 {floor * 100:F1}%（3×MAD）");
+
+    double gain = paired - 1.0;
+    string verdict = Math.Abs(gain) <= floor
+        ? $"差 {Math.Abs(gain) * 100:F1}% ≤ 噪声地板：**噪声内，不足以判定**"
+        : gain > 0
+            ? $"**B 快 {gain * 100:F1}%**（配对中位，超过噪声地板 {floor * 100:F1}%）"
+            : $"**A 快 {-gain * 100:F1}%**（配对中位，超过噪声地板 {floor * 100:F1}%）";
+
+    Console.WriteLine($"verdict   : {verdict}");
+
+    if (sortedRatios[0] < 1.0 && sortedRatios[^1] > 1.0)
+        Console.WriteLine("           注意：每轮方向不一致（有 >1 也有 <1），别单看某一轮。");
+
+    return 0;
+}
+
+/// <summary>
+/// 逐输出比对：max / mean / p99 / 超过 1e-3 的个数，外加最差的几个下标。
+/// <para>
+/// 只给一个全局 max 没有诊断价值 —— 融合前后 <c>dets</c> 的 max 差 0.5（top-k 选中了不同的
+/// query），但 1200 个值里只有个位数变了，靠「有几个超阈值 + 最差下标」才能一眼分辨
+/// 「数值精度」和「选了不同的检测框」。
+/// </para>
+/// </summary>
+static void PrintAbOutputDiff(List<Tensor> outA, List<Tensor> outB)
+{
+    if (outA.Count != outB.Count)
+    {
+        Console.WriteLine($"check     : 输出个数不一致（{outA.Count} vs {outB.Count}）");
+        return;
+    }
+
+    var scratch = new List<double>();
+
+    for (int i = 0; i < outA.Count; i++)
+    {
+        var a = outA[i].AsSpan<float>();
+        var b = outB[i].AsSpan<float>();
+
+        if (a.Length != b.Length)
+        {
+            Console.WriteLine($"check     : out{i} 形状不一致（{outA[i].Shape} vs {outB[i].Shape}）");
+            continue;
+        }
+
+        scratch.Clear();
+        var offenders = new List<(int Index, double Diff)>();
+        double max = 0, sum = 0;
+
+        for (int j = 0; j < a.Length; j++)
+        {
+            double diff = Math.Abs((double)a[j] - b[j]);
+            if (double.IsNaN(diff))
+            {
+                max = double.NaN;
+                break;
+            }
+
+            scratch.Add(diff);
+            sum += diff;
+            if (diff > max)
+                max = diff;
+            if (diff > 1e-3)
+                offenders.Add((j, diff));
+        }
+
+        if (double.IsNaN(max))
+        {
+            Console.WriteLine($"check     : out{i} 含 NaN");
+            continue;
+        }
+
+        scratch.Sort();
+        double p99 = scratch.Count == 0 ? 0 : scratch[Math.Min(scratch.Count - 1, (int)(scratch.Count * 0.99))];
+
+        Console.WriteLine($"check     : out{i} {outA[i].Shape,-14} max|d|={max:E2} mean={sum / Math.Max(1, a.Length):E2} " +
+                          $"p99={p99:E2} >1e-3: {offenders.Count}/{a.Length}");
+
+        foreach (var (index, diff) in offenders.OrderByDescending(o => o.Diff).Take(5))
+            Console.WriteLine($"              [{index}] A={a[index]:F6}  B={b[index]:F6}  d={diff:E2}");
+    }
+}
+
+/// <summary>可被 <c>ab</c> 切换的旋钮（默认值来自环境变量，见各自的属性声明）。</summary>
+static (string Name, string Alias, Func<string> Default, Action<string> Apply)[] AbKnobs() =>
+[
+    ("ONNXSHARP_ATTN_FUSE_MAXSEQ", "attn_fuse",
+        () => GraphFusion.AttentionFusionMaxSeq.ToString(),
+        v => GraphFusion.AttentionFusionMaxSeq = AbParseInt("ONNXSHARP_ATTN_FUSE_MAXSEQ", v)),
+    ("ONNXSHARP_ATTN_BLOCK_SEQ", "attn_block",
+        () => AttentionOps.BlockKernelMinSeq.ToString(),
+        v => AttentionOps.BlockKernelMinSeq = AbParseInt("ONNXSHARP_ATTN_BLOCK_SEQ", v)),
+    ("ONNXSHARP_ATTN_SCORE_BUDGET", "attn_budget",
+        () => (AttentionOps.ScoreBudget / 1024).ToString(),
+        v =>
+        {
+            int kb = AbParseInt("ONNXSHARP_ATTN_SCORE_BUDGET", v);
+            AttentionOps.ScoreBudget = kb > 0
+                ? kb * 1024
+                : throw new FormatException(
+                    $"--a/--b: ONNXSHARP_ATTN_SCORE_BUDGET 期望正整数（单位 KB），收到 '{v}'");
+        }),
+    ("ONNXSHARP_ATTN_LAZY_SOFTMAX", "attn_lazy_soft",
+        () => AttentionOps.LazySoftmax ? "1" : "0",
+        v => AttentionOps.LazySoftmax = AbParseInt("ONNXSHARP_ATTN_LAZY_SOFTMAX", v) != 0),
+    ("ONNXSHARP_ATTN_PACK_REUSE", "attn_pack_reuse",
+        () => AttentionOps.PackReuse ? "1" : "0",
+        v => AttentionOps.PackReuse = AbParseInt("ONNXSHARP_ATTN_PACK_REUSE", v) != 0),
+    ("ONNXSHARP_NCHWC", "nchwc",
+        () => OnnxSharp.Kernels.NchwcConv.Enabled ? "1" : "0",
+        v => OnnxSharp.Kernels.NchwcConv.Enabled = AbParseInt("ONNXSHARP_NCHWC", v) != 0),
+    ("ONNXSHARP_GEMM_THRESHOLD", "gemm_threshold",
+        () => GemmKernel.ParallelThreshold.ToString(),
+        v => GemmKernel.ParallelThreshold = GemmKernel.TryParseThreshold(v, out long threshold)
+            ? threshold
+            : throw new FormatException($"--a/--b: ONNXSHARP_GEMM_THRESHOLD 期望 65536 / 1<<16 / 64K，收到 '{v}'")),
+];
+
+static int AbParseInt(string name, string text)
+    => int.TryParse(text, out int value) && value >= 0
+        ? value
+        : throw new FormatException($"--a/--b: {name} 期望非负整数，收到 '{text}'");
+
+static double AbTime(Net net, List<(string Key, string Value)> config,
+    (string Name, string Alias, Func<string> Default, Action<string> Apply)[] knobs,
+    string[] defaults, System.Diagnostics.Stopwatch watch, List<double> samples)
+{
+    // 每次计时前重放配置：建图期旋钮（融合）此时无副作用，运行期旋钮（并行阈值）必须重放。
+    ApplyAbConfig(config, knobs, defaults);
+
+    watch.Restart();
+    net.ForwardAll();
+    watch.Stop();
+
+    double ms = watch.Elapsed.TotalMilliseconds;
+    samples.Add(ms);
+    return ms;
+}
+
+/// <summary>解析 <c>--a K=V,K=V</c>。键可以是环境变量名，也可以是短别名。</summary>
+static List<(string Key, string Value)> ParseAbConfig(
+    string? text, string flag, (string Name, string Alias, Func<string> Default, Action<string> Apply)[] knobs)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        throw new FormatException($"ab: 必须给 {flag}（例如 {flag} ONNXSHARP_ATTN_FUSE_MAXSEQ=0）");
+
+    var pairs = new List<(string, string)>();
+    foreach (string item in text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+    {
+        int separator = item.IndexOf('=');
+        if (separator <= 0)
+            throw new FormatException($"ab: {flag} 的 '{item}' 不是 K=V 形式");
+
+        string key = item[..separator].Trim();
+        string value = item[(separator + 1)..].Trim();
+
+        bool known = knobs.Any(k =>
+            string.Equals(k.Name, key, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(k.Alias, key, StringComparison.OrdinalIgnoreCase));
+
+        if (!known)
+        {
+            throw new FormatException($"ab: {flag} 不认识键 '{key}'，可用：" +
+                string.Join(" | ", knobs.Select(k => $"{k.Alias}({k.Name})")));
+        }
+
+        pairs.Add((key, value));
+    }
+
+    if (pairs.Count == 0)
+        throw new FormatException($"ab: {flag} 为空");
+
+    return pairs;
+}
+
+/// <summary>先把所有旋钮复位到进程启动时的默认值，再套用给定配置（未列出的键 = 环境默认）。</summary>
+static void ApplyAbConfig(List<(string Key, string Value)> config,
+    (string Name, string Alias, Func<string> Default, Action<string> Apply)[] knobs, string[] defaults)
+{
+    for (int i = 0; i < knobs.Length; i++)
+        knobs[i].Apply(defaults[i]);
+
+    foreach (var (key, value) in config)
+    {
+        foreach (var knob in knobs)
+        {
+            if (string.Equals(knob.Name, key, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(knob.Alias, key, StringComparison.OrdinalIgnoreCase))
+            {
+                knob.Apply(value);
+            }
+        }
+    }
+}
+
+/// <summary>按配置文本渲染生效值（不读当前静态状态 —— 那已经是后一套配置了）。</summary>
+static string DescribeAbConfig(List<(string Key, string Value)> config,
+    (string Name, string Alias, Func<string> Default, Action<string> Apply)[] knobs, string[] defaults)
+{
+    var parts = new List<string>();
+    for (int i = 0; i < knobs.Length; i++)
+    {
+        string value = defaults[i];
+        foreach (var (key, overridden) in config)
+        {
+            if (string.Equals(knobs[i].Name, key, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(knobs[i].Alias, key, StringComparison.OrdinalIgnoreCase))
+            {
+                value = overridden;
+            }
+        }
+
+        parts.Add($"{knobs[i].Alias}={value}");
+    }
+
+    return string.Join("  ", parts);
+}
+
+/// <summary>两个引擎的算子直方图对比：只打印有差异的类型 —— 用来确认开关真的改变了图。</summary>
+static void PrintAbGraphDiff(Net a, Net b)
+{
+    static Dictionary<string, int> Histogram(Net net)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (net.MainGraph is not { } graph)
+            return counts;
+
+        foreach (var op in graph.Prog)
+            counts[op.Type] = counts.GetValueOrDefault(op.Type) + 1;
+
+        return counts;
+    }
+
+    var histogramA = Histogram(a);
+    var histogramB = Histogram(b);
+
+    int opsA = histogramA.Values.Sum();
+    int opsB = histogramB.Values.Sum();
+    Console.WriteLine($"graph     : ops A {opsA} / B {opsB}");
+
+    var types = histogramA.Keys.Union(histogramB.Keys, StringComparer.Ordinal)
+        .Select(type => (Type: type, A: histogramA.GetValueOrDefault(type), B: histogramB.GetValueOrDefault(type)))
+        .Where(entry => entry.A != entry.B)
+        .OrderByDescending(entry => Math.Abs(entry.A - entry.B))
+        .ToList();
+
+    if (types.Count == 0)
+    {
+        Console.WriteLine("            两个配置的图完全相同（只有运行期旋钮会不同）");
+        return;
+    }
+
+    foreach (var (type, countA, countB) in types)
+        Console.WriteLine($"            {type,-20} A {countA,5}  B {countB,5}  ({(countB - countA).ToString("+0;-0;0")})");
 }
 
 /// <summary>
@@ -788,17 +1207,27 @@ static int ConvBench(string[] args)
         configs.Add((3, 16, 640, 640, 3, 2, 1));
         configs.Add((16, 32, 320, 320, 3, 2, 1));
         configs.Add((32, 64, 160, 160, 3, 2, 1));
+        configs.Add((64, 64, 160, 160, 3, 2, 1));
         configs.Add((64, 64, 160, 160, 3, 1, 1));
         configs.Add((64, 128, 80, 80, 3, 2, 1));
+        configs.Add((128, 128, 80, 80, 3, 2, 1));
         configs.Add((128, 128, 80, 80, 3, 1, 1));
         configs.Add((128, 256, 40, 40, 3, 2, 1));
+        configs.Add((256, 256, 40, 40, 3, 2, 1));
         configs.Add((256, 256, 40, 40, 3, 1, 1));
+        configs.Add((128, 128, 20, 20, 3, 2, 1));
         configs.Add((256, 256, 20, 20, 3, 1, 1));
         configs.Add((64, 64, 160, 160, 1, 1, 0));
         configs.Add((128, 128, 80, 80, 1, 1, 0));
         configs.Add((256, 256, 40, 40, 1, 1, 0));
         configs.Add((256, 256, 20, 20, 1, 1, 0));
     }
+
+    // 进程里第一个配置的读数永远不可信：冷启动窗口内各内核都慢 2~6 倍
+    // （实测同一形状排第一 14 GMAC/s、排第二 91 GMAC/s，且与 DOTNET_* 无关）。
+    // 先塞一个一次性小形状把它吃掉，读数丢弃。
+    configs.Insert(0, (128, 128, 20, 20, 3, 2, 1));
+    bool discard = true;
 
     Console.WriteLine($"threads : {OnnxSharp.Threading.ParallelRange.Threads}");
     Console.WriteLine($"iters   : {iters}");
@@ -881,7 +1310,50 @@ static int ConvBench(string[] args)
         }
 
         OnnxSharp.Kernels.Winograd.MaxSpatialPixels = saved;
-        Console.WriteLine(line);
+
+        // NCHWc16 布局的 3×3 内核（planv2 §P7.7），stride 1 与 2 都报。
+        // 两列分开报：kernel 是稳态代价，reorder 是进出该布局的搬运（是否摊薄取决于图级传播）。
+        if (OnnxSharp.Kernels.NchwcConv.Dispatch(ic, oc, h, w, oh, ow, k, k, 1, s, s, 1, 1, p, p))
+        {
+            // span 进不了 lambda（Best 是静态本地函数），拷成数组
+            float[] xsArray = xs.ToArray();
+            float[] bsArray = bs.ToArray();
+            var packedW = OnnxSharp.Kernels.NchwcConv.PackWeights(ws, ic, oc);
+            var blockedIn = new float[OnnxSharp.Kernels.NchwcConv.BlockedInputCount(ic, h, w, s)];
+            var blockedOut = new float[OnnxSharp.Kernels.NchwcConv.BlockedOutputCount(oc, oh, ow)];
+            var unpacked = new float[blockedOut.Length];
+            OnnxSharp.Kernels.NchwcConv.PackInput(xsArray, blockedIn, ic, h, w, s);
+
+            OnnxSharp.Kernels.ConvKernels.Im2Col(input, weight, bias, output, 1, s, s, 1, 1, p, p);
+            OnnxSharp.Kernels.NchwcConv.Conv(blockedIn, packedW, bsArray, blockedOut, ic, oc, h, w, oh, ow, s);
+            OnnxSharp.Kernels.NchwcConv.UnpackOutput(blockedOut, unpacked, oc, oh, ow);
+
+            var expected = output.AsSpan<float>();
+            double diff = 0;
+            for (int i = 0; i < unpacked.Length; i++)
+                diff = Math.Max(diff, Math.Abs(unpacked[i] - expected[i]));
+
+            double kernel = Best(() => OnnxSharp.Kernels.NchwcConv.Conv(
+                blockedIn, packedW, bsArray, blockedOut, ic, oc, h, w, oh, ow, s));
+
+            double reorder = Best(() =>
+            {
+                OnnxSharp.Kernels.NchwcConv.PackInput(xsArray, blockedIn, ic, h, w, s);
+                OnnxSharp.Kernels.NchwcConv.UnpackOutput(blockedOut, unpacked, oc, oh, ow);
+            });
+
+            line += $"  nchwc {kernel,7:F2} ms ({macs / kernel / 1e6,6:F1}) +reorder {reorder,6:F2}"
+                + $"  max|d|={diff:E1}";
+        }
+        else
+        {
+            line += "  nchwc     --";
+        }
+
+        if (discard)
+            discard = false;
+        else
+            Console.WriteLine(line);
     }
 
     return 0;
@@ -921,7 +1393,13 @@ static int Profile(string[] args)
     bool traceAlloc = options.Has("--alloc");
 
     var watch = System.Diagnostics.Stopwatch.StartNew();
-    var timings = net.ProfileAll(iters, warmup, traceAlloc);
+    var timings = net.ProfileAll(iters, warmup, traceAlloc, () =>
+    {
+        if (OnnxSharp.Kernels.ConvProf.On)
+            OnnxSharp.Kernels.ConvProf.Reset();
+        if (OnnxSharp.Kernels.NchwcConv.Profile)
+            OnnxSharp.Kernels.NchwcConv.ResetProfile();
+    });
     watch.Stop();
 
     double total = timings.Sum(t => t.Milliseconds);
@@ -977,6 +1455,91 @@ static int Profile(string[] args)
     {
         string head = $"{group.Type,-20}{group.Ops,6}{group.Min,10:F1}{group.Milliseconds,10:F1}{group.Min / totalMin * 100,7:F1}%";
         Console.WriteLine(traceAlloc ? $"{head}{group.AllocKB,10:F0}" : head);
+    }
+
+    // NCHWc 的分阶段耗时（只有 ONNXSHARP_NCHWC_PROF=1 时才有数）：
+    // 回答「每层都付的 reorder 到底吃掉多少」，微基准里的 reorder 是热缓冲下的乐观值。
+    if (OnnxSharp.Kernels.NchwcConv.Profile)
+    {
+        var (pack, kernel, unpack, calls) = OnnxSharp.Kernels.NchwcConv.TakeProfile();
+        Console.WriteLine();
+        if (calls > 0)
+        {
+            Console.WriteLine($"nchwc     : 墙钟 {(pack + kernel + unpack) / iters:F2} ms/帧（打包输入 {pack / iters:F2} · " +
+                              $"内核 {kernel / iters:F2} · 解包输出 {unpack / iters:F2}）  " +
+                              $"{calls / (double)iters:F0} 次/帧   reorder 占比 {((pack + unpack) / (pack + kernel + unpack) * 100):F1}%");
+        }
+        else
+        {
+            Console.WriteLine("nchwc     : 0 次调用（本模型没有命中 NCHWc 路径）");
+        }
+    }
+
+    // 1×1 走 pointwise 时的分阶段耗时（ONNXSHARP_CONV_PROF=1）：
+    // 「整段」与「GEMM」之差 = Span 切片 + 并行派发等非 GEMM 开销。
+    if (OnnxSharp.Kernels.ConvProf.On)
+    {
+        var (pointwise, gemm, act) = OnnxSharp.Kernels.ConvProf.Take(iters);
+        Console.WriteLine();
+        Console.WriteLine($"pointwise : 1×1 每帧整段 {pointwise:F2} ms（其中 GEMM {gemm:F2} ms，" +
+                          $"非 GEMM 开销 {pointwise - gemm:F2} ms）  融合激活 {act:F2} ms  [{iters} 帧实测]");
+
+        var calls = OnnxSharp.Kernels.ConvProf.TakeCalls(iters, out int dropped);
+        Console.WriteLine("            按「每帧贡献」排（m×k×n · 每帧次数 · 单次 ms · GMAC/s · 每帧合计 ms）：");
+
+        foreach (var (ms, count, m, k, n) in calls.Take(10))
+        {
+            double gmac = (double)m * k * n / ms / 1e6;
+            Console.WriteLine($"            {m,4}×{k,4}×{n,6} · {count,3} 次 · {ms,6:F2} ms · {gmac,6:F1} · {ms * count,6:F2} ms");
+        }
+
+        if (dropped > 0)
+            Console.WriteLine($"            ⚠ 有 {dropped} 次调用被容量截断，次数偏低（调大 ConvProf.Capacity 或减小 --iters）");
+
+        // im2col 路径（3×3 等）：整段 = 打包 + GEMM + 其余（回写/派发）
+        var (colWall, colTotal, colPack, colGemm, colTasks) = OnnxSharp.Kernels.ConvProf.TakeIm2Col(iters);
+        double packShare = colTotal > 0 ? colPack / colTotal * 100 : 0;
+
+        Console.WriteLine();
+        Console.WriteLine($"im2col    : 墙钟 {colWall:F2} ms/帧 · 任务累计 {colTotal:F2} ms（打包 {colPack:F2} = {packShare:F0}% · " +
+                          $"GEMM {colGemm:F2} = {(colTotal > 0 ? colGemm / colTotal * 100 : 0):F0}%）" +
+                          $"  任务 {colTasks:F0} 次/帧  [{iters} 帧实测]");
+
+        var colCalls = OnnxSharp.Kernels.ConvProf.TakeIm2ColCalls(iters, out int colDropped);
+        Console.WriteLine("            按「每帧贡献」排（m=outC × k=inC·kh·kw × n=块像素 · 每帧次数 · 单次 ms · GMAC/s · 每帧合计 ms）：");
+
+        foreach (var (ms, count, m, k, n) in colCalls.Take(10))
+        {
+            double gmac = (double)m * k * n / ms / 1e6;
+            Console.WriteLine($"            {m,4}×{k,4}×{n,6} · {count,3} 次 · {ms,6:F2} ms · {gmac,6:F1} · {ms * count,6:F2} ms");
+        }
+
+        if (colDropped > 0)
+            Console.WriteLine($"            ⚠ 有 {colDropped} 次 im2col 任务被容量截断");
+
+        // 面板式直接卷积（3×3 的主路径）：整段 = 打包面板 + 微内核
+        var (packedWall, packedTotal, packedPack, packedMul, packedTasks) = OnnxSharp.Kernels.ConvProf.TakePacked(iters);
+        string packPct = packedTotal > 0 ? $"{packedPack / packedTotal * 100:F0}%" : "n/a";
+        string mulPct = packedTotal > 0 ? $"{packedMul / packedTotal * 100:F0}%" : "n/a";
+
+        Console.WriteLine();
+        Console.WriteLine($"packed    : 墙钟 {packedWall:F2} ms/帧 · 任务累计 {packedTotal:F2} ms（打包 {packedPack:F2} = {packPct} · " +
+                          $"微内核 {packedMul:F2} = {mulPct}）  面板 {packedTasks:F0} 次/帧  [{iters} 帧实测]");
+
+        var (winogradWall, winogradCalls) = OnnxSharp.Kernels.ConvProf.TakeWinograd(iters);
+        Console.WriteLine($"winograd  : 墙钟 {winogradWall:F2} ms/帧  调用 {winogradCalls:F0} 次/帧");
+    }
+
+    // GEMM 指针对齐诊断（ONNXSHARP_GEMM_ALIGN=1）：微基准的缓冲是 new float[]，
+    // 图里的 A/B/C 是 byte[] 槽位切片，对齐不同 → 同形状能差 10~14%（见 bench.md §30）。
+    if (OnnxSharp.Tensors.GemmKernel.DbgAlign)
+    {
+        var (calls, alignA, alignB, alignC) = OnnxSharp.Tensors.GemmKernel.TakeAlignment();
+        double Pct(long x) => calls == 0 ? 0 : x * 100.0 / calls;
+
+        Console.WriteLine();
+        Console.WriteLine($"gemm 对齐  : {calls} 次调用 · 64B 对齐率 A {Pct(alignA):F0}% / " +
+                          $"B {Pct(alignB):F0}% / C {Pct(alignC):F0}%");
     }
 
     return 0;

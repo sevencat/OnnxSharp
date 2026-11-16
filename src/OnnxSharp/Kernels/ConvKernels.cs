@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using OnnxSharp.Core;
@@ -6,6 +7,236 @@ using OnnxSharp.Tensors;
 using OnnxSharp.Threading;
 
 namespace OnnxSharp.Kernels;
+
+/// <summary>
+/// 卷积分阶段计时（<c>ONNXSHARP_CONV_PROF=1</c>）：把「1×1 走 pointwise」这条路径拆成
+/// <list type="bullet">
+/// <item><see cref="PointwiseMs"/>：<c>Im2Col</c> 里整段（含 Span 切片与并行派发）</item>
+/// <item><see cref="GemmMs"/>：其中真正的 <see cref="GemmKernel.Multiply"/></item>
+/// <item><see cref="ActMs"/>：卷积后融合的激活（<c>SiLU</c>）就地一趟</item>
+/// </list>
+/// 两者之差就是「不在 GEMM 里」的那部分开销 —— 1×1 层耗时反常时先看这个差。
+/// </summary>
+internal static class ConvProf
+{
+    public static readonly bool On =
+        Environment.GetEnvironmentVariable("ONNXSHARP_CONV_PROF") == "1";
+
+    private static long _pointwise;
+    private static long _gemm;
+    private static long _act;
+
+    private const int Capacity = 16384;
+    private static readonly long[] CallTicks = new long[Capacity];
+    private static readonly int[] CallShape = new int[Capacity * 3];
+    private static int _calls;
+    private static int _dropped;
+
+    // ---- im2col 路径（3×3 等）：把「打包列矩阵」与「GEMM」分开计 ----
+    private static long _colTotal;
+    private static long _colPack;
+    private static long _colGemm;
+    private static long _colWall;
+    private static int _colTasks;
+
+    private static readonly long[] ColTicks = new long[Capacity];
+    private static readonly int[] ColShape = new int[Capacity * 3];
+    private static int _colCalls;
+    private static int _colDropped;
+
+    // ---- 面板式直接卷积（PackedConv，3×3 的主路径）：打包面板 vs 微内核 ----
+    private static long _packedTotal;
+    private static long _packedPack;
+    private static long _packedMul;
+    private static long _packedWall;
+    private static int _packedTasks;
+
+    public static void AddPackedWall(long ticks) => Interlocked.Add(ref _packedWall, ticks);
+
+    // ---- Winograd（3×3 s1 pad1、空间小的层）：只看墙钟，内部不再细分 ----
+    private static long _winogradWall;
+    private static int _winogradCalls;
+
+    public static void AddWinograd(long ticks)
+    {
+        Interlocked.Add(ref _winogradWall, ticks);
+        Interlocked.Increment(ref _winogradCalls);
+    }
+
+    public static (double WallMs, double CallsPerFrame) TakeWinograd(int frames)
+    {
+        double divisor = 1000.0 / Stopwatch.Frequency / Math.Max(1, frames);
+        return (Interlocked.Exchange(ref _winogradWall, 0) * divisor,
+                Interlocked.Exchange(ref _winogradCalls, 0) / (double)Math.Max(1, frames));
+    }
+
+    /// <summary>记一次面板任务：整段 / 打包 <c>[K][16]</c> / 微内核。面板粒度太细，不做逐形状记录。</summary>
+    public static void AddPacked(long totalTicks, long packTicks, long mulTicks)
+    {
+        Interlocked.Add(ref _packedTotal, totalTicks);
+        Interlocked.Add(ref _packedPack, packTicks);
+        Interlocked.Add(ref _packedMul, mulTicks);
+        Interlocked.Increment(ref _packedTasks);
+    }
+
+    public static (double WallMs, double TotalMs, double PackMs, double MulMs, double TasksPerFrame) TakePacked(int frames)
+    {
+        double scale = 1000.0 / Stopwatch.Frequency / Math.Max(1, frames);
+        return (Interlocked.Exchange(ref _packedWall, 0) * scale,
+                Interlocked.Exchange(ref _packedTotal, 0) * scale,
+                Interlocked.Exchange(ref _packedPack, 0) * scale,
+                Interlocked.Exchange(ref _packedMul, 0) * scale,
+                Interlocked.Exchange(ref _packedTasks, 0) / (double)Math.Max(1, frames));
+    }
+
+    public static void AddIm2Col(long totalTicks, long packTicks, long gemmTicks)
+    {
+        Interlocked.Add(ref _colTotal, totalTicks);
+        Interlocked.Add(ref _colPack, packTicks);
+        Interlocked.Add(ref _colGemm, gemmTicks);
+        Interlocked.Increment(ref _colTasks);
+    }
+
+    /// <summary>
+    /// 整个 <c>Im2Col</c> 调用的墙钟（含并行派发）。逐任务累加值在多线程下 ≈ 墙钟 × 占用核数，
+    /// 两者都报才不会被误读成「这一层花了 9 ms」。
+    /// </summary>
+    public static void AddIm2ColWall(long ticks) => Interlocked.Add(ref _colWall, ticks);
+
+    /// <summary>记一次 im2col 任务（整段耗时 + GEMM 形状 m/k/n）。</summary>
+    public static void AddIm2ColCall(long ticks, int m, int k, int n)
+    {
+        int slot = Interlocked.Increment(ref _colCalls) - 1;
+        if ((uint)slot >= Capacity)
+        {
+            Interlocked.Increment(ref _colDropped);
+            return;
+        }
+
+        ColTicks[slot] = ticks;
+        ColShape[slot * 3] = m;
+        ColShape[slot * 3 + 1] = k;
+        ColShape[slot * 3 + 2] = n;
+    }
+
+    /// <summary>
+    /// 清空累计值。**必须在预热之后、正式计时之前调一次** —— 否则预热的那几帧会混进来，
+    /// 让「每帧」的除数和分子对不上（2026-11-16 前就是这样，1×1 因此被虚报 1.4 倍）。
+    /// </summary>
+    public static void Reset()
+    {
+        Interlocked.Exchange(ref _pointwise, 0);
+        Interlocked.Exchange(ref _gemm, 0);
+        Interlocked.Exchange(ref _act, 0);
+        Interlocked.Exchange(ref _calls, 0);
+        Interlocked.Exchange(ref _dropped, 0);
+        Interlocked.Exchange(ref _colTotal, 0);
+        Interlocked.Exchange(ref _colPack, 0);
+        Interlocked.Exchange(ref _colGemm, 0);
+        Interlocked.Exchange(ref _colWall, 0);
+        Interlocked.Exchange(ref _colTasks, 0);
+        Interlocked.Exchange(ref _colCalls, 0);
+        Interlocked.Exchange(ref _colDropped, 0);
+        Interlocked.Exchange(ref _packedTotal, 0);
+        Interlocked.Exchange(ref _packedPack, 0);
+        Interlocked.Exchange(ref _packedMul, 0);
+        Interlocked.Exchange(ref _packedWall, 0);
+        Interlocked.Exchange(ref _packedTasks, 0);
+        Interlocked.Exchange(ref _winogradWall, 0);
+        Interlocked.Exchange(ref _winogradCalls, 0);
+    }
+
+    public static void AddPointwise(long ticks) => Interlocked.Add(ref _pointwise, ticks);
+    public static void AddGemm(long ticks) => Interlocked.Add(ref _gemm, ticks);
+    public static void AddAct(long ticks) => Interlocked.Add(ref _act, ticks);
+
+    /// <summary>记一次 1×1 调用（毫秒 + m/k/n），用于逐形状看谁在拖后腿。</summary>
+    public static void AddCall(long ticks, int m, int k, int n)
+    {
+        int slot = Interlocked.Increment(ref _calls) - 1;
+        if ((uint)slot >= Capacity)
+        {
+            // 溢出不能静默吞掉：次数少了，「每帧贡献」会被低估
+            Interlocked.Increment(ref _dropped);
+            return;
+        }
+
+        CallTicks[slot] = ticks;
+        CallShape[slot * 3] = m;
+        CallShape[slot * 3 + 1] = k;
+        CallShape[slot * 3 + 2] = n;
+    }
+
+    /// <summary>取走并清零累计值，**除以实测帧数**换成每帧毫秒。</summary>
+    public static (double PointwiseMs, double GemmMs, double ActMs) Take(int frames)
+    {
+        double scale = 1000.0 / Stopwatch.Frequency / Math.Max(1, frames);
+        return (Interlocked.Exchange(ref _pointwise, 0) * scale,
+                Interlocked.Exchange(ref _gemm, 0) * scale,
+                Interlocked.Exchange(ref _act, 0) * scale);
+    }
+
+    /// <summary>
+    /// 取走并清零逐调用记录，按形状聚合成「每帧贡献」（最小耗时 × 每帧次数），降序。
+    /// 用最小值是为了剔掉首帧的 JIT/冷缓存，次数取每帧平均。
+    /// <paramref name="dropped"/> 是被容量截断掉的调用数（非 0 说明次数被低估，要调大 <c>Capacity</c>）。
+    /// </summary>
+    public static List<(double MinMs, int Count, int M, int K, int N)> TakeCalls(int frames, out int dropped)
+    {
+        int count = Math.Min(Interlocked.Exchange(ref _calls, 0), Capacity);
+        dropped = Interlocked.Exchange(ref _dropped, 0);
+        return Aggregate(CallTicks, CallShape, count, frames);
+    }
+
+    /// <summary>
+    /// 取走并清零 im2col 路径的阶段计时：整段 / 其中打包 / 其中 GEMM（毫秒每帧），
+    /// 以及每帧的 im2col 任务数（行块 × 列切分 × batch × group）。
+    /// </summary>
+    public static (double WallMs, double TotalMs, double PackMs, double GemmMs, double TasksPerFrame) TakeIm2Col(int frames)
+    {
+        double scale = 1000.0 / Stopwatch.Frequency / Math.Max(1, frames);
+        return (Interlocked.Exchange(ref _colWall, 0) * scale,
+                Interlocked.Exchange(ref _colTotal, 0) * scale,
+                Interlocked.Exchange(ref _colPack, 0) * scale,
+                Interlocked.Exchange(ref _colGemm, 0) * scale,
+                Interlocked.Exchange(ref _colTasks, 0) / (double)Math.Max(1, frames));
+    }
+
+    /// <summary>im2col 任务按 GEMM 形状（m=输出通道 · k=inC·kh·kw · n=块内像素）聚合。</summary>
+    public static List<(double MinMs, int Count, int M, int K, int N)> TakeIm2ColCalls(int frames, out int dropped)
+    {
+        int count = Math.Min(Interlocked.Exchange(ref _colCalls, 0), Capacity);
+        dropped = Interlocked.Exchange(ref _colDropped, 0);
+        return Aggregate(ColTicks, ColShape, count, frames);
+    }
+
+    private static List<(double MinMs, int Count, int M, int K, int N)> Aggregate(
+        long[] ticks, int[] shape, int count, int frames)
+    {
+        double scale = 1000.0 / Stopwatch.Frequency;
+        var grouped = new Dictionary<(int, int, int), (long Min, int Count)>();
+
+        for (int i = 0; i < count; i++)
+        {
+            var key = (shape[i * 3], shape[i * 3 + 1], shape[i * 3 + 2]);
+            long value = ticks[i];
+            ticks[i] = 0;
+
+            if (grouped.TryGetValue(key, out var slot))
+                grouped[key] = (Math.Min(slot.Item1, value), slot.Item2 + 1);
+            else
+                grouped[key] = (value, 1);
+        }
+
+        var list = new List<(double, int, int, int, int)>(grouped.Count);
+
+        foreach (var (key, value) in grouped)
+            list.Add((value.Item1 * scale, value.Item2 / Math.Max(1, frames), key.Item1, key.Item2, key.Item3));
+
+        list.Sort((x, y) => (y.Item1 * y.Item2).CompareTo(x.Item1 * x.Item2));
+        return list;
+    }
+}
 
 /// <summary>
 /// NCHW 卷积实现（含 group / stride / dilation / padding）。
@@ -67,8 +298,11 @@ internal static class ConvKernels
 
         if (isPointwise)
         {
+            long t0 = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
             Pointwise(input, weight, bias, output, groups, batches,
                 channels, inPerGroup, outChannels, outPerGroup, outH * outW);
+            if (ConvProf.On)
+                ConvProf.AddPointwise(Stopwatch.GetTimestamp() - t0);
             return;
         }
 
@@ -149,9 +383,14 @@ internal static class ConvKernels
 
                 int pixels = rows * colCount;
 
+                long t0 = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
+
                 FillColumns(src, pool, channels, inH, inW, n, g * inPerGroup, inPerGroup,
                     kernelH, kernelW, strideH, strideW, dilH, dilW, padT, padL,
                     oyBegin, rows, oxBegin, colCount, outW, pixels);
+
+                long tPack = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
+                long tGemm = tPack;
 
                 long dstBase = ((long)n * outChannels + g * outPerGroup) * outH * outW
                              + (long)oyBegin * outW + oxBegin;
@@ -168,6 +407,9 @@ internal static class ConvKernels
                         outPerGroup, kernelSize, pixels,
                         ldc: outH * outW, parallel: innerParallel,
                         bias: biases.IsEmpty ? ReadOnlySpan<float>.Empty : biases.Slice(g * outPerGroup, outPerGroup));
+
+                    if (ConvProf.On)
+                        tGemm = Stopwatch.GetTimestamp();
                 }
                 else
                 {
@@ -180,6 +422,9 @@ internal static class ConvKernels
                         ldc: pixels, parallel: innerParallel,
                         bias: biases.IsEmpty ? ReadOnlySpan<float>.Empty : biases.Slice(g * outPerGroup, outPerGroup));
 
+                    if (ConvProf.On)
+                        tGemm = Stopwatch.GetTimestamp();
+
                     for (int oc = 0; oc < outPerGroup; oc++)
                     {
                         for (int r = 0; r < rows; r++)
@@ -189,6 +434,13 @@ internal static class ConvKernels
                         }
                     }
                 }
+
+                if (ConvProf.On)
+                {
+                    long tEnd = Stopwatch.GetTimestamp();
+                    ConvProf.AddIm2Col(tEnd - t0, tPack - t0, tGemm - tPack);
+                    ConvProf.AddIm2ColCall(tEnd - t0, outPerGroup, kernelSize, pixels);
+                }
             }
 
             ArrayPool<float>.Shared.Return(pool);
@@ -197,10 +449,15 @@ internal static class ConvKernels
                 ArrayPool<float>.Shared.Return(outPool);
         };
 
+        long tWall = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
+
         if (innerParallel)
             runTasks(0, tasks);
         else
             ParallelRange.For(tasks, runTasks);
+
+        if (ConvProf.On)
+            ConvProf.AddIm2ColWall(Stopwatch.GetTimestamp() - tWall);
     }
 
     /// <summary>1x1 卷积：<c>out[oc, p] = Σ_ic W[oc, ic] · in[ic, p]</c>，零拷贝。</summary>
@@ -235,6 +492,8 @@ internal static class ConvKernels
                 long srcBase = (long)(n * channels + g * inPerGroup) * pixels;
                 long dstBase = ((long)n * outChannels + g * outPerGroup) * pixels;
 
+                long tg = ConvProf.On ? Stopwatch.GetTimestamp() : 0;
+
                 GemmKernel.Multiply(
                     weights.Slice(g * outPerGroup * inPerGroup, outPerGroup * inPerGroup),
                     src.Slice((int)srcBase, inPerGroup * pixels),
@@ -243,6 +502,13 @@ internal static class ConvKernels
                     ldc: pixels,
                     parallel: innerParallel,
                     bias: biases.IsEmpty ? ReadOnlySpan<float>.Empty : biases.Slice(g * outPerGroup, outPerGroup));
+
+                if (ConvProf.On)
+                {
+                    long elapsed = Stopwatch.GetTimestamp() - tg;
+                    ConvProf.AddGemm(elapsed);
+                    ConvProf.AddCall(elapsed, outPerGroup, inPerGroup, pixels);
+                }
             }
         });
     }
