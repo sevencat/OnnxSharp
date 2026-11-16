@@ -600,10 +600,23 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 
 **内核分档（运行时探测，`Int8KernelTier`）**
 
-> ⚠️ **实测约束（2026-11-10，本机 Ryzen 7 8845HS / Zen4，.NET 10.0.101）**：
+> ⚠️ **实测约束（2026-11-10 Ryzen 7 8845HS / Zen4 / .NET 10.0.101；2026-11-16 在 Ryzen 9 8945HX 上复测，结论相同）**：
 > ① `System.Runtime.Intrinsics.X86` **没有 `Avx512Vnni`**（写一行就 `CS0103`；ref 程序集字节里也搜不到）；
-> ② `AvxVnni`（Intel 专属 AVX-VNNI，256 位）在本机 **`False`**，但它对应的 512 位 `Avx512BW.MultiplyAddAdjacent`
-> **可用**（实测 `3×5×4 = 60` 语义正确）。
+> ② `AvxVnni`（AVX-VNNI，256 位）在**两代 AMD Zen4 上都是 `False`**，且这不是「换台机器就好」：
+> AMD 只实现 **EVEX 编码**的 AVX512-VNNI，不实现 VEX 编码的 AVX-VNNI（直到 Zen5 才补 AVX-VNNI），
+> 而 .NET 恰好只暴露 VEX 那个 —— *所以「AMD + .NET」这个组合里 `vpdpbusd` 根本拿不到*；
+> ③ 于是 `Int8KernelTier` 在 AMD 上只能落到 `Scalar`（除非显式 `ONNXSHARP_INT8_TIER=avx512bw`），
+> `QuantizedMatMulOps` 的 DQM 一直走 F32 GEMM 是**必然结果**，不是配置/开关问题；
+> ④ **不要再给 ASR 的 DQM 做 int8 化**：F32 GEMM 实测 171 GMAC/s，已贴 4 核峰值（185 GMAC/s）；
+> ORT 的 23.9 ms 来自 MLAS 手写汇编的 EVEX `vpdpbusd`
+> （`core/mlas/lib/amd64/QgemmU8X8KernelAvx512Core.asm`，MR=6 / NR=16 / 一条指令 64 个 MAC），
+> 纯托管代码里没有对应物。ORT 侧同源证据：`contrib_ops/cpu/quantization/dynamic_quantize_matmul.cc`
+> 的 `ComputeCommon` → `MlasGemmBatch`，反量化走 `MLAS_QGEMM_SCALE_BIAS_OUTPUT_PROCESSOR`（per-column 折进写出）。
+>
+> **加线程也救不了 DQM（2026-11-16 实测 encoder，4/8/16/32 线程）**：
+> mean 57.8 / 52.8 / 53.3 / 81.1 ms，sum-of-min 49.2 / 42.6 / 43.9 / 27.8 ms。
+> 4→8 只 −9%，说明瓶颈不是并行度（4 线程已把 4 个核的 F32 峰值喂满）；32 线程 mean 反而爆炸（超订阅抖动）。
+> → sherpa 剩余空间在**非 GEMM 算子**（4 线程 min 口径：我们 ~23 ms vs ORT ~6 ms），不在 DQM。
 >
 > **指令级结论**（每 32/64 个 MAC 需要的指令数）：
 >
@@ -627,7 +640,7 @@ forward 5525 ms   max|diff|=1.862E-003   mean|diff|=3.293E-006
 
 | 档位 | 触发条件（.NET 8/10 都有对应 intrinsic） | 实现 | 目标倍率（vs 我们的 FP32 GEMM） | 典型 CPU |
 |---|---|---|---|---|
-| `Vnni256` | `AvxVnni.IsSupported`（**仅 Intel 12 代+**） | `vpdpbusd` ymm | **2~3×**（≈2× vs AVX-512 FP32、≈4× vs AVX2 FP32） | Alder Lake / Raptor Lake / Meteor Lake 等客户端 |
+| `Vnni256` | `AvxVnni.IsSupported`（**Intel 12 代+ / AMD Zen5+**；Zen4 不算，见上方实测约束②） | `vpdpbusd` ymm | **2~3×**（≈2× vs AVX-512 FP32、≈4× vs AVX2 FP32） | Alder Lake / Raptor Lake / Meteor Lake 等客户端、Zen5 |
 | `Avx512Bw` | `Avx512BW.IsSupported`（有 512 位但无 VNNI） | `vpmaddubsw`+`vpmaddwd` zmm（**7 位拆分，防饱和**） | **2~4×** | Skylake-SP / Cascade Lake / **Zen4 / Zen5** |
 | `Avx2` | `Avx2.IsSupported` | `vpmaddubsw`+`vpmaddwd` ymm（同上） | **1.5~2×** | Haswell~Coffee Lake、Zen1~Zen3 |
 | `Neon` | ARM64 `AdvSimd` | `vmull`/`vpaddl`（无 `sdot` 时等价实现） | 1.5~2× | Apple M / 骁龙 / 鲲鹏 |
@@ -840,6 +853,188 @@ P3/P4 只有在 P0~P2 落地后 encoder 仍 > 30 ms 才启动（现在它们合�
 新增用例 `gemm: packed panels match plain multiply` 与
 `gemm: packed column scale and bias fold the epilogue`（含 `n=45/17/7` 的尾面板与 `m=7` 的单行路径，
 后者第一版把 bias 加了两遍、被这条用例抓住）。
+
+#### A9. 2026-11-16 收尾：F32 路线的天花板（M10 到此为止）
+
+按上文的实测约束确认了「AMD + .NET 拿不到 `vpdpbusd`」之后，把力气全部转到**不依赖 int8 指令**的地方，
+再把 DQM 里那部分纯浪费收掉：
+
+| 改动 | 位置 | 前后 | 为什么之前慢 |
+|---|---|---|---|
+| LayerNorm 升到 512 位 | `AttnOps.cs` | **4.8 → 0.5~1.9 ms**（81 个） | 原来只有 `Vector<float>`（256 位），循环里还每轮 `xrow.Slice(i)` 构造 Span；改成一次取 `ref` + `Vector512.LoadUnsafe/StoreUnsafe` |
+| DQM 激活缓冲改线程本地 | `QuantizedMatMulOps.cs` | quant 段 **60 → 21 μs/次**（160 次 ≈ 11 → 3.4 ms） | 决定性证据：quant 耗时几乎不随 k 变（k=320 → 0.060 ms，k=1280 → 0.074 ms，元素差 4 倍），说明瓶颈是 `ArrayPool.Shared.Rent/Return` + 目标页冷启动，不是 SIMD |
+| attention 阈值 128 → 64 | `AttentionOps.cs` | **4.5 → 2.7 ms**（40 个） | `GemmKernel` 这几轮加宽 + 面板复用后盈亏点下移；T=76 走 `ComputeBlocks` 比逐行 `Dot/Axpy` 快 40%（历史默认值 128 是 GEMM 还没优化的年代定的） |
+
+**结果（4 线程、`profile --iters 10`、sum-of-min、多轮）**：
+
+| 项 | 优化前 | 现在 | ORT（同口径 `bench_ort.py 4 10`） |
+|---|---|---|---|
+| encoder 合计 | 44.1 ms | **30.1 ~ 33.0 ms**（三轮 32.5 / 33.0 / 32.6） | **23.8 / 23.9**（min / median，三轮极稳） |
+| `DynamicQuantizeMatMul` ×160 | 31.9 | **22.2~25.1** | ~15.8 |
+| `FusedAttention` ×40 | 4.4 | **2.8** | — |
+| `LayerNormalization` ×81 | 4.8 | **0.5** | — |
+| 其余算子合计 | 12.2 | **~7.5** | ~8.1 |
+
+比值：优化前 1.85× → **1.37×**（对 ORT）。
+
+**跨引擎回归（同日 `bench/run_all.py`，4 线程，对比 `bench/results/all_latest.log`）**：
+
+| 模型 | 我们 | ORT | 历史（改动前） | 判定 |
+|---|---|---|---|---|
+| yolo11n | 30.1 / 29.7 | 23.3 / 23.2 | 28.8 / 28.4 | 噪声内（该模型不含 LN / attention / DQM，改动理论上零影响） |
+| rfdetr-small | 198.8 / 195.6 | 188.2 / 187.4 | 198.7 / 197.7 | **持平**（含 49 个 LN + 12 个 FusedAttention，是本次改动的主要受影响面） |
+
+DETR 上对 attention 阈值做了同进程 A/B（`ab --a attn_block=128 --b attn_block=64 --rounds 3`）：
+**输出 max|d| = 0.00E+000（bit-exact）**，耗时比 1.001（噪声地板 1.0%）—— 说明该模型的 attention
+序列长度不落在 64~128 区间，新旧默认值等价，改动对它安全。
+
+**结论（这部分不要再花时间）**：
+
+1. **非 GEMM 侧已经追平甚至略优于 ORT**（7.5 vs 8.1 ms），没有余量了。
+2. 剩下那 6~8 ms 差距**全部**来自 DQM 的 F32 vs int8 算力差：`gemm` 段稳定在 **161 GMAC/s**，
+   已是 4 核 F32 峰值（185）的 87%，**换不出算力**。
+3. 所以 4 线程下 encoder 的物理下限就是 ≈ 30 ms。要再往前走只有两条：
+   (a) 引入 native（C/汇编）直接生成 EVEX `vpdpbusd` —— 与「纯托管」定位冲突；
+   (b) 等 .NET 暴露 `Avx512Vnni`，或换 Zen5+ / Intel 12 代+ 机器走 `AvxVnni`（届时 P1/P2 的现成代码可直接接）。
+4. 线程数也救不了：4/8/16/32 → mean 57.8 / 52.8 / 53.3 / 81.1 ms（优化前口径），4→8 只有 −9%。
+
+验证：`dotnet run --project tests/OnnxSharp.Tests -c Release` → 116/118 passed、2 skipped、0 failed；
+`asr` 识别文本不变（`今天气真不错我们出去走一走吧`，best 61 ms：feat 6 / enc 44 / dec 11）。
+
+#### A10. 2026-11-16 sherpa 专项评测（端到端 / 长度扫描 / decoder）
+
+**端到端**（4 线程、`asr --repeat 6`、三轮取 best）：
+
+| 音频 | 帧数 | tokens | feat | enc | dec | 识别文本 |
+|---|---|---|---|---|---|---|
+| `huihui.wav` | 76 | 16 | 7 | **45** | 15 | 今天气真不错我们出去走一走吧 |
+| `huihui2.wav` | ~80 | 16 | 7 | **59** | 21 | 语音识别测试成功这是一个纯c井的实现 |
+
+两段结果都与参考一致；`huihui` 的 enc 从优化前的 53 ms 降到 45 ms。
+
+**encoder 随序列长度**（`.tmp/sherpa/sweep_T.py` 生成截断输入 + `profile --iters 20`，min 口径）：
+
+| T | 我们 | ORT | 比值 | attention 路径 |
+|---|---|---|---|---|
+| 8 | 21.0 | 6.1 | 3.44× | 分块 ≡ 逐行 |
+| 32 | 18.2 | 12.8 | 1.42× | 逐行 |
+| 48 | 22.1 | 16.9 | 1.31× | 逐行 |
+| 64 | 28.1 | 20.8 | 1.35× | 分块 |
+| 76 | 31.1 | 24.3 | 1.28× | 分块（本轮改动后） |
+
+短序列时**固定开销**主导（T=8：6.1 vs 21.0），T≥48 后稳定在 1.3× 左右 —— 与 DQM 的 F32 算力差一致。
+
+**attention 阈值 A/B**（同进程 `ab --a attn_block=0 --b attn_block=999`，配对中位，三轮）：
+
+| T | 分块 / 逐行 | 判定 |
+|---|---|---|
+| 8 | 1.000 | 噪声内等价 |
+| 32 | 0.979（分块快 2.1%） | 略超噪声地板 1.1% |
+| 48 | 0.955（分块快 4.5%） | 超噪声地板 2.1% |
+
+→ 逐行内核在全部测点上都不优于分块，**阈值 64 是安全下界**；再降到 32 可再省 2~4%
+（只影响短音频，真实语音 T≈76 已走分块，收益为零，故未改）。
+
+**decoder —— 新发现的热点**：
+
+| 口径 | 我们 | ORT | 比值 |
+|---|---|---|---|
+| 单步 forward（16 tokens / enc_len=76 / 固定输入热态） | **11.3（min）~12.4（mean）** | **3.57** | **3.2~3.5×** |
+| 完整一步（含输入绑定 + 输出分配，CLI `run` 口径） | 20~24 | — | — |
+
+逐算子（814 个节点）：`MatMul` 25 个仅 0.9 ms、`Mul` 49 个 0.6 ms、`Conv` 12 个 0.3 ms、`Softmax` 12 个 0.1 ms
+—— **算子计算合计约 2 ms，其余 ~9 ms 是每个节点的调度/形状检查开销**。
+其中形状类节点占三分之一：`Shape` 96、`Gather` 96、`Unsqueeze` 102、`Concat` 48、`Reshape` 48，
+结果与运行期数据无关，**可在导入期常量折叠**。这是 decoder 侧最明确的下一步。
+
+> 复现：`.tmp/sherpa/bench_ort.py`（encoder ORT 对照）、`bench_ort_decoder.py`（decoder ORT 对照）、
+> `sweep_T.py`（按 T 生成输入 + ORT 基线）。CLI 侧 `run` 口径比 `profile` 高 8~10 ms 是每轮的
+> 输入拷贝与输出分配，比较推理性能时用 `profile` 或 `asr` 的内部分段计时。
+
+#### A11. 2026-11-16 decoder 形状链常量折叠（814 → 419 节点）
+
+A10 的 profile 里，decoder 814 个节点中 `Shape` 96、`Gather` 96、`Unsqueeze` 102 做的是同一件事：
+给 self-attention 算 reshape 目标。它们的结果**只取决于张量形状**，跟数据无关，本该在加载期就算完。
+
+**根因有两处，缺一不可**：
+
+| 问题 | 位置 | 后果 |
+|---|---|---|
+| rank-0 输入被当成「形状未知」 | `OnnxImporter.Test` | `..._zero_point`（标量 u8）`HasShape=false` → `MatMulInteger` 输出形状推不出来 → 下游 `Cast→Mul→Add→Split→Shape` 全动态，94 个 `Shape` 一个也折不掉 |
+| 长度类输入按**数值**参与掩码构造 | `ParaformerRecognizer` | `make_pad_mask = ReduceMax(speech_lengths)→Cast→Range→Less→Cast`；只特化形状时 `Range` 的长度仍然未知 |
+
+**改动**：
+
+| 改动 | 位置 | 说明 |
+|---|---|---|
+| 标量输入视为形状已知 | `OnnxImporter.Test` | rank 0 → `TensorShape.Scalar` + `HasShape=true`（原来和动态维一起 `return`） |
+| 新增常量烘焙 | `Net.BakeConstants`、`ReadModel(path, shapes, constants)` | 把输入按实参改成 `ArgKind.Const` 并从图输入摘掉，折叠期就能算出整张掩码；常量自带形状，调用方不必再为它传 `inputShapes`；烘焙后再 `SetInput` 会直接报错，避免用错 |
+| 识别器烘焙三个长度输入 | `ParaformerRecognizer` | `speech_lengths`(=特征帧)、`token_num`(=tokens)、`max_label_len`(=tokens)；decoder 缓存键加入 `speechLengths`；每帧少装 3 个 input |
+
+**结果**（基线/新实现交替各跑 15 次，同一进程同一口径）：
+
+| 指标 | 改动前 | 改动后 | 变化 |
+|---|---|---|---|
+| decoder 节点数 | 814 | **419** | −48%（`Shape` 96→0、`Gather` 96→0、`Unsqueeze` 102→0） |
+| decoder forward，`huihui`（16 tokens / 77 帧） | 12.62 min / 16.00 median | **10.69 / 14.08** | −15% / −12% |
+| decoder forward，`huihui2` | 17.87 / 22.51 | **16.32 / 21.36** | −9% / −5% |
+| `asr` 的 dec 段（含 CIF + argmax） | 11 | **9** | −18% |
+
+**注意这里的收益不是线性的**：逐算子 profile 里这 395 个节点自报合计只有约 0.2 ms，
+它们的真实代价全在每帧的固定开销上（≈4.8 μs/节点 × 395 ≈ 1.9 ms），所以省下的是 13% 而不是 48%。
+剩下的 419 个节点里 `Transpose` 72 + `Concat` 48 + `Reshape` 48 仍可继续融合，是 decoder 侧的下一步。
+> **（A12 已否证这句）** 72/48/48 是 raw 图的数字；折叠后 `Concat` 已经是 0 个、`Transpose` 36 个合计 0.1 ms。
+
+验证：识别文本不变；单测 116/118 passed、2 skipped、0 failed；yolo11n 27.8 ms、rfdetr-small 194.3 ms
+（与 A9 的 28.8 / 195.6 持平，无回归）。
+
+**复测：与 ORT 对比** —— 按「性能数字只看 `bench.md`」的约定，分段表、长度扫描、测量坑与复现命令
+都记在 **`bench.md §31`**。一句话：encoder 1.27~1.35×、decoder 单步 2.9~3.7×（折叠前 3.2~3.5×；
+可信量是配对 A/B 的 −15%），端到端 `huihui` 68~70 ms。
+
+
+#### A12. 2026-11-16 decoder 图优化收工：差距不在图结构，在整数 GEMM
+
+A11 之后的计划是「把 `Transpose` 72 + `Concat` 48 + `Reshape` 48 继续融合」。先量再动手，前提不成立：
+
+| 项 | raw 图 | 折叠后（实际执行） |
+|---|---:|---:|
+| `Concat` | 60 | **0** |
+| `Transpose` | 84 | 36（合计 **0.1 ms，0.5%**） |
+| `Reshape` | 72 | 48（**0.0 ms**） |
+| `Shape` / `Gather` / `Unsqueeze` | 96 / 96 / 102 | 0 / 0 / 0 |
+
+耗时构成（`profile`，绝对值的噪声同 §12.6，结构稳定）：GEMM 三类 **60~70%**
+（`DynamicQuantizeMatMul` 50 个、`MatMul` 25 个、`MatMulInteger` 12 个），`LayerNormalization` 7~9%，
+`Add` 4~10%，其余都是 ≤3% 的固定开销。
+
+为什么追不上 ORT：
+
+- 4 线程 F32 峰值 `flopsbench` = **434 GFLOPS**（单线程 108.5）。
+- decoder 每帧 849 MMAC（1.70 GFLOP），GEMM 段 7.7 ms ⇒ **≈221 GFLOPS（51%）**；
+  单形状口径大 GEMM 已到 86%（`76×320×1280` 373 GFLOPS）。
+- ORT 3.57 ms 反推 **≈550 GFLOPS > 434** ⇒ 它的 `DynamicQuantizeMatMul` 走 MLAS **u8s8** 内核
+  （Zen4 的 AVX512-VNNI `vpdpbusd`），不是 F32。旁证：F32 的 encoder 只差 1.3×，量化模型差 2.9~3.7×。
+- 我们这边上不了整数内核：Zen4 无 AVX-VNNI（`AvxVnni.IsSupported == false`），EVEX `vpdpbusd`
+  在 .NET 没有 API，`Avx2` 也没暴露 `maddubs`（`MultiplyAddAdjacent` 只有 i16 的 `vpmaddwd`，吞吐等于 FMA）。
+
+顺带否掉两条：
+
+- `ONNXSHARP_GEMM_MR` 12/6/4 在 5 个真实形状上**无差别**（`16×320×320` 恒 0.036~0.037）——
+  「小 m 需要更窄行块」不成立，浪费的那点被 packed 免 padding 抵消了。
+- 图内 GEMM 比微基准慢 25%（`76×320×1280` 0.187 vs 0.150）：12 层权重 20 MB 轮换，L2 装不下，
+  是带宽问题；改布局/预取的上限只有 ~0.3 ms（3%），不划算。
+
+⇒ 结论：
+1. **decoder 侧不再做图优化**。要缩这 3× 只剩 native int8 内核一条路，需单独评估是否接受 C 依赖。
+2. 精力回到 F32 模型（encoder 1.3×、yolo11n 1.23×），那些差距才是调度与内核能追的。
+
+数据与复现命令见 `bench.md §32`。
+
+**收工快照（2026-11-16）**：视觉三模型 + ASR 两段同会话串行复测，单测 **116/118 passed、2 skipped、0 failed**。
+数据在 `bench.md §33`，要点：yolo11n / yolo11s 对 ORT **1.25 / 1.23×**、rfdetr-small **1.06×**、
+sherpa encoder **1.30×**、decoder **2.97×**（与 §31.3 的 1.27~1.35 / 2.9~3.7 一致，无回归）。
+同日 OpenCV 跑出 311~315 ms（§4 时是 187~237），所以 §33.1 里「对 OpenCV 0.60~0.64×」不作数，仍以 §4 的 1.21~1.23× 为准。
 
 
 ## 5. 核心设计

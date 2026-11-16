@@ -1,3 +1,4 @@
+using OnnxSharp.Engine;
 using OnnxSharp.Tensors;
 
 namespace OnnxSharp.Core;
@@ -35,12 +36,57 @@ public sealed class Net
     /// <param name="path">ONNX 文件路径。</param>
     /// <param name="inputShapes">图输入名 → 完整形状（每维 &gt; 0）；null 表示按模型声明（可含动态维）。</param>
     public static Net ReadModel(string path, IReadOnlyDictionary<string, int[]>? inputShapes)
+        => ReadModel(path, inputShapes, null);
+
+    /// <summary>
+    /// 加载模型，固定动态输入维，并把<b>取值为标量/小张量的输入烘焙成常量</b>。
+    /// <para>
+    /// 与只给形状的区别：有些图把「长度」当<b>数值</b>用（Paraformer 的
+    /// <c>make_pad_mask: ReduceMax(speech_lengths) → Cast → Range → Less → Cast</c>），
+    /// 只特化形状时 <c>Range</c> 的长度仍然未知，整条链连同下游 <c>Shape/Gather/Concat</c>
+    /// 都得留在图里每帧重算（decoder 上约 330 个节点）。把这类输入按实参烘成常量后，
+    /// 掩码在折叠期就变成一块常量，节点全部消失。
+    /// </para>
+    /// <para>
+    /// 烘焙后该名字不再是图输入（<see cref="NetImpl.SetInput"/> 会直接报错），
+    /// 所以调用方要按这些常量值做图缓存（见 <c>ParaformerRecognizer</c>）。
+    /// </para>
+    /// </summary>
+    /// <param name="path">ONNX 文件路径。</param>
+    /// <param name="inputShapes">图输入名 → 完整形状；null 表示按模型声明。</param>
+    /// <param name="constantInputs">图输入名 → 恒定取值；null 表示不做数值烘焙。</param>
+    public static Net ReadModel(
+        string path,
+        IReadOnlyDictionary<string, int[]>? inputShapes,
+        IReadOnlyDictionary<string, Tensor>? constantInputs)
     {
         Onnx.OnnxFile file = Onnx.OnnxFile.Load(path);
-        if (inputShapes is { Count: > 0 })
-            file = file.WithInputShapes(inputShapes);
+        var shapes = MergeConstantShapes(inputShapes, constantInputs);
+        if (shapes is { Count: > 0 })
+            file = file.WithInputShapes(shapes);
 
-        return Build(file);
+        return Build(file, constantInputs);
+    }
+
+    /// <summary>
+    /// 常量的形状是已知的，所以调用方<b>不用</b>再为它们单独传 <c>inputShapes</c> ——
+    /// 这里把常量的形状补进特化字典，形状特化的校验才不会因为「动态维没给具体值」而报错。
+    /// </summary>
+    private static Dictionary<string, int[]>? MergeConstantShapes(
+        IReadOnlyDictionary<string, int[]>? inputShapes,
+        IReadOnlyDictionary<string, Tensor>? constantInputs)
+    {
+        if (constantInputs is not { Count: > 0 })
+            return inputShapes is null ? null : new Dictionary<string, int[]>(inputShapes);
+
+        var shapes = inputShapes is null
+            ? new Dictionary<string, int[]>()
+            : new Dictionary<string, int[]>(inputShapes);
+
+        foreach (var (name, value) in constantInputs)
+            shapes[name] = value.Shape.Dims.ToArray();
+
+        return shapes;
     }
 
     /// <summary>
@@ -141,12 +187,16 @@ public sealed class Net
         return file.WithInputShapes(shapes);
     }
 
-    private static Net Build(Onnx.OnnxFile file)
+    private static Net Build(Onnx.OnnxFile file, IReadOnlyDictionary<string, Tensor>? constantInputs = null)
     {
         var impl = Onnx.OnnxImporter.Build(file);
 
         if (impl is { MainGraph: { } graph })
         {
+            // 常量烘焙必须在折叠之前：折叠期才能看到这些输入的真实取值。
+            if (constantInputs is { Count: > 0 })
+                BakeConstants(impl, graph, constantInputs);
+
             // 先折叠（会删节点、把上游改成常量），再融合（合并剩下的运行时节点）。
             // 顺序不能反：折叠后可能又暴露出新的融合机会，而且融合不处理常量输入。
             ConstFolder.Run(impl, graph);
@@ -154,6 +204,36 @@ public sealed class Net
         }
 
         return new Net(impl);
+    }
+
+    /// <summary>
+    /// 把图输入的取值就地烘成常量（<see cref="ArgKind.Const"/>）并从图输入列表里摘掉。
+    /// 之后 <see cref="ConstFolder"/> 才能把依赖这些数值的 <c>Range/Less</c> 掩码链整段算掉。
+    /// </summary>
+    private static void BakeConstants(NetImpl impl, Graph graph, IReadOnlyDictionary<string, Tensor> constants)
+    {
+        foreach (var (name, value) in constants)
+        {
+            ArgumentNullException.ThrowIfNull(value, name);
+
+            var arg = impl.Require(name);
+            var data = impl.GetArgData(arg);
+
+            if (data.Kind != ArgKind.Input)
+                throw new OnnxSharpException(
+                    $"'{name}' is not a graph input (kind {data.Kind}); cannot bake it as a constant");
+
+            data.Kind = ArgKind.Const;
+            data.Const = value;
+            data.Shape = value.Shape;
+            data.HasShape = true;
+            data.DType = value.DType;
+            data.Layout = value.Layout;
+            data.BufferIndex = BufferAllocator.NoSlot;
+            data.Runtime = null;
+
+            graph.DropInput(arg);
+        }
     }
 
     public void SetInput(string name, Tensor input) => _impl.SetInput(name, input);

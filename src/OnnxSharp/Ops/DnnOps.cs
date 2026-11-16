@@ -419,6 +419,18 @@ internal static class DnnOps
                 return;
             }
 
+            // 3 通道输入的首层（YuNet 的 Conv_0 这类）：K=27 配 M=16，面板式与 im2col 都只有
+            // 50 GMAC/s 左右。试过「沿输出宽向量化」，实测反而更慢（1.08 vs 0.81 ms），
+            // 默认关闭，见 FirstConv.Enabled。
+            if (Kernels.FirstConv.Enabled && input.Shape.Dims[1] == 3 && Kernels.FirstConv.TryConv(
+                    input, weight, bias, output,
+                    _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1]))
+            {
+                if (FusedActivation is { } firstActivation)
+                    TensorOps.ElementWiseUnary(firstActivation, output, output);
+                return;
+            }
+
             // 3×3 / s2 / pad1 走 NCHWc16 直接卷积（planv2 §P7.7 阶段 1）：blocked 布局下
             // 一次 zmm 载入就是「16 个通道」，16 个累加器全压在寄存器里，实测 165~220 GMAC/s，
             // 是同一形状上面板式（88~138）的 1.6~2.4 倍。代价是每层进出一次 reorder。

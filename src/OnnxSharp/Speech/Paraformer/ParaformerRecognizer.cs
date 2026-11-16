@@ -87,7 +87,7 @@ public sealed class ParaformerRecognizer
     // 图按形状特化，所以按 (frames/dim) 缓存；同一实例不保证线程安全，用 _gate 串行化
     private readonly object _gate = new();
     private readonly Dictionary<(int Frames, int Dim), Net> _encoders = new();
-    private readonly Dictionary<(int Tokens, int EncFrames, int Dim), Net> _decoders = new();
+    private readonly Dictionary<(int Tokens, int EncFrames, int Dim, int SpeechLengths), Net> _decoders = new();
 
     public ParaformerRecognizer(ParaformerOptions options)
     {
@@ -126,9 +126,6 @@ public sealed class ParaformerRecognizer
         var speech = Tensor.Allocate(new TensorShape(1, frames, dim), DType.F32);
         features.Values.AsSpan().CopyTo(MemoryMarshal.Cast<byte, float>(speech.Bytes()));
 
-        var lengths = Tensor.Allocate(new TensorShape(1), DType.I32);
-        lengths.AsSpan<int>()[0] = frames;
-
         float[] hiddenValues;
         float[] alphaValues;
         byte[] encQuantized;
@@ -140,7 +137,6 @@ public sealed class ParaformerRecognizer
         lock (_gate)
         {
             encoder.SetInput("speech", speech);
-            encoder.SetInput("speech_lengths", lengths);
             var outputs = encoder.ForwardAll();
 
             var hidden = FindOutput(encoder, outputs, _options.EncoderOutput);
@@ -185,17 +181,11 @@ public sealed class ParaformerRecognizer
         // ---- 4) decoder（深切版：图里不再重跑 encoder，K/V 由 encoder 的量化输出直接喂）
         watch.Restart();
         int encLength = encQuantized.Length / hiddenDim;
-        var decoder = GetDecoder(tokenCount, encLength, hiddenDim, out double decoderLoadMs);
+        var decoder = GetDecoder(tokenCount, encLength, hiddenDim, frames, out double decoderLoadMs);
         watch.Restart();
 
         var memory = Tensor.Allocate(new TensorShape(1, tokenCount, hiddenDim), DType.F32);
         cif.Tokens.AsSpan().CopyTo(MemoryMarshal.Cast<byte, float>(memory.Bytes()));
-
-        var maxLength = Tensor.Allocate(TensorShape.Scalar, DType.I64);
-        maxLength.AsSpan<long>()[0] = tokenCount;
-
-        var tokenNum = Tensor.Allocate(new TensorShape(1), DType.I32);
-        tokenNum.AsSpan<int>()[0] = tokenCount;
 
         var encKv = Tensor.Allocate(new TensorShape(1, encLength, hiddenDim), DType.U8);
         encQuantized.AsSpan().CopyTo(encKv.Bytes());
@@ -209,14 +199,10 @@ public sealed class ParaformerRecognizer
         Tensor logits;
         lock (_gate)
         {
-            decoder.SetInput("speech_lengths", lengths);
             decoder.SetInput(_options.MemoryInput, memory);
-            decoder.SetInput(_options.MaxLabelLengthInput, maxLength);
-            decoder.SetInput(_options.TokenNumInput, tokenNum);
             decoder.SetInput(_options.EncoderQuantizedOutput, encKv);
             decoder.SetInput(_options.EncoderScaleOutput, encScaleTensor);
             decoder.SetInput(_options.EncoderZeroPointOutput, encZeroPointTensor);
-
             logits = FindOutput(decoder, decoder.ForwardAll(), _options.LogitsOutput);
         }
 
@@ -254,11 +240,10 @@ public sealed class ParaformerRecognizer
         }
 
         var watch = Stopwatch.StartNew();
-        var net = Net.ReadModel(_options.EncoderPath, new Dictionary<string, int[]>
-        {
-            ["speech"] = [1, frames, dim],
-            ["speech_lengths"] = [1],
-        });
+        var net = Net.ReadModel(
+            _options.EncoderPath,
+            new Dictionary<string, int[]> { ["speech"] = [1, frames, dim] },
+            new Dictionary<string, Tensor> { ["speech_lengths"] = LengthScalar(frames) });
         loadMs = watch.Elapsed.TotalMilliseconds;
 
         lock (_gate)
@@ -271,10 +256,16 @@ public sealed class ParaformerRecognizer
         return net;
     }
 
-    /// <summary>按 (token 数, encoder 帧数, 维度) 取 decoder 图。</summary>
-    private Net GetDecoder(int tokens, int encFrames, int dim, out double loadMs)
+    /// <summary>
+    /// 按 (token 数, encoder 帧数, 维度, 特征帧数) 取 decoder 图。
+    /// <para>
+    /// <c>speech_lengths / token_num / max_label_len</c> 是按<b>数值</b>参与掩码构造的，
+    /// 烘成常量后 <c>make_pad_mask</c> 在折叠期就整段消失，因此它们也必须进缓存键。
+    /// </para>
+    /// </summary>
+    private Net GetDecoder(int tokens, int encFrames, int dim, int speechLengths, out double loadMs)
     {
-        var key = (tokens, encFrames, dim);
+        var key = (tokens, encFrames, dim, speechLengths);
         lock (_gate)
         {
             if (_decoders.TryGetValue(key, out var cached))
@@ -285,12 +276,19 @@ public sealed class ParaformerRecognizer
         }
 
         var watch = Stopwatch.StartNew();
-        var net = Net.ReadModel(_options.DecoderPath, new Dictionary<string, int[]>
-        {
-            ["speech_lengths"] = [1],
-            [_options.MemoryInput] = [1, tokens, dim],
-            [_options.EncoderQuantizedOutput] = [1, encFrames, dim],
-        });
+        var net = Net.ReadModel(
+            _options.DecoderPath,
+            new Dictionary<string, int[]>
+            {
+                [_options.MemoryInput] = [1, tokens, dim],
+                [_options.EncoderQuantizedOutput] = [1, encFrames, dim],
+            },
+            new Dictionary<string, Tensor>
+            {
+                ["speech_lengths"] = LengthScalar(speechLengths),
+                [_options.MaxLabelLengthInput] = LabelLengthScalar(tokens),
+                [_options.TokenNumInput] = LengthScalar(tokens),
+            });
         loadMs = watch.Elapsed.TotalMilliseconds;
 
         lock (_gate)
@@ -301,6 +299,22 @@ public sealed class ParaformerRecognizer
         }
 
         return net;
+    }
+
+    /// <summary>[1] 的 i32 长度张量（烘焙 <c>speech_lengths</c> / <c>token_num</c> 用）。</summary>
+    private static Tensor LengthScalar(int value)
+    {
+        var tensor = Tensor.Allocate(new TensorShape(1), DType.I32);
+        tensor.AsSpan<int>()[0] = value;
+        return tensor;
+    }
+
+    /// <summary>标量 i64（烘焙 <c>max_label_len</c> 用）。</summary>
+    private static Tensor LabelLengthScalar(long value)
+    {
+        var tensor = Tensor.Allocate(TensorShape.Scalar, DType.I64);
+        tensor.AsSpan<long>()[0] = value;
+        return tensor;
     }
 
     private static Tensor FindOutput(Net net, List<Tensor> outputs, string name)

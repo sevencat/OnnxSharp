@@ -12,6 +12,7 @@
 | 样本 | 默认 40 帧（`iters=40`），跑 2 轮取 median 较低的一轮 |
 | 线程 | **4 线程**（`ONNXSHARP_THREADS=4` / `intra_op_num_threads=4` / `cv2.setNumThreads(4)` / SimdYolo `threads=4`）。<br>**2026-11-07 ~ 11-11 的历史段落是 16 线程口径**，且其中 onnxsharp 的数字实为 **32 线程**（`run_all.py` 的 env 没传给子进程，`ONNXSHARP_THREADS` 从未生效，见第八轮）。跨段落比较前先确认线程数 |
 | 指标 | 主指标 **median**；副指标 **min**（反映无干扰时的下限） |
+| ASR（sherpa / Paraformer） | **不在四引擎表内**：输入是 wav（先过 fbank），按 `feat / enc / dec` 分段计时。口径与结果见 **§31** |
 
 ## 环境
 
@@ -2458,4 +2459,603 @@ Im2Col / PackedConv 不动是合理的：它们的 A 是权重、B 来自 `Array
   长时间跑多模型要继续盯 `FitReallocCount`。
 - 方法学外推：任何「起点只保证 8 字节」的张量都会让 SIMD 掉档，不只是 GEMM。
 
+## 31. 2026-11-16 sherpa / Paraformer（ASR）专项 —— 常量折叠后与 ORT 复测
+
+### 31.1 为什么单独一节，而不是并进四引擎表
+
+`bench/run_all.py` 的模型清单只有视觉/OCR 那 6 个，ASR 不在里面：它的输入是 wav（先过 fbank），
+输出是 token 序列，端到端没有和 yolo 共通的「一次 forward」口径。这里的对照方式是**逐段对照**：
+
+- 我们：`asr` 命令的内部三段计时（`feat` / `enc` / `dec`）+ `profile` 的纯 forward；
+- ORT：`onnxruntime` 直接建 session，喂**同一批落盘的张量**（`.tmp/sherpa/*.f32`），只测 `sess.run`。
+
+两边都是 4 线程（`ONNXSHARP_THREADS=4` / `intra_op=4, inter_op=1, ORT_ENABLE_ALL`），热态多轮取 min。
+
+### 31.2 折叠前后（decoder，814 → 419 节点）
+
+| 项 | 折叠前 | 折叠后 |
+|---|---|---|
+| 节点数 | 814 | **419**（`Shape` 96→0、`Gather` 96→0、`Unsqueeze` 102→0） |
+| forward `huihui.wav`（16 tokens / 76 帧） | 12.62 min / 16.00 median | **10.69 / 14.08** |
+
+（这一行是同进程交替 A/B、各 15 次取 min/median，可信度高于后面 §31.3 的跨进程快照。）
+
+改动本身（rank-0 输入误判 + 长度输入按数值参与掩码）见 `plan.md §A11`；这里只记性能。
+**收益不是线性的**：那 395 个节点逐算子自报合计才 ~0.2 ms，真实代价在每节点固定开销
+（≈4.8 μs/节点 ≈ 1.9 ms），所以省的是 13~15%。
+
+### 31.3 与 ORT 的分段对比（2026-11-16，交替轮次，min ms）
+
+| 段 | 我们 | ORT | 比值 |
+|---|---:|---:|---:|
+| encoder（1×76×560，纯 forward，`profile`） | 30.2 / 30.2 / 32.4 | 23.9 / 24.0 / 23.9 | **1.27~1.35×** |
+| decoder 单步（16 tokens / enc 76，纯 forward） | 13.2 / 10.3 / 10.7（median 15.0 / 13.6 / 12.9） | 3.56 / 3.62 / 3.55（median 3.59） | **2.9~3.7×** |
+| 端到端 `huihui.wav` | 68~70 ms（feat 6~7 / enc 45~55 / dec 8~13） | enc+dec 27.5（无 ORT 版 CIF/argmax） | — |
+
+- **抖动差异大**：ORT 的 min 与 median 几乎重合（<1%），我们的 min/median 差 20~30%。
+  这台机器 32 核但 IDE 长期抢 CPU，C# 侧对干扰更敏感（GC / 线程唤醒）。**结论只看交替 A/B 的 −15%**，
+  上表 2.9~3.7× 只是折叠后的一次快照。
+- decoder 仍是最弱的一环（encoder 已到 1.3×）：419 节点里 `Transpose` 72 + `Concat` 48 + `Reshape` 48 尚未融合，
+  每节点固定开销仍约 2 ms。
+- `asr` 的 `dec` 段（含 CIF + 输入绑定 + argmax）比纯 forward 高 1~3 ms；`enc` 段比 `profile` 高 4~5 ms
+  （多了 3 个输出拷贝 + 量化）。跨表比较时别把两套口径混用。
+
+### 31.4 encoder 随序列长度（`sweep_T.py` 截断输入）
+
+T=8~64 这四行是同日 A10 会话测的、本轮没重测；T=76 是本次交替复测的两个下限值（编码器代码未改动，
+与 A10 的 1.28× 一致，可认为没漂）。
+
+| T | 我们 | ORT | 比值 |
+|---|---:|---:|---:|
+| 8 | 21.0 | 6.1 | 3.44× |
+| 32 | 18.2 | 12.8 | 1.42× |
+| 48 | 22.1 | 16.9 | 1.31× |
+| 64 | 28.1 | 20.8 | 1.35× |
+| 76 | 30.2~32.4 | 23.9 | 1.27~1.35× |
+
+短序列由固定开销主导（T=8 时 6.1 vs 21.0），T≥48 后稳定在 1.3× 左右 —— 与 DQM 的 F32 算力差一致。
+
+### 31.5 两个测量坑
+
+1. **CLI `profile` 加载期不做常量烘焙**。直接 `profile decoder.onnx` 跑的还是 814 节点那条老路径
+   （逐算子表里 `Shape 96` 仍在就是证据），要看折叠后的数必须先把长度输入烘成 initializer：
+   `.tmp/sherpa/bake_decoder.py` 生成 `decoder_baked.onnx`。
+2. **ORT 的 `--profile` 口径不能跨引擎比**（同 §28.2），这里 ORT 侧一律是「纯 `sess.run` 计时、不挂 profiling」。
+
+### 31.6 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'; $exe='tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe'
+# PATH 上的 python 是失效 shim（exit 49 / 无输出），必须给全路径
+$py='E:\misedir\installs\python\3.11.17\python.exe'
+
+# 我们：encoder 纯 forward（T=76）
+& $exe profile .tmp/sherpa/encoder.onnx `
+  --input speech=.tmp/asr/e2e_feats.f32 --input speech_lengths=.tmp/asr/e2e_lengths.i32 `
+  --shape speech=1,76,560 --shape speech_lengths=1 --iters 20 --top 0
+
+# 我们：折叠后的 decoder（长度输入先烘成 initializer，与识别器加载期等价）
+& $py .tmp/sherpa/bake_decoder.py
+& $exe profile .tmp/sherpa/decoder_baked.onnx `
+  --input 'onnx::Slice_6785=.tmp/sherpa/ok_memory.f32' `
+  --input '/encoder/after_norm/Add_1_output_0_quantized=.tmp/sherpa/dec2_enc_u8.bin' `
+  --input '/encoder/after_norm/Add_1_output_0_scale=.tmp/sherpa/dec2_enc_scale.f32' `
+  --input '/encoder/after_norm/Add_1_output_0_zero_point=.tmp/sherpa/dec2_enc_zp.u8' `
+  --shape 'onnx::Slice_6785=1,16,320' `
+  --shape '/encoder/after_norm/Add_1_output_0_quantized=1,76,320' --iters 20 --top 0
+
+# ORT 对照
+& $py .tmp/sherpa/bench_ort.py 4 20            # encoder，打印 min/median/mean
+& $py .tmp/sherpa/bench_ort_decoder.py         # decoder 单步
+
+# 端到端（内部分段计时）
+& $exe asr .tmp/asr/huihui.wav --models .tmp/sherpa --repeat 30
+```
+
+> `.tmp/sherpa/dec2_*.f32|bin` 这些探针是早期一次真实推理落盘的，混用过不同样本
+> （`speech_lengths` 与 `enc_len` 不自洽），`bench_ort_decoder.py` 里已按「enc 行数 / `token_num`」自洽修正，
+> 自己造输入时别踩回去。
+
+## 32. 2026-11-16 decoder 的 3× 差距溯源：**不在图结构，在整数 GEMM**（图优化路线终止）
+
+§31 之后的第一计划是「419 节点里 `Transpose` 72 + `Concat` 48 + `Reshape` 48 继续融合」。先量再动手，
+结论是**这条路线无效**，同时把 3× 差距定死在一个不可消除的地方。
+
+### 32.1 前提否证：Transpose/Concat/Reshape 合计 0.5%
+
+折叠后（`decoder_baked.onnx`）的算子构成与耗时（`profile --iters 20`）：
+
+| 类型 | 个数 | min ms | share |
+|---|---:|---:|---:|
+| DynamicQuantizeMatMul | 50 | 3.3 ~ 3.9 | 30~37% |
+| MatMul | 25 | 1.1 ~ 2.3 | 10~21% |
+| MatMulInteger | 12 | 2.1 | 19% |
+| LayerNormalization | 51 | 0.7 ~ 1.0 | 7~9% |
+| Add | 60 | 0.5 ~ 1.1 | 4~10% |
+| Softmax / LogSoftmax | 12 / 1 | 0.1 / 0.1 | ~1% |
+| Cast / Pad / Split / Conv / Relu | 12 each | 0.3 / 0.2 / 0.2 / 0.3 / 0.1 | ~8% |
+| **Transpose** | **36** | **0.1** | **0.5%** |
+| **Reshape** | **48** | **0.0** | **0.0%** |
+| **Concat** | **0** | — | — |
+
+- 折叠后 `Concat` 已经一个不剩（raw 图里那 60 个被折叠/融合掉了），`Shape`/`Gather`/`Unsqueeze` 也是 0。
+- `Transpose` 36 个只剩 0.1 ms —— 它们全是 stride 视图（§15.2 的零拷贝 Reshape + 视图 Transpose），
+  本来就不贵。**「再融合 170 个搬运节点」这个前提是错的**（那是 raw 图的数字，不是折叠后的）。
+
+> 逐算子的绝对值不可信（同一份模型两次 profile，DQM 3.3 / 3.9、MatMul 1.1 / 2.3，同 §12.6），
+> 但「GEMM 三类合计 60~70%、搬运类 ≤0.5%」这个结构性结论两次都成立。
+
+### 32.2 我们的 GEMM 已经在 F32 峰值附近
+
+同会话 `flopsbench --threads 4`：**单线程 108.5 GFLOPS，4 线程合计 434.1 GFLOPS**（IDE 在后台，真实峰值更高）。
+
+decoder 每帧的 MAC 数（12 层 + output layer，按图里真实形状累加）：
+
+| 段 | 形状 | MMAC/层 |
+|---|---|---:|
+| self-attn q | 16×320×320 | 1.6 |
+| self-attn k_v | 16×320×1280 | 6.6 |
+| self-attn out | 16×1280×320 | 6.6 |
+| cross-attn q | 16×320×320 | 1.6 |
+| cross-attn k_v | 76×320×1280 | 31.1 |
+| cross-attn out | 16×1280×320 | 6.6 |
+| ffn w_1 / w_2 | 16×320×1280 / 16×1280×320 | 13.1 |
+| **合计** | 12 层 + output(16×320×8404) | **849 MMAC/帧 ≈ 1.70 GFLOP** |
+
+7.7 ms 的 GEMM 段对应 **≈221 GFLOPS（51% 峰值）**；按 §32.4 的单形状口径，大形状已经到
+`gemmbench` 的 86%（373/434），差距来自小 m/n 的固定开销与权重轮换（§32.5）。
+
+### 32.3 ORT 的 3.57 ms 用 F32 解释不了
+
+| 口径 | GEMM 时间 | 折算 |
+|---|---:|---:|
+| 我们 | 7.7 ms | 221 GFLOPS |
+| ORT（总 3.57 减去 non-GEMM 估计 0.5） | ~3.1 ms | **~550 GFLOPS** |
+
+~550 > 同会话 F32 峰值 434。也就是说：**ORT 这个 decoder 不是跑在 F32 域上的**。
+一致的解释是它的 `DynamicQuantizeMatMul` 走 MLAS 的 **u8s8 整数内核**（`MlasGemmU8S8`），
+在 Zen4 上可用 AVX512-VNNI 的 `vpdpbusd`，吞吐是 F32 的 2× —— 4 核理论 ~868 GFLOPS，与 550 吻合。
+
+旁证（同一编码器、两个模型）：
+
+| 模型 | 计算类型 | 我们/ORT |
+|---|---|---:|
+| encoder（F32） | F32 GEMM/Conv | **1.27~1.35×** |
+| decoder（量化） | u8×s8 | **2.9~3.7×** |
+
+同为 GEMM 密集，唯独量化模型差 2.4 倍 —— 差异只能来自整数内核。
+
+### 32.4 为什么我们不能上整数内核
+
+> **本节结论已被 §34 推翻**：在 `net11.0` 目标下 `AvxVnni.IsSupported == true`（本机 Zen4 的 AVX-VNNI
+> 可用），256 位 `vpdpbusd` 已实装进 `Int8Gemm`，`76×320×1280` 从 314 → 733 GFLOPS，
+> decoder 对 ORT 从 2.97× 收到 1.67×。下面这段只在 `net10.0`（无 `AvxVnni`）时成立，保留作对照。
+
+`plan.md` 的「int8 GEMM 指令可行性」已定：本机 Zen4 **没有 VEX 编码的 AVX-VNNI**（`AvxVnni.IsSupported == false`），
+而能用的 EVEX `vpdpbusd`（AVX512-VNNI）**.NET 没有暴露 intrinsic**；退而用 `Avx2` 的
+`sadbw`/`maddubs` 也没有对应 API（`MultiplyAddAdjacent` 只覆盖 i16 的 `vpmaddwd`，吞吐与 FMA 相同，无收益）。
+ORT 是 C++，直接吃 intrinsics 表。
+
+本轮又把两条「整数也许更快」的路实测了一遍，都不通：
+
+| 开关 | 走的路径 | `dec` 段（huihui，min） |
+|---|---|---:|
+| 默认（`Int8Kernel.Tier == Scalar` ⇒ F32 展开） | F32 packed GEMM | **8~11 ms** |
+| `ONNXSHARP_INT8_F32GEMM=0` | 标量 int8 内核（正确性 oracle） | **352~356 ms（40×）** |
+| `ONNXSHARP_INT8_TIER=avx512bw` | i16 展开 + `vpmaddwd` | 见 `plan.md §M10-A`：比 F32 慢 4× |
+
+所以默认值是对的（没有 VNNI 就退 F32），两个开关都只该在对照实验里用。
+
+⇒ **decoder 的 3× 在 .NET + 本机指令集下不可消除**。除非 P/Invoke 自写 native 内核（超出引擎范围），
+或换到有 AVX-VNNI 的机器（Zen5 / Intel 12 代+）。
+
+### 32.5 顺带否掉两条：MR 与「小 m 需要更窄行块」
+
+`gemmbench`（packed 列，DQM 走的就是 packed 路径）在 decoder 的 5 个真实形状上扫 `ONNXSHARP_GEMM_MR`：
+
+| 形状 | MR=12 | MR=6 | MR=4 |
+|---|---:|---:|---:|
+| 16×320×320 | **0.036** | 0.036 | 0.037 |
+| 16×320×1280 | **0.038** | 0.037 | 0.037 |
+| 76×320×1280 | **0.150** | 0.170 | 0.170 |
+| 16×1280×320 | **0.037** | 0.037 | 0.040 |
+| 76×320×320 | **0.038** | 0.043 | 0.043 |
+
+- MR=12 已是最优或持平，**m=16 并不需要更窄的行块**（16 < MR 时浪费的那部分被「packed 面板 + 免去 padding」
+  抵消了）。这条不用再试。
+- `16×320×320` 只有 63 GFLOPS，与 MR 无关 ⇒ 瓶颈是**固定开销**（24 个/帧 × 0.037 ms ≈ 0.9 ms），
+  不是内核形状。
+
+### 32.6 残留：图内比微基准慢 25%（权重轮换冷）
+
+| 形状 | 图内 DQM 的 gemm 段 | gemmbench packed | 比 |
+|---|---:|---:|---:|
+| 16×320×320 | 0.037 | 0.036 | 1.03 |
+| 76×320×1280 | 0.187 | 0.150 | **1.25** |
+| 76×320×320 | 0.048 | 0.038 | **1.26** |
+
+微基准里同一份权重反复跑（L2 热），图里每层换权重（12 层 × 320×1280×4B ≈ 20 MB，L2 1 MB 装不下，
+每层重读到 L3）。这是**内存带宽**问题，同 §30 的对齐问题不是一个来源，改法要动权重布局/分块预取，
+收益上限 ~0.3 ms（3%），不划算。
+
+### 32.7 结论
+
+1. **decoder 图优化到此为止**：搬运类已 ≤0.5%，GEMM 已到 F32 峰值的 51%（大形状 86%），
+   剩余差距是 int8 指令，.NET 拿不到。
+2. 若要继续缩 decoder：只有「native int8 内核」一条路，需要评估是否值得为 ASR 引入 C 依赖。
+3. 精力应该回到 **F32 模型**（encoder 1.3×、yolo 1.23×）—— 那些差距才是调度/内核可以追的。
+
+### 32.8 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'; $exe='tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe'
+$py='E:\misedir\installs\python\3.11.17\python.exe'
+
+# 4 线程 F32 峰值（对照 3.57 ms 的可行性）
+dotnet tools/OnnxSharp.Cli/bin/Release/net10.0/OnnxSharp.Cli.dll flopsbench --iters 100 --inner 500000 --threads 4
+
+# 图内逐算子构成（注意绝对值不可信，看结构）
+& $exe profile .tmp/sherpa/decoder_baked.onnx `
+  --input 'onnx::Slice_6785=.tmp/sherpa/ok_memory.f32' `
+  --input '/encoder/after_norm/Add_1_output_0_quantized=.tmp/sherpa/dec2_enc_u8.bin' `
+  --input '/encoder/after_norm/Add_1_output_0_scale=.tmp/sherpa/dec2_enc_scale.f32' `
+  --input '/encoder/after_norm/Add_1_output_0_zero_point=.tmp/sherpa/dec2_enc_zp.u8' `
+  --shape 'onnx::Slice_6785=1,16,320' --shape '/encoder/after_norm/Add_1_output_0_quantized=1,76,320' `
+  --iters 20 --top 40
+
+# DQM 内部拆解（quant / gemm / epilogue）
+$env:ONNXSHARP_DQM_BREAKDOWN='1'; & $exe asr .tmp/asr/huihui.wav --models .tmp/sherpa --repeat 6
+
+# MR 扫描（每个 MR 单独进程）
+foreach ($mr in '12','6','4') { $env:ONNXSHARP_GEMM_MR=$mr
+  & $exe gemmbench --iters 30 --shape 16,320,320 --shape 76,320,1280 --shape 76,320,320 }
+
+# 整数路径对照（=0 会慢 40×，只用于确认默认值正确）
+$env:ONNXSHARP_INT8_F32GEMM='0'; & $exe asr .tmp/asr/huihui.wav --models .tmp/sherpa --repeat 20
+$env:ONNXSHARP_INT8_F32GEMM='1'; & $exe asr .tmp/asr/huihui.wav --models .tmp/sherpa --repeat 20
+```
+
+## 33. 2026-11-16 收工快照：视觉三模型 + ASR 两段
+
+一条命令跑完、同会话、**串行**（先视觉后 ASR，不并行争 CPU）：4 线程、`--iters 20 --rounds 2 --warmup 5`，
+ASR 是 `--repeat 30` 去掉首轮加载后的 29 个样本。口径与全表一致：median 为主、min 为无干扰下限。
+
+### 33.1 视觉（`bench/run_all.py`，median / min，ms）
+
+| 模型 | OnnxSharp | ONNXRuntime | OpenCV dnn | SimdYolo |
+|---|---:|---:|---:|---:|
+| yolo11n | 29.2 / 28.7 | 23.3 / 23.2 | 45.8 / 45.0 | 32.2 / 29.3 |
+| yolo11s | 79.7 / 77.1 | 64.6 / 63.8 | 132.3 / 126.2 | 78.7 / 77.5 |
+| rfdetr-small | 198.0 / 196.3 | 187.5 / 187.2 | 315.2 / 311.2 | N/A（CLI 不支持 DETR） |
+
+We ÷ 对方 median：
+
+| 模型 | ÷ORT | ÷OpenCV | ÷SimdYolo |
+|---|---:|---:|---:|
+| yolo11n | **1.25** | 0.64 | 0.91 |
+| yolo11s | **1.23** | 0.60 | 1.01 |
+| rfdetr-small | **1.06** | 0.63 | — |
+
+> **对 OpenCV 的 0.60~0.64 不能当成「已超越」**：同一天它跑出 311~315 ms，而 §4 那次是 187~237 ms
+> （rfdetr-small 历史 191.7）。也就是说今天 OpenCV 处于坏状态，与 §4 的 **1.21~1.23×** 矛盾。
+> 按「跨会话只比倍率方向、绝对值不作数」的约定，**结论仍以 §4 的 1.21 / 1.23 为准**，
+> 本节只作为同一会话内的相对快照。
+>
+> 反过来，我们自己的 rfdetr-small 从 §4 的 231.5 降到 198.0（-14%），但同期 OpenCV 也偏了 64%，
+> 说明这是机器状态整体变化，**不要归因为代码优化**（代码自 §30 起未改）。
+
+### 33.2 ASR（`asr` 分段 + `profile` 纯 forward，ms）
+
+| 段 | 我们 | ORT | 倍率 | §31.3 当时 |
+|---|---:|---:|---:|---:|
+| encoder 纯 forward（1×76×560） | 31.0 / 32.6 / 32.8（3 次） | 23.8 / 23.9 | **1.30×** | 1.27~1.35× |
+| decoder 纯 forward（16 tok / enc 76） | 10.6 / 10.7 / 15.1（3 次） | 3.57 / 3.59 | **2.97×** | 2.9~3.7× |
+| 端到端 `huihui.wav` | min 44（feat 4 / enc 32 / dec 7），median 65 | enc+dec 27.5 | — | 68~70 |
+| 端到端 `huihui2.wav` | min 55（feat 4 / enc 40 / dec 9），median 59 | — | — | — |
+
+- 识别文本两条都正确：`今天气真不错我们出去走一走吧`、`语音识别测试成功这是一个纯c井的实现`。
+- **与 §31.3 一致，无回归**：encoder 1.30×、decoder 2.97× 都落在当时的区间内。
+- `asr` 的 `dec`（7~9 ms）比 `profile` 的纯 forward（10.6 ms）还小，是因为前者按 `token_num` 收窄、
+  后者用固定 16 token 的输入；两者不可直接换算，跨表比较需注意（同 §31.3 的注）。
+- decoder 这 2.97× 的成因已定死在 §32：ORT 走 u8s8 整数内核（VNNI），我们只有 F32。
+
+### 33.3 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'
+$py='E:\misedir\installs\python\3.11.17\python.exe'      # PATH 上的 python 是无输出的 mise shim
+$exe='tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe'
+
+# 视觉三模型 × 四引擎（直接打印 §33.1 的表，并写 bench/results/latest.json）
+& $py bench/run_all.py --iters 20 --warmup 5 --rounds 2 --threads 4 `
+  --names yolo11n,yolo11s,rfdetr-small --runtimes onnxsharp,onnxruntime-cpu,opencv-dnn,simdyolo
+
+# ASR 端到端（分段计时，取 min/median）
+& $exe asr .tmp/asr/huihui.wav  --models .tmp/sherpa --repeat 30
+& $exe asr .tmp/asr/huihui2.wav --models .tmp/sherpa --repeat 30
+
+# ASR 纯 forward（与 ORT 对照的口径）
+& $exe profile .tmp/sherpa/encoder.onnx --input 'speech=.tmp/asr/e2e_feats.f32' `
+  --input 'speech_lengths=.tmp/asr/e2e_lengths.i32' --shape 'speech=1,76,560' `
+  --shape 'speech_lengths=1' --iters 20 --warmup 5 --top 0
+
+& $py .tmp/sherpa/bench_ort.py 4 20
+& $py .tmp/sherpa/bench_ort_decoder.py
+```
+
+> `run_all.py` 的 `--runtimes` 里任一引擎失败只会把该格写成 `error`，不会中断整轮
+> （本轮 `rfdetr-small × simdyolo` 就是 `error`：SimdYolo 只支持 yolo 家族）。
+
+## 34. 2026-11-16 整数 GEMM 重写：4 行 × 24 列，733 GFLOPS（§32.4 被推翻）
+
+§32 的落点是「decoder 的 3× 差距不可消除，因为 .NET 拿不到整数 VNNI」。这条**只在 `net10.0` 成立**：
+`net11.0` 目标下本机 Zen4 的 `AvxVnni.IsSupported` 为 `true`，256 位 `vpdpbusd` 可用。
+本轮按 MLAS 的输出块形状重写了 `Int8Gemm` 的 VNNI 内核，矩阵乘段直接翻倍。
+
+### 34.1 形状：1 行 × 32 列 → 4 行 × 24 列
+
+ORT 的 AVX512-VNNI kernel（`QgemmU8X8KernelAvx512Core.asm`）是 **6 行 × 48 列**：
+18 个累加 zmm + 3 条 B + 1 条 A，占满 zmm14~zmm31；一个 quad（4 个 k）
+是 3 load + 6 bcast + 18 `vpdpbusd` = 27 条指令 / 1152 MAC。
+
+托管侧只有 16 个 ymm，等比缩到 **4 行 × 24 列**（12 + 3 + 1 = 16，刚好占满）：
+
+| 项 | MLAS AVX512VNNI | 旧 `MultiplyVnni` | 新 `MultiplyVnniFourRows` |
+|---|---|---:|---:|
+| 输出块 | 6 行 × 48 列 | 1 行 × 32 列 | 4 行 × 24 列 |
+| 累加器 | 18 × zmm | 4 × ymm | 12 × ymm |
+| 每 quad 指令 | 3 load + 6 bcast + 18 dpbusd = 27 | 4 load + 1 bcast + 4 dpbusd = 9 | 3 load + 4 bcast + 12 dpbusd = 19 |
+| **MAC/指令** | **42.7** | **14.2** | **20.2** |
+
+关键是**复用**而不是「指令更高级」：B 的加载对 4 行共享、A 的广播对 3 个列组共享，
+且每个 kBlock 内的 96 字节 B 是连续的一块；12 条累加链彼此独立，
+已足够盖住 `vpdpbusd` 约 4 cycle 的延迟，**不需要再做 K 展开**。
+
+配套三处小改：
+
+1. **epilogue 向量化**（`StoreVector`）：`acc + (offset−bzp)·Σa + azp·(bzp·K−Σb)` 全部走
+   `vpmulld`/`vpaddd`，每 8 列一次；旧版是逐列 `GetElement(j)` + 4 次标量运算。
+2. **列尾巴 8 列向量**：`n=320 / 1280` 在 24 列块之后恰好剩 8 列，不再逐列。
+3. **调度**：`MultiplyVnniDispatch` 按 4 行一组切 `ParallelRange.ForEach`（19 块 / 4 线程，动态领取），
+   `m % 4` 的尾巴回落到单行内核；`4×kPadded` 超过 32 KB 时整段退回单行。
+
+### 34.2 吞吐（`tier_probe`，4 线程）
+
+| 形状 | 改前 | 改后 | 倍率 |
+|---|---:|---:|---:|
+| 16×320×320 | 96.7 | 173.4 | 1.79× |
+| 16×320×1280 | 364.2 | **736.4** | 2.02× |
+| 76×320×1280 | 314.1 | **732.5** | 2.33× |
+
+`732.5 / 4 = 183 GFLOPS` 单核 = `20.2 MAC/cycle × 4.5 GHz × 2`，
+即 256 位 `vpdpbusd` 1 条/cycle 的**理论上限**，多线程效率≈100%。
+
+`16×320×320` 仍是 173（1.6 MMAC 太小，A 打包 + 派发 + 尾块占主导），与 §32.5 的
+「小 m 是固定开销」结论一致，不是内核形状的问题。
+
+### 34.3 decoder 与端到端
+
+| 指标 | 改前（§33.2） | 改后 | |
+|---|---:|---:|---|
+| `MatMulInteger` 12 个（`profile`，min） | 1.3 ms | **0.7 ms** | −46% |
+| decoder 纯 forward（16 tok / enc 76） | 10.6 ~ 15.1 | **6.0 ~ 8.6** | |
+| ÷ ORT（3.57 ~ 3.61） | **2.97×** | **1.67×** | |
+| 端到端 `dec` 段（`asr`，min） | 7 ~ 9 | **6** | |
+
+### 34.4 DQM 换整数内核：实测否证
+
+`decoder` 里 `DynamicQuantizeMatMul` 仍是最大一块（50 个、3.3 ms、39%），
+但它**不**走 `Int8Gemm`：它的权重是 per-channel 量化的 F32，走「量化为 F32 偏移 + packed F32 GEMM」。
+按 ORT 的口径把它接到整数路径**不划算**，实测拆解如下（`ONNXSHARP_DQM_BREAKDOWN=1`）：
+
+| 段 | 占比 |
+|---|---|
+| quant（写 m×k 个 float） | 小 |
+| **gemm（F32 packed）** | **绝对主体** |
+| epilogue | ≈0（已折进 GEMM 尾部） |
+
+即它的成本就是 GEMM 本身：`1.70 GFLOP / 3.3 ms ≈ 512 GFLOPS`，已经在 F32 峰值的量级上；
+换成整数路径还要多一趟 `int32 → float` 的输出 pass，收益为负。**DQM 维持现状**。
+
+### 34.5 sherpa 现状（同会话交替，4 线程，ms）
+
+`profile --iters 30 --warmup 5`，`net11`/`net10`/ORT 交替跑 5 轮取 min（机器本底负载偏重，
+median 会差 10~30%，见 §31.5）：
+
+| 段 | 我们 net11 | 我们 net10 | ORT | ÷ORT（net11） |
+|---|---:|---:|---:|---:|
+| encoder 纯 forward（1×76×560） | 30.3 | 29.9 | 24.1 | **1.26×** |
+| decoder 纯 forward（16 tok / enc 76） | **6.0** | 6.9 | 3.60 | **1.67×** |
+
+- **encoder 没变**（30.3 vs 29.9，噪声内）：它的 160 个 DQM 同样走 F32 路径，本轮没动它。
+  1.26× 就是 §32 说的「F32 域上我们已到峰值」的残留，属于调度/Conv 的事，不是 GEMM。
+- **decoder 6.0 vs 6.9**：差额几乎正好是 `MatMulInteger` 的 1.3 → 0.7。
+- 端到端 `huihui.wav`（`--repeat 30`，min）：feat 4 / enc 37 / **dec 6**，文本仍为
+  `今天气真不错我们出去走一走吧`。
+- 单测：`net11.0` 116/118 passed、2 skipped、0 failed（与改前一致，数值逐位不变）。
+
+### 34.6 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'
+$xNew='tools\OnnxSharp.Cli\bin\Release\net11.0\OnnxSharp.Cli.exe'
+$xOld='tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe'
+
+# 内核吞吐（§34.2）：打印 tier 与 3 个形状，只 net11 有 AvxVnni
+cd .tmp/tier_probe; dotnet run -c Release -f net11.0
+
+# decoder 纯 forward（§34.3）
+& $xNew profile .tmp/sherpa/decoder_baked.onnx `
+  --input 'onnx::Slice_6785=.tmp/sherpa/ok_memory.f32' `
+  --input '/encoder/after_norm/Add_1_output_0_quantized=.tmp/sherpa/dec2_enc_u8.bin' `
+  --input '/encoder/after_norm/Add_1_output_0_scale=.tmp/sherpa/dec2_enc_scale.f32' `
+  --input '/encoder/after_norm/Add_1_output_0_zero_point=.tmp/sherpa/dec2_enc_zp.u8' `
+  --shape 'onnx::Slice_6785=1,16,320' --shape '/encoder/after_norm/Add_1_output_0_quantized=1,76,320' `
+  --iters 30 --warmup 5 --top 0
+
+# encoder 纯 forward + ORT 对照（§34.5）
+& $xNew profile .tmp/sherpa/encoder.onnx --input 'speech=.tmp/asr/e2e_feats.f32' `
+  --input 'speech_lengths=.tmp/asr/e2e_lengths.i32' --shape 'speech=1,76,560' `
+  --shape 'speech_lengths=1' --iters 30 --warmup 5 --top 0
+& 'E:\misedir\installs\python\3.11.17\python.exe' .tmp/sherpa/bench_ort.py 4 20
+& 'E:\misedir\installs\python\3.11.17\python.exe' .tmp/sherpa/bench_ort_decoder.py
+
+# 端到端
+& $xNew asr .tmp/asr/huihui.wav --models .tmp/sherpa --repeat 30
+```
+
+## 35. 2026-11-16 PaddleOCR 与 **Sdcb.SimdPaddleOCR** 对照（4 线程）
+
+第一次把 OCR 管线放到外部实现旁边量。对手是 `Sdcb.SimdPaddleOCR 2.0.0`（纯 C# 的 PaddleOCR 推理引擎），
+**用同一套模型**（`ChineseV6Tiny` 解包出的 `det/rec/cls/dict`，我们 CLI 用的就是它），
+同一份紧凑 RGB24 像素、同一进程内交替运行、4 线程（`ONNXSHARP_THREADS=4`；对方
+`DetIntraOpThreads=4` + `LineWorkerCount=4`），解码（ImageSharp）不计时。
+
+### 35.1 端到端（交替顺序、各取 min / median，ms）
+
+| 图 | 配置 | OnnxSharp | SimdPaddleOCR | 倍率（min / median） |
+|---|---|---:|---:|---|
+| `ocr_test.bmp` 900×300，2 行 | cls on | 34.8 / 43.7 | 18.2 / 20.7 | **1.92× / 2.11×** |
+| `ocr_test.bmp` 900×300，2 行 | cls off | 36.1 / 53.6 | 19.3 / 35.6 | 1.87× / 1.50× |
+| `plate.bmp` 大图，3 行 | cls on | 59.7 / 87.7 | 34.3 / 51.2 | **1.74× / 1.71×** |
+
+结论：**我们慢 1.7~2.1×** —— 比视觉 / ASR（1.06~1.26×）差得多，是当前最大的单项差距。
+
+> 方差：这台机本底负载重，ours 单轮能飘到 244 / 257 ms（GC + 线程池），所以表里用 min，
+> median 只作参考（与 §31.5 口径一致）。`cls off` 那一行反而没降，说明**噪声已经盖住
+> cls 的 ~10 ms**，不能据此判断 cls 是否值得关 —— 需进程内分解（见 35.2）。
+
+### 35.2 我们的时间花在哪（`profile`，纯 forward，4 线程 min）
+
+| 段 | 形状 | 次数 | 每次 | 小计 |
+|---|---|---:|---:|---:|
+| det | 1×3×288×896 | 1 | 19.7 | 19.7 |
+| cls | 1×3×80×160 | 2 | 6.5 | 13.0 |
+| rec | 1×3×48×384 / 400 | 1 / 1 | 4.6 / 5.5 | 10.1 |
+
+- **det 一项 19.7 ms 就超过对方整条管线（18.2 ms）** —— 差距的地基在 det。
+  det 是 PPLCNet 式小通道深度可分离栈（242 节点 / 83 Conv），每次 Conv 只有 16~128 通道，
+  NCHWc 打包 + 内存池 + 派发这些**固定开销**盖过了算力。
+- **cls 13 ms（37%）**：对 2 行文字跑 2 次 80×160 的小网络，每次 6.5 ms —— 32 个 Conv 摊到
+  每个 0.2 ms，同样是固定开销主导。`profile --top` 显示 Conv 占 6.0 / 6.5 ms，没有热点，全是摊薄。
+- **rec 10 ms**：两行串行，对方是 4 路 worker 并行（`RecBatchLines` 还能合批）。
+
+### 35.3 正确性
+
+- `ocr_test.bmp`：两行文本 **逐字一致**（`Hello OnnxSharp 123` / `第二行文字 PaddleOCR`），
+  框位置一致（43,42,498×64；41,141,447×54）。
+- `plate.bmp`：主行 `浙A ES8381` 一致；低置信度小框不同 —— 我们 `e`(0.498) / `A3M15X`(0.807)，
+  对方 `8` / `浙A：3M15X`。两个引擎的 det 框有 1~2 px 差异，裁剪进 rec 后输出了不同字符，
+  属于同一量级的模型噪声，不是实现错误（同一个 rec 模型、同一字典）。
+
+### 35.4 冷启动
+
+| | 我们 | SimdPaddleOCR |
+|---|---:|---:|
+| 加载（读盘 + 建会话） | 4~5 ms（只读字节） | 96~100 ms（完整 session + 字典） |
+| 首轮（含图特化 + JIT） | 119 ms | 41 ms |
+| **合计首次可用** | **~124 ms** | **~141 ms** |
+
+我们是"懒特化"，对方是"加载即建"，总冷启动我们略优，但差距不大。
+
+### 35.5 下一步（如果要把 OCR 拉到 1.3× 以内）
+
+1. **det 的固定开销**：小通道 Conv 豁免 NCHWc / 单线程阈值（`MaxSpatialPixels` 之下已经这么做了，
+   但 896×288 不够小）；这是 §29 提到的「打包上限 5.7%」在小通道图上不成立的反例。
+2. **cls 合并**：两行→一个 batch（80×160×2），或直接按 det 框宽高比预判跳过（水平框占绝大多数）。
+3. **rec 合批**：一次 `Run` 内把多行压成 `1×3×48×Σbucket` 或 `N×3×48×W` 跑，再拆回，
+   这是对方最直接的优势。
+4. det 若仍是瓶颈，再考虑 PPLCNet 专用 depthwise 路径（per-channel 1 线程、多通道才并行）。
+
+### 35.6 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'
+cd .tmp/ocrbench
+dotnet run -c Release -- ..\ocr_test.bmp 30 ..\ocr-models 3            # cls on
+dotnet run -c Release -- ..\ocr_test.bmp 20 ..\ocr-models 2 noclass    # cls off
+dotnet run -c Release -- ..\plate.bmp    15 ..\ocr-models 2            # 大图 3 行
+
+# 我们的纯 forward 分段（需先造零输入，见 §35.2 的形状）
+$cli='..\..\tools\OnnxSharp.Cli\bin\Release\net11.0\OnnxSharp.Cli.exe'
+& $cli profile ..\ocr-models\det.onnx --input 'x=..\ocr_det.f32' --shape 'x=1,3,288,896' --iters 20 --warmup 5 --top 12
+& $cli profile ..\ocr-models\cls.onnx --input 'x=..\ocr_cls.f32' --shape 'x=1,3,80,160' --iters 20 --warmup 5 --top 12
+& $cli profile ..\ocr-models\rec.onnx --input 'x=..\ocr_rec384.f32' --shape 'x=1,3,48,384' --iters 20 --warmup 5 --top 12
+```
+
+## 36. 2026-11-16 YuNet：int8 能跑了，以及三条优化尝试的结果
+
+YuNet（`face_detection_yunet_2023mar.onnx`，0.22 MB，opset 11，91 个执行算子，输入 1×3×640×640，
+输出 12 个：cls/obj/bbox/kps × stride 8/16/32）。
+
+### 36.1 fp32 基线（4 线程，640×640）
+
+| 段 | min | median |
+|---|---:|---:|
+| 纯 forward（`bench`，热机） | 5.4~5.9 | 6.1~7.8 |
+| 预处理（512² → 640² Stretch + BGR→CHW） | 1.74 | 2.84 |
+| forward（`facebench` 里含解码同进程） | 7.92 | 11.89 |
+| 解码（12 输出 + NMS） | ~0.5 | ~0.5 |
+| **端到端** | **8.4** | **10.9** |
+
+`profile` 的分段：53 层 Conv 占 94%（sum-of-min 5.1 / 总 5.4），
+**Conv_0（3→16, 3×3, s2, 320²）一层就 0.81 ms（14.7%）**，其余大层 0.27~0.48 ms。
+按 MAC 估，全图约 0.3~0.5 GMAC → 有效 60~100 GMAC/s，对小通道多层网络属正常区间（寄存器/派发主导，不是算力）。
+
+> `facebench` 的 forward 比 `bench` 高 ~2 ms，因为每轮都新建输入张量（1.2M float）+ 与解码共享 Net，
+> GC 压力不同；口径分开看。
+
+### 36.2 int8：**能跑**（README 里"M10-04/05 未实现"的旧结论已过时）
+
+`yunet_int8.onnx` 是标准 QDQ/QL 图：53 `QLinearConv` + 16 `DequantizeLinear` + 5 `QuantizeLinear`
++ 6 `QLinearSigmoid` + 2 `QLinearAdd` + 4 `MaxPool` + 2 `Resize`，跑通无报错。
+
+| | fp32 | int8 |
+|---|---|---|
+| score | 0.9135 | 0.8944 |
+| box | (209.3, 181.5) 142.2×206.0 | (209.4, 180.7) 143.6×207.4 |
+| forward（min / med） | 5.4 / 6.1 | **22.95 / 23.44** |
+
+精度是同一量级（框中心差 ~1 px、尺寸差 ~1.4 px，score 低 0.019），**但性能慢 2.9~4×**。
+
+原因（`profile` sum-of-min 28.4 ms）：`QLinearConv` 每层都要
+`Dequantize(x) → F32 卷积 → Requantize(y)`，也就是在 f32 卷积之外多两次**全张量物化**
+（写 4N + 读 4N 各一遍）。53 层累计 14.4 ms（是 fp32 Conv 5.1 ms 的 2.8×），
+另有 5 个 `QuantizeLinear` 3.1 ms。YuNet 太小（0.3~0.5 GMAC），省下的带宽抵不过这两趟搬运。
+
+### 36.3 三条尝试（都做了实测）
+
+| 尝试 | 做法 | 结果 |
+|---|---|---|
+| 数据通路换向 | `ONNXSHARP_PACKED=0` 全走 im2col/Winograd | 5.4 → 5.6 ms，**中性**（面板式与 im2col 在 K=27/M=16 上同样低效） |
+| 强制面板 | `ONNXSHARP_PACKED_S1=1`（s1 大空间也打包，复核 §24 的老经验） | 5.7 → 5.8 ms，**中性** |
+| 首层专用内核 | 新增 `Kernels/FirstConv.cs`：沿输出宽 8 像素向量化、输出通道内层展开、步长 2 用偶数位抽取 | **更慢**：Conv_0 0.81 → 1.08 ms。每条 `vfmadd` 要配一条 `vbroadcastss`（指令比 1:1），而面板式是 4 行 × 16 列、广播被 16 列复用。已实现但默认关闭（`ONNXSHARP_FIRSTCONV=1` 才开），注释里留了原因 |
+
+### 36.4 结论
+
+- **fp32 已接近这个结构的实测上限**：层多、通道窄、单层 MAC 小，固定开销（打包 + 派发 + 访存）占大头；
+  packed/im2col/Winograd 三条路径在这个形状上无差异，说明瓶颈不在某个内核，而在「层数 × 每层固定成本」。
+  再往上走要么是布局传播（§24.4 结论：≤8%，不值得），要么是 Conv+Relu 这类图级融合（Relu 已 in-place，收益近零）。
+- **int8 想赢 fp32，必须走整数卷积或链式 QDQ 消除**：
+  前者把 53 层的 `vpdpbusd` 直接接起来（§34 的 4×24 内核已有），后者在 QLinearConv → QLinearConv 之间
+  省掉「RQ→DQ」这一来一回。两条都是 M10 级的改造（前者 ~300 行内核 + epilogue 对拍，后者要动图重写），
+  本次没有展开。
+
+### 36.5 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'
+$cli='tools\OnnxSharp.Cli\bin\Release\net11.0\OnnxSharp.Cli.exe'
+
+& $cli face .tmp/yunet/yunet.onnx .tmp/lena.jpg          # fp32：score 0.9135
+& $cli face .tmp/yunet/yunet_int8.onnx .tmp/lena.jpg     # int8：score 0.8944
+
+& $cli bench .tmp/yunet/yunet.onnx --input 'input=.tmp/yunet/yunet_input.f32' --iters 40 --warmup 10
+& $cli profile .tmp/yunet/yunet_int8.onnx --input 'input=.tmp/yunet/yunet_input.f32' --shape 'input=1,3,640,640' --iters 20 --warmup 5 --top 20
+
+$env:ONNXSHARP_FIRSTCONV='1'    # 复现"首层专用内核更慢"（Conv_0 0.81 → 1.08）
+
+cd .tmp/facebench               # 预处理 / forward / 解码 三段
+dotnet run -c Release -- ..\lena.jpg 20 5
+```
 

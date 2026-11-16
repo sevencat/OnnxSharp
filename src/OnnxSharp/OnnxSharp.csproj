@@ -1,7 +1,9 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <!-- net11.0：.NET 11 补了 AVX512VL，使 AvxVnni 在「有 AVX512_VNNI 无 AVX_VNNI」的 CPU（如 Zen4）
+         上可用（EVEX 编码的 256 位 vpdpbusd）；net8/net10 上 AvxVnni.IsSupported 恒为 false，走 F32 展开。 -->
+    <TargetFrameworks>net8.0;net10.0;net11.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -12,7 +14,7 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>Sevencat.OnnxSharp</PackageId>
-    <Version>0.0.2</Version>
+    <Version>0.4.0</Version>
     <Authors>Sevencat</Authors>
     <PackageIcon>icon.png</PackageIcon>
     <Description>Pure C# ONNX inference engine — CPU only (FP32), no CUDA / Vulkan / OpenCL / DirectML backends, zero third-party dependencies. Runs YOLO11 / YOLOv8 / RF-DETR exports, with an optional image-to-detections facade. The code is written by AI coding agents; requirements, reference material and review come from the maintainer.</Description>

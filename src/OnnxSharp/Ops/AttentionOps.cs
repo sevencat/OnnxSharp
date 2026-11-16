@@ -37,10 +37,14 @@ internal static class AttentionOps
     /// 超过这个序列长度就改用 GEMM 分块内核（<see cref="ComputeBlocks"/>）。
     /// <para>
     /// <see cref="ComputeRows"/> 逐行做点积 + axpy，每行都要把整个 K/V 平面重读一遍，
-    /// 只有在 K/V 平面小到能留在 L1/L2 且 hsum 开销被摊薄时（ASR 的 T=76）才划算；
-    /// T=257 时它比图上的 MatMul+Softmax 慢一倍（66 ms vs 33 ms）。
-    /// GEMM 分块把 S 块按 <c>[T][T]</c>（T=257 时 264 KB）算出来，两趟 GEMM 之间不落地，
-    /// 于是既拿到 GEMM 的算术密度，又没有 6.3 MB 的 scores 帧缓冲往返。
+    /// 只在「K/V 平面够小 + GEMM 内核本身没优化」时才划算。T=257 时它比图上的
+    /// MatMul+Softmax 慢一倍（66 ms vs 33 ms）。
+    /// </para>
+    /// <para>
+    /// ⚠ 2026-11-16 复测（sherpa paraformer encoder，T=76 / D=64 / H=8，4 线程）：
+    /// 逐行 4.5 ms/帧 vs 分块 <b>2.7 ms</b>/帧 —— <see cref="GemmKernel"/> 这两轮做了 512 位
+    /// 加宽、面板复用和 A/B 打包之后，盈亏点已经从 T≈128 下移到 T≈64 以下，
+    /// 所以默认值改成 64（ASR 的 T=76 现在走分块）。更小的 T 仍需实测，别盲调。
     /// </para>
     /// <para><c>ONNXSHARP_ATTN_BLOCK_SEQ</c> 设默认值（0 = 全部走 GEMM 分块）。</para>
     /// <para>
@@ -58,7 +62,7 @@ internal static class AttentionOps
         int.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_BLOCK_SEQ"), out int blockSeq)
             && blockSeq >= 0
             ? blockSeq
-            : 128;
+            : 64;
 
     /// <summary>
     /// 分块内核里**每块分数矩阵 S 的预算字节数**，决定行块宽度

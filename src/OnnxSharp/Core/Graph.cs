@@ -65,6 +65,18 @@ public sealed class Graph
         return removed;
     }
 
+    /// <summary>
+    /// 把某个 Arg 从图输入列表摘掉（它已被烘焙成常量时调用）。返回是否真的移除了。
+    /// </summary>
+    public bool DropInput(Arg arg)
+    {
+        if (!Inputs.Remove(arg))
+            return false;
+
+        Version++;
+        return true;
+    }
+
     public void SetOutputs(IEnumerable<Arg> outputs)
     {
         Outputs = outputs.ToList();

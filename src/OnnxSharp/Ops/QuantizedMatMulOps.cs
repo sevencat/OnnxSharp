@@ -32,9 +32,27 @@ internal static class QuantizedMatMulOps
             Environment.GetEnvironmentVariable("ONNXSHARP_DQM_BREAKDOWN") is { Length: > 0 };
 
         // (w - w_zp) 的 F32 版本 + 预打包面板（常量权重只算一次）
+        //
+        // 为什么不是「u8 激活 × s8 权重 + vpdpbusd」：本机（AMD Zen4 + .NET 10）拿不到这条指令 ——
+        // Zen4 没有 VEX 编码的 AVX-VNNI（`AvxVnni.IsSupported == false`），而 AVX512-VNNI
+        // （EVEX `vpdpbusd`）在 .NET 里根本没有 API。详见 plan.md 的「int8 GEMM 指令可行性」。
         private float[]? _floatWeights;
         private GemmKernel.PackedB? _packedWeights;
         private Tensor? _weightSource;
+
+        // 激活缓冲按线程复用。`ArrayPool.Shared.Rent/Return` 在 m×k 这个量级（2 万 ~ 10 万元素）
+        // 是实打实的固定成本：实测 quant 段耗时几乎与 k 无关（k=320 → 0.060 ms，k=1280 → 0.074 ms，
+        // 元素数差 4 倍），说明瓶颈在租还 + 目标页冷启动，而不是 SIMD 计算。
+        [ThreadStatic] private static float[]? _activationScratch;
+
+        private static float[] RentScratch(ref float[]? slot, int size)
+        {
+            var buffer = slot;
+            if (buffer is null || buffer.Length < size)
+                slot = buffer = new float[size];
+
+            return buffer;
+        }
         private int[]? _weightZeroPoints;
 
         // 每列合成 scale = a_scale * w_scale[col]（复用一个缓冲）
@@ -140,8 +158,8 @@ internal static class QuantizedMatMulOps
             CombinedScale(scale, weightScale, n, out var combined);
 
             // ---- 3) 边量化边展开成 F32（不物化 u8）
-            float[] activationBuffer = ArrayPool<float>.Shared.Rent(m * k);
-            float[]? accumulatorBuffer = packed is null ? ArrayPool<float>.Shared.Rent(m * n) : null;
+            float[] activationBuffer = RentScratch(ref _activationScratch, m * k);
+            float[]? accumulatorBuffer2 = packed is null ? ArrayPool<float>.Shared.Rent(m * n) : null;
 
             try
             {
@@ -158,7 +176,7 @@ internal static class QuantizedMatMulOps
                 }
                 else
                 {
-                    var accumulator = accumulatorBuffer!.AsSpan(0, m * n);
+                    var accumulator = accumulatorBuffer2!.AsSpan(0, m * n);
                     GemmKernel.Multiply(activation, weights!, accumulator, m, k, n);
                     t3 = clock.ElapsedTicks;
                     Epilogue(accumulator, output.AsSpan<float>(), bias, combined, n);
@@ -177,9 +195,8 @@ internal static class QuantizedMatMulOps
             }
             finally
             {
-                ArrayPool<float>.Shared.Return(activationBuffer);
-                if (accumulatorBuffer is not null)
-                    ArrayPool<float>.Shared.Return(accumulatorBuffer);
+                if (accumulatorBuffer2 is not null)
+                    ArrayPool<float>.Shared.Return(accumulatorBuffer2);
             }
         }
 
@@ -201,6 +218,19 @@ internal static class QuantizedMatMulOps
             }
 
             combined = _combinedScale.AsSpan(0, n);
+        }
+
+        private static bool ZeroPointsEqual(int[]? a, int[] b)
+        {
+            if (a is null || a.Length != b.Length)
+                return false;
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i])
+                    return false;
+            }
+
+            return true;
         }
 
         private float[] GetFloatWeights(Tensor weight, int k, int n, int[] zeroPoints)
@@ -246,19 +276,6 @@ internal static class QuantizedMatMulOps
             return _packedWeights;
         }
 
-        private static bool ZeroPointsEqual(int[]? a, int[] b)
-        {
-            if (a is null || a.Length != b.Length)
-                return false;
-            for (int i = 0; i < a.Length; i++)
-            {
-                if (a[i] != b[i])
-                    return false;
-            }
-
-            return true;
-        }
-
         /// <summary><c>q = clamp(round_half_even(x / scale) + zp)</c>，写出 <c>q - zp</c>（整数小值）。</summary>
         private static void QuantizeAndWiden(ReadOnlySpan<float> source, Span<float> destination, float scale, int zeroPoint)
         {
@@ -271,6 +288,9 @@ internal static class QuantizedMatMulOps
             var vZero512 = Vector512.Create((float)zeroPoint);
             var vMax512 = Vector512.Create(255f);
 
+            ref float srcReference = ref MemoryMarshal.GetReference(source);
+            ref float dstReference = ref MemoryMarshal.GetReference(destination);
+
             int i = 0;
 
             if (Avx512F.IsSupported)
@@ -279,7 +299,7 @@ internal static class QuantizedMatMulOps
 
                 for (; i + 16 <= source.Length; i += 16)
                 {
-                    var x = Vector512.LoadUnsafe(ref MemoryMarshal.GetReference(source[i..]));
+                    var x = Vector512.LoadUnsafe(ref srcReference, (nuint)i);
                     var scaled = Avx512F.Multiply(x, vInverse512);
 
                     // round-half-even：512 位的 vroundps 没有暴露，两半各用 256 位（仍是 16 宽）
@@ -290,7 +310,7 @@ internal static class QuantizedMatMulOps
 
                     var q = Avx512F.Add(rounded, vZero512);
                     q = Avx512F.Min(vMax512, Avx512F.Max(Vector512<float>.Zero, q));
-                    Avx512F.Subtract(q, vZero512).StoreUnsafe(ref destination[i]);
+                    Vector512.StoreUnsafe(Avx512F.Subtract(q, vZero512), ref dstReference, (nuint)i);
                 }
             }
 
@@ -298,12 +318,12 @@ internal static class QuantizedMatMulOps
             {
                 for (; i + 8 <= source.Length; i += 8)
                 {
-                    var x = Vector256.LoadUnsafe(ref MemoryMarshal.GetReference(source[i..]));
+                    var x = Vector256.LoadUnsafe(ref srcReference, (nuint)i);
                     var q = Avx.RoundToNearestInteger(Avx.Multiply(x, vInverse));
                     q = Avx.Add(q, vZero);
                     q = Avx.Min(vMax, Avx.Max(vMin, q));
 
-                    Avx.Subtract(q, vZero).StoreUnsafe(ref destination[i]);
+                    Vector256.StoreUnsafe(Avx.Subtract(q, vZero), ref dstReference, (nuint)i);
                 }
             }
 

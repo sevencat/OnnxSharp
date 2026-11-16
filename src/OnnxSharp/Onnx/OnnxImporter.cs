@@ -137,10 +137,14 @@ internal static class OnnxImporter
         // 否则 int64 的 `max_label_len` 会被当成 F32（decoder 里当 Slice 的 starts 用）。
         data.DType = info.Type;
 
-        if (dynamic || info.Dims.Length == 0)
-            return;   // 动态维度 / 标量：形状交给运行时或调用方
+        if (dynamic)
+            return;   // 动态维度：形状交给特化或调用方
 
-        data.Shape = new TensorShape(info.Dims);
+        // rank 0 不是「形状未知」，而是**确定的标量**。以前这里和动态维一起跳过，
+        // 结果是带标量 scale/zero_point 的量化图（sherpa decoder 的 MatMulInteger）
+        // 形状推断断在第一层：下游 Cast→Mul→Add→Split→Shape 全部拿不到形状，
+        // 94 个 Shape 节点一个也折不掉，每帧白跑几百个节点。
+        data.Shape = info.Dims.Length == 0 ? TensorShape.Scalar : new TensorShape(info.Dims);
         data.HasShape = true;
         data.Layout = Layout.NCHW;
     }

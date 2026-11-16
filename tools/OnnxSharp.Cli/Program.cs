@@ -2657,7 +2657,7 @@ static Tensor LoadTensor(Net net, string name, string file, int[]? shapeOverride
             $"input '{name}': {file} is {bytes.Length} B, expected {expected} B for {shape} {data.DType}");
 
     var tensor = Tensor.Allocate(shape, data.DType);
-    bytes.CopyTo(tensor.Buffer.AsSpan(0, (int)expected));
+    bytes.CopyTo(tensor.Bytes());
     return tensor;
 }
 

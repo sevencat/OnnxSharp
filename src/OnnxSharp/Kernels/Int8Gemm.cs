@@ -201,7 +201,7 @@ public static class Int8Gemm
             return;
 
         if (Int8Kernel.Tier == Int8KernelTier.AvxVnni && AvxVnni.IsSupported)
-            MultiplyVnni(a, packed, c, m, aZeroPoint);
+            MultiplyVnniDispatch(a, packed, c, m, aZeroPoint);
         else if (Int8Kernel.Tier == Int8KernelTier.Avx512Bw && Avx512BW.IsSupported)
             MultiplyAvx512Bw(a, packed, c, m, aZeroPoint);
         else
@@ -243,6 +243,270 @@ public static class Int8Gemm
         long index = ((long)(k / 4) * packed.NPadded + n) * 4 + (k % 4);
         int packedValue = unchecked((sbyte)packed.Data[index]);
         return packedValue + packed.ZeroPointOffset;
+    }
+
+    /// <summary>
+    /// VNNI 调度：按 4 行块跑 <see cref="MultiplyVnniFourRows"/>，剩下的 <c>m % 4</c> 行走单行内核。
+    /// <para>
+    /// 4 行块要求把 4 行 A 同时打包进栈（<c>4 × kPadded</c> 字节），超过 32 KB 时退回逐行。
+    /// </para>
+    /// </summary>
+    private static void MultiplyVnniDispatch(
+        ReadOnlySpan<byte> a,
+        PackedInt8Weights packed,
+        Span<int> c,
+        int m,
+        int aZeroPoint)
+    {
+        int blockRows = packed.KPadded <= 8192 ? 4 : 1;
+        int blocks = blockRows == 4 ? m / 4 : 0;
+
+        if (blocks == 0)
+        {
+            MultiplyVnni(a, packed, c, m, aZeroPoint);
+            return;
+        }
+
+        MultiplyVnniFourRows(a, packed, c, m, blocks, aZeroPoint);
+
+        int tailRows = m - blocks * 4;
+        if (tailRows > 0)
+        {
+            MultiplyVnni(
+                a.Slice(blocks * 4 * packed.K),
+                packed,
+                c.Slice(blocks * 4 * packed.N),
+                tailRows,
+                aZeroPoint);
+        }
+    }
+
+    /// <summary>
+    /// 4 行 × 24 列的输出块 —— 把 MLAS <c>QgemmU8X8KernelAvx512Core.asm</c> 的「6 行 × 48 列」按
+    /// 256 位寄存器宽度缩下来的形状：12 个累加器 + 3 条 B + 1 条 A，刚好 16 个 ymm。
+    /// <para>
+    /// 一个 quad（4 个 k）：3 次 B 加载 + 4 次 A 广播 + 12 条 <c>vpdpbusd</c>，共 384 MAC →
+    /// <b>20.2 MAC/指令</b>；而单行 32 列（4 加载 + 1 广播 + 4 dpbusd）只有 14.2。
+    /// B 的加载对 4 行复用、A 的广播对 3 个列组复用，且每个 kBlock 内的 96 字节 B 是连续的；
+    /// 12 条累加链彼此独立，足以盖住 <c>vpdpbusd</c> 约 4 cycle 的延迟，因此不需要再做 K 展开。
+    /// </para>
+    /// </summary>
+    private static unsafe void MultiplyVnniFourRows(
+        ReadOnlySpan<byte> a,
+        PackedInt8Weights packed,
+        Span<int> c,
+        int m,
+        int blocks,
+        int aZeroPoint)
+    {
+        int k = packed.K;
+        int n = packed.N;
+        int kPadded = packed.KPadded;
+        int nPadded = packed.NPadded;
+        int kBlocks = kPadded / 4;
+
+        byte[] data = packed.Data;
+        int[] columnSums = packed.ColumnSums;
+        int[] bZeroPoints = packed.BZeroPoints;
+        int offset = packed.ZeroPointOffset;
+
+        fixed (byte* aPointer = a)
+        fixed (int* cPointer = c)
+        fixed (byte* dataPointer = data)
+        fixed (int* columnSumPointer = columnSums)
+        fixed (int* bZeroPointPointer = bZeroPoints)
+        {
+            nint aAddress = (nint)aPointer;
+            nint cAddress = (nint)cPointer;
+            nint dataAddress = (nint)dataPointer;
+            nint columnSumAddress = (nint)columnSumPointer;
+            nint bZeroPointAddress = (nint)bZeroPointPointer;
+
+            void Block(int rowBase)
+            {
+                byte* weights = (byte*)dataAddress;
+                Span<byte> padded = stackalloc byte[kPadded * 4];
+                Span<int> rowSums = stackalloc int[4];
+
+                for (int r = 0; r < 4; r++)
+                {
+                    byte* source = (byte*)aAddress + (long)(rowBase + r) * k;
+                    int start = r * kPadded;
+                    int sum = 0;
+                    for (int i = 0; i < k; i++)
+                    {
+                        byte value = source[i];
+                        padded[start + i] = value;
+                        sum += value;
+                    }
+                    for (int i = k; i < kPadded; i++)
+                        padded[start + i] = 0;
+                    rowSums[r] = sum;
+                }
+
+                fixed (byte* paddedPointer = padded)
+                {
+                    int colBlock = 0;
+                    for (; colBlock + 24 <= n; colBlock += 24)
+                    {
+                        var a00 = Vector256<int>.Zero;
+                        var a01 = Vector256<int>.Zero;
+                        var a02 = Vector256<int>.Zero;
+                        var a10 = Vector256<int>.Zero;
+                        var a11 = Vector256<int>.Zero;
+                        var a12 = Vector256<int>.Zero;
+                        var a20 = Vector256<int>.Zero;
+                        var a21 = Vector256<int>.Zero;
+                        var a22 = Vector256<int>.Zero;
+                        var a30 = Vector256<int>.Zero;
+                        var a31 = Vector256<int>.Zero;
+                        var a32 = Vector256<int>.Zero;
+
+                        for (int kb = 0; kb < kBlocks; kb++)
+                        {
+                            byte* bp = weights + ((long)kb * nPadded + colBlock) * 4;
+                            byte* q = paddedPointer + (long)kb * 4;
+
+                            var b0 = Vector256.LoadUnsafe(ref *(sbyte*)bp);
+                            var b1 = Vector256.LoadUnsafe(ref *(sbyte*)(bp + 32));
+                            var b2 = Vector256.LoadUnsafe(ref *(sbyte*)(bp + 64));
+
+                            var v = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)q)).AsByte();
+                            a00 = AvxVnni.MultiplyWideningAndAdd(a00, v, b0);
+                            a01 = AvxVnni.MultiplyWideningAndAdd(a01, v, b1);
+                            a02 = AvxVnni.MultiplyWideningAndAdd(a02, v, b2);
+
+                            v = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)(q + kPadded))).AsByte();
+                            a10 = AvxVnni.MultiplyWideningAndAdd(a10, v, b0);
+                            a11 = AvxVnni.MultiplyWideningAndAdd(a11, v, b1);
+                            a12 = AvxVnni.MultiplyWideningAndAdd(a12, v, b2);
+
+                            v = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)(q + 2 * kPadded))).AsByte();
+                            a20 = AvxVnni.MultiplyWideningAndAdd(a20, v, b0);
+                            a21 = AvxVnni.MultiplyWideningAndAdd(a21, v, b1);
+                            a22 = AvxVnni.MultiplyWideningAndAdd(a22, v, b2);
+
+                            v = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)(q + 3 * kPadded))).AsByte();
+                            a30 = AvxVnni.MultiplyWideningAndAdd(a30, v, b0);
+                            a31 = AvxVnni.MultiplyWideningAndAdd(a31, v, b1);
+                            a32 = AvxVnni.MultiplyWideningAndAdd(a32, v, b2);
+                        }
+
+                        int* crow = (int*)cAddress + (long)rowBase * n + colBlock;
+
+                        StoreVector(a00, crow, bZeroPointAddress, columnSumAddress, colBlock, rowSums[0], aZeroPoint, offset, k);
+                        StoreVector(a01, crow + 8, bZeroPointAddress, columnSumAddress, colBlock + 8, rowSums[0], aZeroPoint, offset, k);
+                        StoreVector(a02, crow + 16, bZeroPointAddress, columnSumAddress, colBlock + 16, rowSums[0], aZeroPoint, offset, k);
+
+                        crow += n;
+                        StoreVector(a10, crow, bZeroPointAddress, columnSumAddress, colBlock, rowSums[1], aZeroPoint, offset, k);
+                        StoreVector(a11, crow + 8, bZeroPointAddress, columnSumAddress, colBlock + 8, rowSums[1], aZeroPoint, offset, k);
+                        StoreVector(a12, crow + 16, bZeroPointAddress, columnSumAddress, colBlock + 16, rowSums[1], aZeroPoint, offset, k);
+
+                        crow += n;
+                        StoreVector(a20, crow, bZeroPointAddress, columnSumAddress, colBlock, rowSums[2], aZeroPoint, offset, k);
+                        StoreVector(a21, crow + 8, bZeroPointAddress, columnSumAddress, colBlock + 8, rowSums[2], aZeroPoint, offset, k);
+                        StoreVector(a22, crow + 16, bZeroPointAddress, columnSumAddress, colBlock + 16, rowSums[2], aZeroPoint, offset, k);
+
+                        crow += n;
+                        StoreVector(a30, crow, bZeroPointAddress, columnSumAddress, colBlock, rowSums[3], aZeroPoint, offset, k);
+                        StoreVector(a31, crow + 8, bZeroPointAddress, columnSumAddress, colBlock + 8, rowSums[3], aZeroPoint, offset, k);
+                        StoreVector(a32, crow + 16, bZeroPointAddress, columnSumAddress, colBlock + 16, rowSums[3], aZeroPoint, offset, k);
+                    }
+
+                    // 列尾巴：先按整条 8 列向量收（n 常见 320/1280，24 列块后正好剩 8），
+                    // 最后不足 8 列才逐列。
+                    for (; colBlock + 8 <= n; colBlock += 8)
+                    {
+                        var b0 = Vector256<int>.Zero;
+                        var b1 = Vector256<int>.Zero;
+                        var b2 = Vector256<int>.Zero;
+                        var b3 = Vector256<int>.Zero;
+
+                        for (int kb = 0; kb < kBlocks; kb++)
+                        {
+                            byte* bp = weights + ((long)kb * nPadded + colBlock) * 4;
+                            byte* q = paddedPointer + (long)kb * 4;
+                            var bv = Vector256.LoadUnsafe(ref *(sbyte*)bp);
+
+                            var v = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)q)).AsByte();
+                            b0 = AvxVnni.MultiplyWideningAndAdd(b0, v, bv);
+                            v = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)(q + kPadded))).AsByte();
+                            b1 = AvxVnni.MultiplyWideningAndAdd(b1, v, bv);
+                            v = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)(q + 2 * kPadded))).AsByte();
+                            b2 = AvxVnni.MultiplyWideningAndAdd(b2, v, bv);
+                            v = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)(q + 3 * kPadded))).AsByte();
+                            b3 = AvxVnni.MultiplyWideningAndAdd(b3, v, bv);
+                        }
+
+                        int* crow = (int*)cAddress + (long)rowBase * n + colBlock;
+                        StoreVector(b0, crow, bZeroPointAddress, columnSumAddress, colBlock, rowSums[0], aZeroPoint, offset, k);
+                        StoreVector(b1, crow + n, bZeroPointAddress, columnSumAddress, colBlock, rowSums[1], aZeroPoint, offset, k);
+                        StoreVector(b2, crow + 2 * n, bZeroPointAddress, columnSumAddress, colBlock, rowSums[2], aZeroPoint, offset, k);
+                        StoreVector(b3, crow + 3 * n, bZeroPointAddress, columnSumAddress, colBlock, rowSums[3], aZeroPoint, offset, k);
+                    }
+
+                    // 列尾巴（< 8 列）：逐列算，避免越界写。仍然用向量指令，只取 lane 0。
+                    for (; colBlock < n; colBlock++)
+                    {
+                        int zp = bZeroPoints[colBlock];
+                        int columnSum = columnSums[colBlock];
+                        int bias = aZeroPoint * (zp * k - columnSum);
+
+                        for (int r = 0; r < 4; r++)
+                        {
+                            byte* q = paddedPointer + (long)r * kPadded;
+                            int acc = 0;
+                            for (int kb = 0; kb < kBlocks; kb++)
+                            {
+                                byte* bp = weights + ((long)kb * nPadded + colBlock) * 4;
+                                var bVec = Vector256.LoadUnsafe(ref *(sbyte*)bp);
+                                var aVec = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref *(byte*)(q + kb * 4))).AsByte();
+                                acc += AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, aVec, bVec).GetElement(0);
+                            }
+
+                            int* crow = (int*)cAddress + (long)(rowBase + r) * n + colBlock;
+                            crow[0] = acc + (offset - zp) * rowSums[r] + bias;
+                        }
+                    }
+                }
+            }
+
+            if ((long)m * k * n >= ParallelThreshold && blocks > 1)
+                Threading.ParallelRange.ForEach(blocks, index => Block(index * 4));
+            else
+                for (int index = 0; index < blocks; index++)
+                    Block(index * 4);
+        }
+    }
+
+    /// <summary>
+    /// 把一条 8 列（i32 lane）的累加器补上 zero-point 修正并按向量写回：
+    /// <c>acc + (offset − bzp)·Σa − azp·Σb + azp·bzр·K</c>，后半段合并成
+    /// <c>azp·(bzp·K − Σb)</c>，整体两次 <c>vpmulld</c> + 两次 <c>vpaddd</c>。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreVector(
+        Vector256<int> acc,
+        int* destination,
+        nint bZeroPointAddress,
+        nint columnSumAddress,
+        int column,
+        int rowSum,
+        int aZeroPoint,
+        int zeroPointOffset,
+        int k)
+    {
+        var zeroPoints = Vector256.LoadUnsafe(ref *(int*)(bZeroPointAddress + (long)column * sizeof(int)));
+        var columnSums = Vector256.LoadUnsafe(ref *(int*)(columnSumAddress + (long)column * sizeof(int)));
+
+        var correction = Avx2.Add(
+            Avx2.MultiplyLow(Vector256.Subtract(Vector256.Create(zeroPointOffset), zeroPoints), Vector256.Create(rowSum)),
+            Avx2.MultiplyLow(
+                Vector256.Create(aZeroPoint),
+                Avx2.Subtract(Avx2.MultiplyLow(zeroPoints, Vector256.Create(k)), columnSums)));
+
+        Avx2.Add(acc, correction).StoreUnsafe(ref *destination);
     }
 
     private static unsafe void MultiplyVnni(
@@ -289,31 +553,58 @@ public static class Int8Gemm
                 for (int i = k; i < kPadded; i++)
                     padded[i] = 0;
 
-                for (int colBlock = 0; colBlock < n; colBlock += 8)
+                // 收尾：把一条 8 列（i32 lane）的累加器写回 cRow，并补 zero-point 修正。
+                void Store8(Vector256<int> acc, int colStart)
                 {
-                    var acc = Vector256<int>.Zero;
-
-                    for (int kb = 0; kb < kBlocks; kb++)
-                    {
-                        uint dword = Unsafe.ReadUnaligned<uint>(ref padded[kb * 4]);
-                        var aVec = Vector256.Create(dword).AsByte();
-
-                        byte* bp = weights + ((long)kb * nPadded + colBlock) * 4;
-                        var bVec = Vector256.LoadUnsafe(ref *bp).AsSByte();
-
-                        acc = AvxVnni.MultiplyWideningAndAdd(acc, aVec, bVec);
-                    }
-
-                    int lanes = Math.Min(8, n - colBlock);
+                    int lanes = Math.Min(8, n - colStart);
                     for (int j = 0; j < lanes; j++)
                     {
-                        int col = colBlock + j;
+                        int col = colStart + j;
                         int zp = bZeroPoints[col];
                         cRow[col] = acc.GetElement(j)
                                     + (offset - zp) * rowSum
                                     - aZeroPoint * columnSums[col]
                                     + aZeroPoint * zp * k;
                     }
+                }
+
+                int colBlock = 0;
+                // 4 组 × 8 列一起做：同一 kBlock 的 a 广播只做一次，喂给 4 条 dpbusd，
+                // 且 4 个累加器互相独立（vpdpbusd 延迟 ~4 cycle，单链会把 IPC 压到 1/4）。
+                for (; colBlock + 32 <= n; colBlock += 32)
+                {
+                    var acc0 = Vector256<int>.Zero;
+                    var acc1 = Vector256<int>.Zero;
+                    var acc2 = Vector256<int>.Zero;
+                    var acc3 = Vector256<int>.Zero;
+
+                    for (int kb = 0; kb < kBlocks; kb++)
+                    {
+                        var aVec = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref padded[kb * 4])).AsByte();
+                        byte* bp = weights + ((long)kb * nPadded + colBlock) * 4;
+
+                        acc0 = AvxVnni.MultiplyWideningAndAdd(acc0, aVec, Vector256.LoadUnsafe(ref *(sbyte*)bp).AsSByte());
+                        acc1 = AvxVnni.MultiplyWideningAndAdd(acc1, aVec, Vector256.LoadUnsafe(ref *(sbyte*)(bp + 32)).AsSByte());
+                        acc2 = AvxVnni.MultiplyWideningAndAdd(acc2, aVec, Vector256.LoadUnsafe(ref *(sbyte*)(bp + 64)).AsSByte());
+                        acc3 = AvxVnni.MultiplyWideningAndAdd(acc3, aVec, Vector256.LoadUnsafe(ref *(sbyte*)(bp + 96)).AsSByte());
+                    }
+
+                    Store8(acc0, colBlock);
+                    Store8(acc1, colBlock + 8);
+                    Store8(acc2, colBlock + 16);
+                    Store8(acc3, colBlock + 24);
+                }
+
+                for (; colBlock < n; colBlock += 8)
+                {
+                    var acc = Vector256<int>.Zero;
+                    for (int kb = 0; kb < kBlocks; kb++)
+                    {
+                        var aVec = Vector256.Create(Unsafe.ReadUnaligned<uint>(ref padded[kb * 4])).AsByte();
+                        byte* bp = weights + ((long)kb * nPadded + colBlock) * 4;
+                        acc = AvxVnni.MultiplyWideningAndAdd(acc, aVec, Vector256.LoadUnsafe(ref *(sbyte*)bp).AsSByte());
+                    }
+                    Store8(acc, colBlock);
                 }
             }
 
