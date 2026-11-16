@@ -33,31 +33,44 @@ namespace OnnxSharp.Ops;
 /// </summary>
 internal static class AttentionOps
 {
+    /// <summary>
+    /// 超过这个序列长度就改用 GEMM 分块内核（<see cref="ComputeBlocks"/>）。
+    /// <para>
+    /// <see cref="ComputeRows"/> 逐行做点积 + axpy，每行都要把整个 K/V 平面重读一遍，
+    /// 只有在 K/V 平面小到能留在 L1/L2 且 hsum 开销被摊薄时（ASR 的 T=76）才划算；
+    /// T=257 时它比图上的 MatMul+Softmax 慢一倍（66 ms vs 33 ms）。
+    /// GEMM 分块把 S 块按 <c>[T][T]</c>（T=257 时 264 KB）算出来，两趟 GEMM 之间不落地，
+    /// 于是既拿到 GEMM 的算术密度，又没有 6.3 MB 的 scores 帧缓冲往返。
+    /// </para>
+    /// <para><c>ONNXSHARP_ATTN_BLOCK_SEQ</c> 设默认值（0 = 全部走 GEMM 分块）。</para>
+    /// <para>
+    /// 可写（<c>ab</c> 子命令要在同一进程里 A/B 两套内核）；层在构造时<b>捕获</b>当时的取值，
+    /// 于是两套配置建出来的两个引擎各自保留自己的内核选择 —— 建完图再改不影响已建的层。
+    /// </para>
+    /// </summary>
+    internal static int BlockKernelMinSeq
+    {
+        get => _blockKernelMinSeq;
+        set => _blockKernelMinSeq = value >= 0 ? value : 0;
+    }
+
+    private static int _blockKernelMinSeq =
+        int.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_BLOCK_SEQ"), out int blockSeq)
+            && blockSeq >= 0
+            ? blockSeq
+            : 128;
+
     public static void Register()
         => LayerRegistry.Register("FusedAttention", p => new AttentionLayer(p));
 
     private sealed class AttentionLayer : Layer
     {
-        /// <summary>
-        /// 超过这个序列长度就改用 GEMM 分块内核（<see cref="ComputeBlocks"/>）。
-        /// <para>
-        /// <see cref="ComputeRows"/> 逐行做点积 + axpy，每行都要把整个 K/V 平面重读一遍，
-        /// 只有在 K/V 平面小到能留在 L1/L2 且 hsum 开销被摊薄时（ASR 的 T=76）才划算；
-        /// T=257 时它比图上的 MatMul+Softmax 慢一倍（66 ms vs 33 ms）。
-        /// GEMM 分块把 S 块按 <c>[T][T]</c>（T=257 时 264 KB）算出来，两趟 GEMM 之间不落地，
-        /// 于是既拿到 GEMM 的算术密度，又没有 6.3 MB 的 scores 帧缓冲往返。
-        /// </para>
-        /// <para><c>ONNXSHARP_ATTN_BLOCK_SEQ</c> 可覆盖（0 = 全部走 GEMM 分块）。</para>
-        /// </summary>
-        private static readonly int BlockKernelMinSeq =
-            int.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_BLOCK_SEQ"), out int blockSeq)
-                && blockSeq >= 0
-                ? blockSeq
-                : 128;
-
         private readonly float _scale;
         private readonly int _heads;
         private readonly bool _outputHeadSpace;
+
+        /// <summary>本层构造时的 <see cref="AttentionOps.BlockKernelMinSeq"/>（引擎级快照）。</summary>
+        private readonly int _blockMinSeq;
 
         public AttentionLayer(LayerParams parameters)
         {
@@ -66,6 +79,7 @@ internal static class AttentionOps
             _scale = (float)parameters.GetFloat("scale", 1.0);
             _heads = (int)parameters.GetInt("heads", 0);
             _outputHeadSpace = parameters.GetInt("output_head_space", 0) != 0;
+            _blockMinSeq = BlockKernelMinSeq;
         }
 
         private (int B, int H, int T, int D) Resolve(IReadOnlyList<TensorShape> shapes)
@@ -234,7 +248,7 @@ internal static class AttentionOps
                             }
                         });
 
-                        if (t > BlockKernelMinSeq)
+                        if (t > _blockMinSeq)
                         {
                             ComputeBlocks(b, h, t, d, width, headsForm, qStrideT, vStrideT,
                                 pm, maskBatch, maskRow, pq, pv, po, keysBuffer, b * t * width);

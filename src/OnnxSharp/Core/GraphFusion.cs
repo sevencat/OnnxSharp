@@ -854,9 +854,20 @@ internal static class GraphFusion
     /// rf-detr 的 T=1028 走分块内核后，微模型上 6 层 attention 从 43~46 ms 掉到
     /// 15.7~18.4 ms（bench.md §19），所以阈值放到 4096，图上 MatMul+Softmax 只在
     /// 更极端的序列长度上才更省。
-    /// <para><c>ONNXSHARP_ATTN_FUSE_MAXSEQ</c> 可覆盖（0 = 一律不融合，用于 A/B）。</para>
+    /// <para><c>ONNXSHARP_ATTN_FUSE_MAXSEQ</c> 设默认值（0 = 一律不融合）。</para>
+    /// <para>
+    /// 可写：<c>ab</c> 子命令要在同一个进程里用两套配置各建一个引擎（融合发生在
+    /// <see cref="Run"/> 建图期，只能靠重新建图来切换）。默认值仍然来自环境变量，
+    /// 不设就等于 4096。
+    /// </para>
     /// </summary>
-    private static readonly int AttentionFusionMaxSeq =
+    internal static int AttentionFusionMaxSeq
+    {
+        get => _attentionFusionMaxSeq;
+        set => _attentionFusionMaxSeq = value >= 0 ? value : 0;
+    }
+
+    private static int _attentionFusionMaxSeq =
         int.TryParse(Environment.GetEnvironmentVariable("ONNXSHARP_ATTN_FUSE_MAXSEQ"), out int maxSeq)
             && maxSeq >= 0
             ? maxSeq
