@@ -35,6 +35,10 @@
 
 这个引擎能写出来，主要是站在 **SimdYolo** 和 **OpenCV 5 `dnn`** 的肩膀上：算子语义、预处理约定、性能基线和验证方法都大量借鉴了它们。感谢两个项目的作者与贡献者，具体借鉴点见 [致谢](#致谢)。
 
+> **声明**：这是一个**用来学习的项目**，目的是搞懂「一个 ONNX 运行时到底是怎么跑起来的」，不是生产级推理框架。
+> 所以**一定会有不少 bug** —— 少见算子、边缘 dtype、异常路径的覆盖都不完整，版本之间也可能有行为变化。
+> 拿它跑通模型、做对照实验没问题；上生产请优先用 ONNXRuntime、SimdYolo、SimdPaddleOCR（`Sdcb.SimdPaddleOCR`）、OpenCV 5 `dnn` 这类成熟实现。踩到问题欢迎开 [issue](https://github.com/sevencat/OnnxSharp/issues)。
+
 ### 只做 CPU，且只用 4 个核
 
 | | |
@@ -862,8 +866,6 @@ bench/                四引擎 × 6 模型的对照脚本与产物
 - ONNX Importer 的组织方式（算子注册、常量折叠时机、形状推断的位置）提供了可参照的骨架。
 - **性能基线**：每一轮优化都以「不劣于本机 OpenCV 5 dnn」为目标，`upstream.lock` 里锁定的就是这条对照线；`bench/` 下的对照脚本与 [bench.md](bench.md) 的结论都以它为参照。
 
-> 说明：OnnxSharp 是独立实现，**不包含**上述项目的任何源码；文中所有对齐数据与性能数字都来自对它们公开接口的实测。
-
 ---
 
 ## English
@@ -877,6 +879,10 @@ bench/                四引擎 × 6 模型的对照脚本与产物
 Semantics follow OpenCV 5 `dnn` and SimdYolo; the engine is within **1.15–1.30×** of OpenCV on the reference machine (see [Performance](#performance)).
 
 This engine stands on the shoulders of **SimdYolo** and **OpenCV 5 `dnn`**: operator semantics, preprocessing conventions, performance baselines and the validation methodology are heavily borrowed from both. Thanks to their authors and contributors — details in [Acknowledgements](#acknowledgements).
+
+> **Disclaimer**: this is a **learning project** — its purpose is to understand how an ONNX runtime actually works, not to be a production inference framework.
+> So **it certainly has plenty of bugs**: rare operators, edge-case dtypes and error paths are not fully covered, and behaviour may change between versions.
+> Running models and comparison experiments is fine; for production, prefer mature implementations such as ONNXRuntime, SimdYolo, SimdPaddleOCR (`Sdcb.SimdPaddleOCR`) or OpenCV 5 `dnn`. Bug reports are welcome via [Issues](https://github.com/sevencat/OnnxSharp/issues).
 
 ### CPU only, and only 4 cores
 
@@ -1489,8 +1495,6 @@ This engine was not invented from scratch — it re-implements, in a different s
 - The **de-facto standard** for operator edge cases: bilinear behaviour and out-of-range handling in `Resize` / `GridSample` / `Pad` / `Slice`, the `INTER_LINEAR` half-pixel convention, `Conv` auto_pad semantics. When in doubt, its output wins.
 - Its ONNX importer layout (operator registration, constant-folding timing, where shape inference sits) provided a skeleton to follow.
 - **The performance baseline**: every optimisation round targeted "no slower than OpenCV 5 dnn on this machine", which is exactly what `upstream.lock` pins down. The scripts under `bench/` and the results in [bench.md](bench.md) are measured against it.
-
-> OnnxSharp is an independent implementation and contains **no** source code from those projects; every alignment figure and timing above comes from exercising their public interfaces.
 
 ---
 
