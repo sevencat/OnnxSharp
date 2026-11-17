@@ -12,34 +12,35 @@
 
 ## 一、慢多少：三个对手，全部比它快
 
-数据来自 `bench.md`，同会话轮转、`min` 口径（`median` 对后台负载太敏感，不作准）。
+数据来自 `bench.md §37.3`（2026-11-17 四引擎同会话、每轮轮转、各取最好一轮）。
 
-### 1. 目标检测（yolo11n，640×640，纯 forward）
+### 1. 目标检测（yolo11n，640×640，纯 forward，4 线程，median）
 
-| 引擎 | min (ms) | 相对 OnnxSharp |
+| 引擎 | median (ms) | 相对 OnnxSharp |
 |---|---:|---|
-| **OnnxSharp** | **28.0** | — |
-| ONNXRuntime CPU | 19.9 | **快 1.4×** |
-| SimdYolo | 15.9 | **快 1.8×** |
-| OpenCV 5 `dnn` | 23.1 | 快 1.2× |
+| **OnnxSharp** | **30.4** | — |
+| ONNXRuntime CPU | 23.8 | **快 1.28×** |
+| SimdYolo | 31.2 | 我们略快（0.97×） |
+| OpenCV 5 `dnn` | 48.8 | 慢 1.6× |
 
-这里每个引擎都用自己的默认线程数。SimdYolo 能吃到 16 线程，而 OnnxSharp 内部只给 4 个，所以差距被放大到 1.8×。
-把双方都钉到 4 线程，yolo11n 会变成 29.2 vs 32.2 ms（OnnxSharp 略快）、yolo11s 79.7 vs 78.7 ms（打平）——
-**但"把对手限制到 4 线程才打平"本身就是一种落后**，不能拿它当成绩。
+四个引擎都在 4 线程（本项目的基准口径）。早先 OnnxSharp 默认只给 4 个线程、SimdYolo 吃到 16 个，
+差距被放大到 1.8×；现在默认线程是**物理核数（16）**，这个类型差已经不存在。
+`s` 档同样打平：yolo11s 76.6 vs SimdYolo 77.8、yolov8s 90.2 vs 83.2（我们慢 8%）。
 
-即使都在 4 线程，ORT 仍然稳定快 1.06~1.26×（F32 图），int8 的 decoder 快 **1.67×**（它用 `vpdpbusd`，
+对 ORT 仍稳定落后 1.05~1.28×（F32 图），int8 的 decoder 落后 **1.67×**（它用 `vpdpbusd`，
 OnnxSharp 走的是 F32 路径）。
 
 ### 2. OCR（PP-OCRv6 tiny，同一套 det/cls/rec 模型、同一份像素）
 
-对手是 `Sdcb.SimdPaddleOCR 2.0.0`，4 线程：
+对手是 `Sdcb.SimdPaddleOCR 2.0.0`，4 线程，同会话 median：
 
-| 图 | OnnxSharp | SimdPaddleOCR | 慢 |
-|---|---:|---:|---:|
-| 900×300，2 行（min） | 34.8 ms | 18.2 ms | **1.9×** |
-| 大图，3 行（min） | 59.7 ms | 34.3 ms | **1.7×** |
+| 图 | OnnxSharp | SimdPaddleOCR | 慢 | 2026-11-16 时 |
+|---|---:|---:|---:|---:|
+| 900×300，2 行 | 40.5 ms | 33.0 ms | **1.23×** | 1.9×（34.8 / 18.2，min） |
+| 大图，3 行 | 53.3 ms | 47.7 ms | **1.12×** | 1.7×（59.7 / 34.3，min） |
 
-这是**最大的单项差距**：光 `det` 一项（19.7 ms）就比对方整条管线（18.2 ms）还慢。文本结果一致，纯粹是慢。
+分段（安静窗口 min）：det 13.2 / cls 1.6 / rec 2.9，端到端 24.2 ms —— 11-16 时是 det 17.9 / rec 4.4、端到端 34.3。
+此前「光 `det` 一项就比对方整条管线还慢」已经不再成立，剩下的差距没有单项超过 5%（`bench.md` §37.2）。
 
 ### 3. 语音（sherpa Paraformer int8，中文）
 
@@ -50,7 +51,7 @@ OnnxSharp 走的是 F32 路径）。
 
 ### 4. 连 int8 都不如别人的 fp32
 
-YuNet 人脸检测的 int8 版本能跑，但比同一模型的 fp32 版**慢 2.9×**（每层多两趟 f32 物化）。
+YuNet 人脸检测的 int8 版本能跑，但比同一模型的 fp32 版**慢 3.5×**（20.3 vs 5.7 ms，每层多两趟 f32 物化）。
 别家上 int8 是加速，这个项目上 int8 是自残 —— 至今没修好。
 
 **一句话总结**：想快，用 ONNXRuntime（CPU）、SimdYolo（YOLO 系）、`Sdcb.SimdPaddleOCR`（OCR）、
@@ -92,7 +93,7 @@ OCR 的 `det` 单项就慢过对方整条管线，作者能给的解释只有"�
 CIF 再手工移植一遍。这不叫设计，这叫躲。
 
 **7. int8 做成负优化。**
-YuNet 的 int8 比 fp32 慢 2.9×，三条优化尝试（见 `bench.md` §36）全部中性或负收益，最后只能关掉。
+YuNet 的 int8 比 fp32 慢 3.5×，三条优化尝试（见 `bench.md` §36）全部中性或负收益，最后只能关掉。
 别人做 int8 是为了快 2~4×，这里做 int8 是为了多一条"支持"的条目。
 
 **8. 微基准救了几次，说明 review 时看不出来。**
@@ -234,7 +235,7 @@ Console.WriteLine(asr.TranscribeWav("test.wav").Text);
 ### 3.5 线程数
 
 ```powershell
-$env:ONNXSHARP_THREADS = "4"     # 默认 = Environment.ProcessorCount
+$env:ONNXSHARP_THREADS = "4"     # 默认 = 物理核数（不是逻辑核数）
 ```
 
 基准里的性能数字都是 4 线程下给的，因为目标场景是"这进程只是众多服务之一"。想要好看的跑分可以设大，
@@ -245,7 +246,7 @@ $env:ONNXSHARP_THREADS = "4"     # 默认 = Environment.ProcessorCount
 ## 四、遇到慢的时候怎么自查
 
 1. `profile --top 15` 看热点是不是落在某一层卷积上（YuNet 的 `Conv_0` 一层就占 forward 的 15%）；
-2. 确认模型没走 int8：int8 在这个项目里不但不加速，反而可能慢 2.9×；
+2. 确认模型没走 int8：int8 在这个项目里不但不加速，反而可能慢 3.5×；
 3. 确认 `--iters 40`，否则量到的是 JIT 冷启动；
 4. 确认没有别的进程抢核（`bench.md` 里整轮数据作废过一次，就是 `SC2_x64` 满载）；
 5. 还慢就用 ORT。真的，不丢人。

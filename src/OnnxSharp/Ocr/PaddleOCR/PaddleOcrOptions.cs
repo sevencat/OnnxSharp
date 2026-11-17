@@ -38,4 +38,10 @@ public sealed class PaddleOcrOptions
 
     /// <summary>识别网络的缓存份数（宽度分桶，每档一份图）。</summary>
     public int RecShapeCacheSize { get; set; } = 8;
+
+    /// <summary>
+    /// 收集分段耗时（预处理 / det / 后处理 / cls / rec），结果放在
+    /// <see cref="PaddleOcrPipeline.LastTimings"/>。默认关闭，关掉时不付计时开销。
+    /// </summary>
+    public bool CollectTimings { get; set; }
 }

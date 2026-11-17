@@ -15,6 +15,21 @@ namespace OnnxSharp.Ops;
 /// </summary>
 internal static class DnnOps
 {
+    /// <summary>
+    /// 池化的几个形状专用内核（<c>ONNXSHARP_POOL_FAST=0</c> 关闭）。
+    /// 供 <c>OnnxSharp.Cli ab</c> 同进程交替 A/B：两条路径输出应当逐位一致。
+    /// </summary>
+    public static bool FastPool { get; set; } = EnvFlag("ONNXSHARP_POOL_FAST");
+
+    /// <summary>
+    /// nearest 2× 上采样专用内核（<c>ONNXSHARP_RESIZE_FAST=0</c> 关闭），同样只为一件事：
+    /// 能和通用查表路径同进程对照。
+    /// </summary>
+    public static bool FastResize2x { get; set; } = EnvFlag("ONNXSHARP_RESIZE_FAST");
+
+    private static bool EnvFlag(string name)
+        => !string.Equals(Environment.GetEnvironmentVariable(name), "0", StringComparison.Ordinal);
+
     public static void Register()
     {
         LayerRegistry.Register("Conv", p => new ConvLayer(p));
@@ -492,6 +507,14 @@ internal static class DnnOps
         private readonly int _groups;
         private readonly string _autoPad;
 
+        /// <summary>
+        /// <c>stride == kernel</c> 专用内核的开关（<c>ONNXSHARP_CONVTRANSPOSE_FAST=0</c> 关闭），
+        /// 供 A/B 与回归比对：两条路径应当逐位一致。
+        /// </summary>
+        private static readonly bool StrideEqualsKernelEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("ONNXSHARP_CONVTRANSPOSE_FAST"), "0",
+                StringComparison.Ordinal);
+
         /// <summary>重排后的权重（缓存），顺序 <c>[groups, kH, kW, Cin/groups, Cout/groups]</c>。</summary>
         private float[]? _packed;
         private Tensor? _packedSource;
@@ -650,6 +673,17 @@ internal static class DnnOps
                 IntPtr ppk = (IntPtr)pp;
                 IntPtr pout = (IntPtr)py;
 
+                // stride == kernel 且无 padding（DB / FPN 的 2× 上采样全是这种）：输出像素与输入像素
+                // 一一对应、相位固定，可以直接按相位展开成「1×1 卷积」，不必每像素做 `% stride` 和边界判断。
+                if (StrideEqualsKernelEnabled && _groups == 1 && dH == 1 && dW == 1 && sH == kH && sW == kW
+                    && pT == 0 && pL == 0 && outH == inH * sH && outW == inW * sW)
+                {
+                    ForwardStrideEqualsKernel(px, pp, py, biasArray,
+                        batches, inChannels, inH, inW, outChannels, outH, outW,
+                        kH, kW, sH, sW, inPerGroup, outPerGroup, inPlane, outPlane);
+                    return;
+                }
+
                 ParallelRange.For(tasks, (begin, end) =>
                 {
                     float* x0 = (float*)pin;
@@ -770,6 +804,301 @@ internal static class DnnOps
         }
 
         /// <summary>
+        /// <c>stride == kernel</c>、<c>dilation = 1</c>、<c>pad = 0</c>、<c>group = 1</c> 的专用路径。
+        /// <para>
+        /// 这种参数下每个输出像素 <c>(iy*sH+ky, ix*sW+kx)</c> 只由输入像素 <c>(iy, ix)</c> 贡献（唯一 tap），
+        /// 于是整层等价于 <c>kH*kW</c> 个 1×1 卷积。通用路径要为每个输出像素做两次 <c>% stride</c>、
+        /// 两次整除和边界判断 —— DB 检出的 2× 上采样（1→1 通道）算力几乎为零，时间全花在这些判断上。
+        /// </para>
+        /// </summary>
+        private static unsafe void ForwardStrideEqualsKernel(
+            float* x0, float* w0, float* y0, float[]? biasArray,
+            int batches, int inChannels, int inH, int inW,
+            int outChannels, int outH, int outW,
+            int kH, int kW, int sH, int sW,
+            int inPerGroup, int outPerGroup,
+            long inPlane, long outPlane)
+        {
+            int threads = ParallelRange.Threads;
+            int blocks = Math.Min(inH, Math.Max(1, threads * 2));
+            int rowsPerBlock = Math.Max(1, (inH + blocks - 1) / blocks);
+            blocks = (inH + rowsPerBlock - 1) / rowsPerBlock;
+
+            // 单输出通道（DB 检出的最后一层 1→1 上采样）：按 ci 外层 + 行缓冲累加。
+            // 「每像素读 16 个跨平面 float」的写法在 258k 像素上要 2 ms，改成行内连续累加、
+            // 整行连续写回后降到 0.3 ms 量级。
+            if (outPerGroup == 1 && kW == sW && inW <= 8192)
+            {
+                float bias = biasArray is null ? 0f : biasArray[0];
+                int singleTasks = batches * kH * blocks;
+
+                ParallelRange.For(singleTasks, (begin, end) =>
+                {
+                    float[] lineBuf = ArrayPool<float>.Shared.Rent(kW * inW);
+                    try
+                    {
+                        fixed (float* lb = lineBuf)
+                        {
+                            for (int task = begin; task < end; task++)
+                            {
+                                int block = task % blocks;
+                                int rest = task / blocks;
+                                int ky = rest % kH;
+                                int b = rest / kH;
+
+                                int iyBegin = block * rowsPerBlock;
+                                int iyEnd = Math.Min(inH, iyBegin + rowsPerBlock);
+                                if (iyBegin >= iyEnd)
+                                    continue;
+
+                                float* xBatch = x0 + (long)b * inChannels * inPlane;
+                                long outBatch = (long)b * outChannels * outPlane;
+                                float* wKy = w0 + (long)ky * kW * inPerGroup;
+
+                                for (int iy = iyBegin; iy < iyEnd; iy++)
+                                {
+                                    float* xRow = xBatch + (long)iy * inW;
+                                    float* yRow = y0 + outBatch + (long)(iy * sH + ky) * outW;
+
+                                    for (int kx = 0; kx < kW; kx++)
+                                    {
+                                        float* dst = lb + (long)kx * inW;
+                                        for (int ix = 0; ix < inW; ix++)
+                                            dst[ix] = bias;
+                                    }
+
+                                    for (int ci = 0; ci < inPerGroup; ci++)
+                                    {
+                                        float* src = xRow + (long)ci * inPlane;
+
+                                        for (int kx = 0; kx < kW; kx++)
+                                        {
+                                            float w = wKy[(long)kx * inPerGroup + ci];
+                                            if (w == 0f)
+                                                continue;
+
+                                            float* dst = lb + (long)kx * inW;
+                                            int ix = 0;
+
+                                            if (Avx2.IsSupported)
+                                            {
+                                                var vw = Vector256.Create(w);
+                                                for (; ix + Vector256<float>.Count <= inW; ix += Vector256<float>.Count)
+                                                {
+                                                    var s = Avx.LoadVector256(src + ix);
+                                                    var a = Avx.LoadVector256(dst + ix);
+                                                    Avx.Store(dst + ix, Avx.Add(a, Avx.Multiply(vw, s)));
+                                                }
+                                            }
+
+                                            for (; ix < inW; ix++)
+                                                dst[ix] += w * src[ix];
+                                        }
+                                    }
+
+                                    for (int ix = 0; ix < inW; ix++)
+                                    {
+                                        int ox = ix * sW;
+                                        for (int kx = 0; kx < kW; kx++)
+                                            yRow[ox + kx] = lb[(long)kx * inW + ix];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(lineBuf);
+                    }
+                });
+                return;
+            }
+
+            // 多通道、kernel 小、行能整行进 L1/L2：同样按 ci 外层 + 行缓冲（每 co 一条输出行），
+            // 把「逐像素散写 co 个平面」换成「每行连续写」。FPN 里 16→16 的 2× 上采样走这条。
+            if (kW == sW && (long)outPerGroup * kW * inW <= (1 << 16))
+            {
+                int tiledTasks = batches * kH * blocks;
+                int bufStride = kW * inW;
+
+                ParallelRange.For(tiledTasks, (begin, end) =>
+                {
+                    float[] tileBuf = ArrayPool<float>.Shared.Rent(outPerGroup * bufStride);
+                    try
+                    {
+                        fixed (float* tb = tileBuf)
+                        {
+                            for (int task = begin; task < end; task++)
+                            {
+                                int block = task % blocks;
+                                int rest = task / blocks;
+                                int ky = rest % kH;
+                                int b = rest / kH;
+
+                                int iyBegin = block * rowsPerBlock;
+                                int iyEnd = Math.Min(inH, iyBegin + rowsPerBlock);
+                                if (iyBegin >= iyEnd)
+                                    continue;
+
+                                float* xBatch = x0 + (long)b * inChannels * inPlane;
+                                long outBatch = (long)b * outChannels * outPlane;
+
+                                for (int iy = iyBegin; iy < iyEnd; iy++)
+                                {
+                                    float* xRow = xBatch + (long)iy * inW;
+                                    float* yRows = y0 + outBatch + (long)(iy * sH + ky) * outW;
+
+                                    for (int co = 0; co < outPerGroup; co++)
+                                    {
+                                        float bv = biasArray is null ? 0f : biasArray[co];
+                                        float* dstBase = tb + (long)co * bufStride;
+                                        for (int kx = 0; kx < kW; kx++)
+                                        {
+                                            float* dst = dstBase + (long)kx * inW;
+                                            for (int ix = 0; ix < inW; ix++)
+                                                dst[ix] = bv;
+                                        }
+                                    }
+
+                                    for (int ci = 0; ci < inPerGroup; ci++)
+                                    {
+                                        float* src = xRow + (long)ci * inPlane;
+
+                                        for (int kx = 0; kx < kW; kx++)
+                                        {
+                                            float* wTap = w0 + (long)((ky * kW + kx) * inPerGroup + ci) * outPerGroup;
+
+                                            for (int co = 0; co < outPerGroup; co++)
+                                            {
+                                                float w = wTap[co];
+                                                if (w == 0f)
+                                                    continue;
+
+                                                float* dst = tb + (long)(co * kW + kx) * inW;
+                                                int ix = 0;
+
+                                                if (Avx2.IsSupported)
+                                                {
+                                                    var vw = Vector256.Create(w);
+                                                    for (; ix + Vector256<float>.Count <= inW; ix += Vector256<float>.Count)
+                                                    {
+                                                        var s = Avx.LoadVector256(src + ix);
+                                                        var a = Avx.LoadVector256(dst + ix);
+                                                        Avx.Store(dst + ix, Avx.Add(a, Avx.Multiply(vw, s)));
+                                                    }
+                                                }
+
+                                                for (; ix < inW; ix++)
+                                                    dst[ix] += w * src[ix];
+                                            }
+                                        }
+                                    }
+
+                                    for (int co = 0; co < outPerGroup; co++)
+                                    {
+                                        float* dstBase = tb + (long)co * bufStride;
+                                        float* yRow = yRows + (long)co * outPlane;
+                                        for (int ix = 0; ix < inW; ix++)
+                                        {
+                                            int ox = ix * sW;
+                                            for (int kx = 0; kx < kW; kx++)
+                                                yRow[ox + kx] = dstBase[(long)kx * inW + ix];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(tileBuf);
+                    }
+                });
+                return;
+            }
+
+            int tasks = batches * kH * blocks;
+
+            ParallelRange.For(tasks, (begin, end) =>
+            {
+                float[] accBuf = ArrayPool<float>.Shared.Rent(outPerGroup);
+                var accSpan = new Span<float>(accBuf, 0, outPerGroup);
+                try
+                {
+                    fixed (float* acc = accBuf)
+                    {
+                        for (int task = begin; task < end; task++)
+                        {
+                            int block = task % blocks;
+                            int rest = task / blocks;
+                            int ky = rest % kH;
+                            int b = rest / kH;
+
+                            int iyBegin = block * rowsPerBlock;
+                            int iyEnd = Math.Min(inH, iyBegin + rowsPerBlock);
+                            if (iyBegin >= iyEnd)
+                                continue;
+
+                            float* xBatch = x0 + (long)b * inChannels * inPlane;
+                            long outBatch = (long)b * outChannels * outPlane;
+                            float* wKy = w0 + (long)ky * kW * inPerGroup * outPerGroup;
+
+                            for (int iy = iyBegin; iy < iyEnd; iy++)
+                            {
+                                long outRow = outBatch + (long)(iy * sH + ky) * outW;
+                                long inRow = (long)iy * inW;
+
+                                for (int ix = 0; ix < inW; ix++)
+                                {
+                                    for (int kx = 0; kx < kW; kx++)
+                                    {
+                                        if (biasArray is null)
+                                            accSpan.Clear();
+                                        else
+                                            biasArray.AsSpan(0, outPerGroup).CopyTo(accSpan);
+
+                                        float* wTap = wKy + (long)kx * inPerGroup * outPerGroup;
+                                        for (int ci = 0; ci < inPerGroup; ci++)
+                                        {
+                                            float v = xBatch[(long)ci * inPlane + inRow + ix];
+                                            if (v == 0f)
+                                                continue;
+
+                                            float* wp = wTap + (long)ci * outPerGroup;
+                                            int co = 0;
+
+                                            if (Avx2.IsSupported)
+                                            {
+                                                var vv = Vector256.Create(v);
+                                                for (; co + Vector256<float>.Count <= outPerGroup; co += Vector256<float>.Count)
+                                                {
+                                                    var a = Avx.LoadVector256(acc + co);
+                                                    var wv = Avx.LoadVector256(wp + co);
+                                                    Avx.Store(acc + co, Avx.Add(a, Avx.Multiply(vv, wv)));
+                                                }
+                                            }
+
+                                            for (; co < outPerGroup; co++)
+                                                acc[co] += v * wp[co];
+                                        }
+
+                                        float* target = y0 + outRow + (long)(ix * sW + kx);
+                                        for (int co = 0; co < outPerGroup; co++)
+                                            target[(long)co * outPlane] = acc[co];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(accBuf);
+                }
+            });
+        }
+
+        /// <summary>
         /// 把 <c>[Cin, Cout/groups, kH, kW]</c> 重排为 <c>[groups, kH, kW, Cin/groups, Cout/groups]</c>，
         /// 让 gather 内核内层的 co 维连续（可直接 8 路向量累加）。结果按权重张量实例缓存。
         /// </summary>
@@ -865,6 +1194,46 @@ internal static class DnnOps
         return (pads, strides, kernel, dilations);
     }
 
+    /// <summary>
+    /// 按「平面 × 行块」二维切分并行，回调参数是 <c>(平面, 行起点, 行终点)</c>。
+    /// <para>
+    /// 池化 / 上采样这类算子只有 16~64 个平面（1×16×H×W），而 <see cref="ParallelRange.For"/>
+    /// 在任务数少于线程数时会整段串行 —— 于是在 32 线程的机器上它们其实一直是单线程在跑。
+    /// 这里把行也切开，让任务数至少是线程数的两倍。
+    /// </para>
+    /// </summary>
+    private static void ForPlanes(int planes, int rows, Action<int, int, int> body)
+    {
+        int threads = ParallelRange.Threads;
+
+        int blocks = planes >= threads
+            ? 1
+            : Math.Min((threads * 2 + planes - 1) / planes, Math.Max(1, rows / 8));
+
+        if (blocks <= 1)
+        {
+            ParallelRange.For(planes, (begin, end) =>
+            {
+                for (int t = begin; t < end; t++)
+                    body(t, 0, rows);
+            });
+
+            return;
+        }
+
+        int chunk = (rows + blocks - 1) / blocks;
+
+        ParallelRange.ForEach(planes * blocks, task =>
+        {
+            int t = task / blocks;
+            int oy0 = (task % blocks) * chunk;
+            int oy1 = Math.Min(oy0 + chunk, rows);
+
+            if (oy0 < oy1)
+                body(t, oy0, oy1);
+        });
+    }
+
     private sealed class MaxPoolLayer : Layer
     {
         private readonly int[] _kernelShape;
@@ -941,13 +1310,72 @@ internal static class DnnOps
             if (input.DType == DType.F32 && kH == 2 && kW == 2 && sH == 2 && sW == 2
                 && dH == 1 && dW == 1 && pT == 0 && pL == 0 && Avx.IsSupported)
             {
-                ParallelRange.For(batches * channels, (begin, end) =>
-                {
-                    var plane = input.AsSpan<float>();
-                    var pooled = output.AsSpan<float>();
+                ForPlanes(batches * channels, outH, (t, oy0, oy1) =>
+                    MaxPool2x2(input.AsSpan<float>(), output.AsSpan<float>(), t, inH, inW, outH, outW, oy0, oy1));
 
-                    for (int t = begin; t < end; t++)
-                        MaxPool2x2(plane, pooled, t, inH, inW, outH, outW);
+                return;
+            }
+
+            // 2×2 / stride 1 的滑动窗口池化（DB 检测的 MaxPool.0：1×16×144×448 → 1×16×144×448）：
+            // 竖向取两行 max 到行缓冲 → 横向取相邻两列 max，两级都是 8 宽无分支。
+            if (FastPool && input.DType == DType.F32 && kH == 2 && kW == 2 && sH == 1 && sW == 1
+                && dH == 1 && dW == 1 && pT >= 0 && pT <= 1 && pL >= 0 && pL <= 1
+                && Avx2.IsSupported && inW >= 8)
+            {
+                ForPlanes(batches * channels, outH, (t, oy0, oy1) =>
+                {
+                    float[] tmp = ArrayPool<float>.Shared.Rent(inW + 16);
+                    try
+                    {
+                        unsafe
+                        {
+                            fixed (float* ps = input.AsSpan<float>())
+                            fixed (float* pd = output.AsSpan<float>())
+                            fixed (float* pt = tmp)
+                            {
+                                MaxPool2x2Stride1(ps, pd, pt, t, inH, inW, outH, outW, pT, pL, oy0, oy1);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(tmp);
+                    }
+                });
+
+                return;
+            }
+
+            // 3×3 / stride 2 的下采样池化：
+            // 走「竖向 3 行取 max 到行缓冲 + 横向去交织」的两段内核。原来的通用路径在这形状上
+            // 因为 sW ≠ 1 拿不到向量化分支，只能逐输出点做 9 次带边界的标量比较。
+            if (FastPool && input.DType == DType.F32
+                && kH == 3 && kW == 3 && sH == 2 && sW == 2
+                && dH == 1 && dW == 1 && pT >= 0 && pT <= 1 && pL >= 0 && pL <= 1
+                && Avx2.IsSupported && inW >= 16)
+            {
+                ForPlanes(batches * channels, outH, (t, oy0, oy1) =>
+                {
+                    // 行缓冲：前置 16 个哨兵 + inW 个数据 + 尾部 24 个哨兵，
+                    // 横向 8 宽加载和 -inf 填充都靠它吸收，内层循环不用判越界。
+                    int stride = MaxPoolRowPad * 2 + inW + 32;
+                    float[] row = ArrayPool<float>.Shared.Rent(stride);
+                    try
+                    {
+                        unsafe
+                        {
+                            fixed (float* ps = input.AsSpan<float>())
+                            fixed (float* pd = output.AsSpan<float>())
+                            fixed (float* pr = row)
+                            {
+                                MaxPool3x3Stride2(ps, pd, pr, t, inH, inW, outH, outW, pT, pL, oy0, oy1);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(row);
+                    }
                 });
 
                 return;
@@ -1069,14 +1497,16 @@ internal static class DnnOps
             int inH,
             int inW,
             int outH,
-            int outW)
+            int outW,
+            int oyBegin,
+            int oyEnd)
         {
             long inBase = (long)t * inH * inW;
             long outBase = (long)t * outH * outW;
 
             var evenIndex = Vector256.Create(0, 1, 4, 5, 2, 3, 6, 7);
 
-            for (int oy = 0; oy < outH; oy++)
+            for (int oy = oyBegin; oy < oyEnd; oy++)
             {
                 int y0 = oy * 2;
                 long row0 = inBase + (long)y0 * inW;
@@ -1121,6 +1551,169 @@ internal static class DnnOps
                     }
 
                     target[(int)(outRow + ox)] = best;
+                }
+            }
+        }
+
+        /// <summary>3×3/s2 池化的行缓冲前置哨兵长度（见 <see cref="MaxPool3x3Stride2"/>）。</summary>
+        private const int MaxPoolRowPad = 16;
+
+        /// <summary>
+        /// 2×2 / stride 1 的滑动窗口池化（<c>pad ∈ {0,1}</c>）：竖向把两行 max 写进行缓冲，
+        /// 横向再把相邻两列 max 取出来 —— 两级都是 8 宽、循环里没有任何判断。
+        /// <para>
+        /// 行缓冲末尾多留一个 <c>-inf</c>（<c>tmp[inW]</c>），右边界那一路窗口自然落空。
+        /// </para>
+        /// </summary>
+        private static unsafe void MaxPool2x2Stride1(
+            float* src,
+            float* dst,
+            float* row,
+            int t,
+            int inH,
+            int inW,
+            int outH,
+            int outW,
+            int pT,
+            int pL,
+            int oyBegin,
+            int oyEnd)
+        {
+            long inBase = (long)t * inH * inW;
+            long outBase = (long)t * outH * outW;
+
+            row[inW] = float.NegativeInfinity;
+
+            for (int oy = oyBegin; oy < oyEnd; oy++)
+            {
+                // pad 行用最靠内的行顶替：那一行本身就在窗口里，取 max 不变。
+                int y0 = Math.Max(oy - pT, 0);
+                int y1 = Math.Min(oy + 1 - pT, inH - 1);
+
+                float* r0 = src + inBase + (long)y0 * inW;
+                float* r1 = src + inBase + (long)y1 * inW;
+
+                int x = 0;
+                for (; x <= inW - 8; x += 8)
+                    Avx.Store(row + x, Avx.Max(Avx.LoadVector256(r0 + x), Avx.LoadVector256(r1 + x)));
+
+                for (; x < inW; x++)
+                    row[x] = MathF.Max(r0[x], r1[x]);
+
+                float* outRow = dst + outBase + (long)oy * outW;
+
+                if (pL == 0)
+                {
+                    x = 0;
+                    for (; x <= outW - 8; x += 8)
+                        Avx.Store(outRow + x, Avx.Max(Avx.LoadVector256(row + x), Avx.LoadVector256(row + x + 1)));
+
+                    for (; x < outW; x++)
+                        outRow[x] = MathF.Max(row[x], row[x + 1]);
+                }
+                else
+                {
+                    // 左 pad：首列只有右半边有值
+                    outRow[0] = row[0];
+
+                    x = 1;
+                    for (; x <= outW - 8; x += 8)
+                        Avx.Store(outRow + x, Avx.Max(Avx.LoadVector256(row + x - 1), Avx.LoadVector256(row + x)));
+
+                    for (; x < outW; x++)
+                        outRow[x] = MathF.Max(row[x - 1], row[x]);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 3×3 / stride 2 / dilation 1 的池化（<c>pad ∈ {0,1}</c>）。
+        /// <para>
+        /// 两段式：先竖向把窗口内的 3 行按 8 宽取 max 写进行缓冲，再横向把行缓冲按
+        /// 「偶列 / 奇列」去交织 —— 第 k 个输出 = <c>max(even[k], odd[k], even[k+1])</c>，
+        /// 一次算 8 个输出。
+        /// </para>
+        /// <para>
+        /// <paramref name="row"/> 的布局：<c>[0, Pad)</c> 与 <c>[Pad + inW, ...)</c> 是 <c>-inf</c> 哨兵，
+        /// 数据放在 <c>[Pad, Pad + inW)</c>。所以窗口越界与 pad 区域都自然得到 <c>-inf</c>，内层无分支。
+        /// </para>
+        /// </summary>
+        private static unsafe void MaxPool3x3Stride2(
+            float* src,
+            float* dst,
+            float* row,
+            int t,
+            int inH,
+            int inW,
+            int outH,
+            int outW,
+            int pT,
+            int pL,
+            int oyBegin,
+            int oyEnd)
+        {
+            const int Pad = MaxPoolRowPad;
+
+            long inBase = (long)t * inH * inW;
+            long outBase = (long)t * outH * outW;
+
+            float* data = row + Pad;
+
+            row[Pad - 1] = float.NegativeInfinity;
+            for (int i = 0; i < 24; i++)
+                data[inW + i] = float.NegativeInfinity;
+
+            var evenIndex = Vector256.Create(0, 1, 4, 5, 2, 3, 6, 7);
+            var shiftIndex = Vector256.Create(1, 2, 3, 4, 5, 6, 7, 0);
+
+            for (int oy = oyBegin; oy < oyEnd; oy++)
+            {
+                // 越界的行用最靠内的行顶替：pad 区域贡献 -inf，被顶替的行本身就在窗口里，取 max 不变。
+                int y0 = Math.Max(2 * oy - pT, 0);
+                int y1 = 2 * oy;
+                int y2 = Math.Min(2 * oy + 1, inH - 1);
+
+                float* r0 = src + inBase + (long)y0 * inW;
+                float* r1 = src + inBase + (long)y1 * inW;
+                float* r2 = src + inBase + (long)y2 * inW;
+
+                int x = 0;
+                for (; x <= inW - 8; x += 8)
+                {
+                    var v = Avx.Max(Avx.LoadVector256(r0 + x), Avx.LoadVector256(r1 + x));
+                    v = Avx.Max(v, Avx.LoadVector256(r2 + x));
+                    Avx.Store(data + x, v);
+                }
+
+                for (; x < inW; x++)
+                    data[x] = MathF.Max(src[inBase + (long)y0 * inW + x],
+                        MathF.Max(src[inBase + (long)y1 * inW + x], src[inBase + (long)y2 * inW + x]));
+
+                float* outRow = dst + outBase + (long)oy * outW;
+
+                int j = 0;
+                for (; j <= outW - 8; j += 8)
+                {
+                    // 窗口起点（相对行缓冲）= 2j - pL：pL = 1 时首组取到 data[-1] 的哨兵，正好是 -inf。
+                    float* b = data + 2 * j - pL;
+                    var l0 = Avx.LoadVector256(b);
+                    var l1 = Avx.LoadVector256(b + 8);
+
+                    var even = Avx2.PermuteVar8x32(Avx.Shuffle(l0, l1, 0x88), evenIndex);
+                    var odd = Avx2.PermuteVar8x32(Avx.Shuffle(l0, l1, 0xDD), evenIndex);
+
+                    // even[k+1]：组内左移一格，末位补 b[16]（即下一组的 even[0]）
+                    var next = Avx2.PermuteVar8x32(even, shiftIndex);
+                    next = Avx.Blend(next, Avx.BroadcastScalarToVector256(b + 16), 0x80);
+
+                    var best = Avx.Max(Avx.Max(even, odd), next);
+                    Avx.Store(outRow + j, best);
+                }
+
+                for (; j < outW; j++)
+                {
+                    float* b = data + 2 * j - pL;
+                    outRow[j] = MathF.Max(b[0], MathF.Max(b[1], b[2]));
                 }
             }
         }
@@ -1372,6 +1965,15 @@ internal static class DnnOps
             int padW = inW + pads[1] + pads[3];
             bool includePad = _countIncludePad;
 
+            // GlobalAveragePool（SE 模块的压缩步）：窗口覆盖整个平面、输出 1×1，
+            // 通用路径每个元素都要算四个边界半径，只有 60% 的单线程带宽。
+            if (outH == 1 && outW == 1 && kH == inH && kW == inW && sH == inH && sW == inW
+                && pT == 0 && pL == 0 && dH == 1 && dW == 1)
+            {
+                GlobalMeanPerPlane(input.AsSpan<float>(), output.AsSpan<float>(), batches * channels, inH, inW);
+                return;
+            }
+
             ParallelRange.For(batches * channels, (begin, end) =>
             {
                 var s = input.AsSpan<float>();
@@ -1420,6 +2022,93 @@ internal static class DnnOps
                     }
                 }
             });
+        }
+
+        /// <summary>
+        /// 整平面求均值（GlobalAveragePool）。每平面 <paramref name="rows"/>×<paramref name="cols"/> 个元素，
+        /// 按「平面 × 行块」切分：SE 模块只有 16~64 个平面，平面数少于线程数时只切平面等于串行。
+        /// 行内用两个累加器展开，读一遍就到带宽上限。
+        /// </summary>
+        private static unsafe void GlobalMeanPerPlane(
+            ReadOnlySpan<float> source, Span<float> target, int planes, int rows, int cols)
+        {
+            fixed (float* ps = source)
+            fixed (float* pd = target)
+            {
+                IntPtr src = (IntPtr)ps;
+                IntPtr dst = (IntPtr)pd;
+
+                int count = rows * cols;
+                int threads = ParallelRange.Threads;
+
+                // 平面数已经够铺满线程时不必再切行（部分和合并也要钱）。
+                int blocks = planes >= threads
+                    ? 1
+                    : Math.Max(1, Math.Min(threads / Math.Max(1, planes), rows / 4));
+
+                if (blocks <= 1)
+                {
+                    ParallelRange.For(planes, (begin, end) =>
+                    {
+                        for (int t = begin; t < end; t++)
+                            ((float*)dst)[t] = PlaneSum((float*)src + (long)t * count, count) / count;
+                    });
+
+                    return;
+                }
+
+                int chunk = (rows + blocks - 1) / blocks;
+                var partial = new float[planes * blocks];
+
+                ParallelRange.ForEach(planes * blocks, task =>
+                {
+                    int t = task / blocks;
+                    int y0 = (task % blocks) * chunk;
+                    int y1 = Math.Min(y0 + chunk, rows);
+
+                    partial[task] = y0 < y1
+                        ? PlaneSum((float*)src + (long)t * count + (long)y0 * cols, (y1 - y0) * cols)
+                        : 0f;
+                });
+
+                for (int t = 0; t < planes; t++)
+                {
+                    float sum = 0;
+                    for (int b = 0; b < blocks; b++)
+                        sum += partial[t * blocks + b];
+
+                    ((float*)dst)[t] = sum / count;
+                }
+            }
+        }
+
+        /// <summary>一段连续 float 的和（两路 AVX 累加，尾部标量）。</summary>
+        private static unsafe float PlaneSum(float* p, int n)
+        {
+            float sum = 0;
+            int i = 0;
+
+            if (Avx.IsSupported)
+            {
+                var acc0 = Vector256<float>.Zero;
+                var acc1 = Vector256<float>.Zero;
+
+                for (; i <= n - 16; i += 16)
+                {
+                    acc0 = Avx.Add(acc0, Avx.LoadVector256(p + i));
+                    acc1 = Avx.Add(acc1, Avx.LoadVector256(p + i + 8));
+                }
+
+                for (; i <= n - 8; i += 8)
+                    acc0 = Avx.Add(acc0, Avx.LoadVector256(p + i));
+
+                sum = Vector256.Sum(Avx.Add(acc0, acc1));
+            }
+
+            for (; i < n; i++)
+                sum += p[i];
+
+            return sum;
         }
     }
 
@@ -1576,80 +2265,176 @@ internal static class DnnOps
                 if (linear)
                     throw new OnnxSharpException($"Resize '{Name}': linear mode on {input.DType} is not supported");
 
-                ParallelRange.For(batches * channels, (begin, end) =>
-                {
-                    var s = input.AsSpan<byte>();
-                    var d = output.AsSpan<byte>();
-
-                    for (int t = begin; t < end; t++)
-                    {
-                        long inBase = (long)t * inH * inW;
-                        long outBase = (long)t * outH * outW;
-
-                        for (int oy = 0; oy < outH; oy++)
-                        {
-                            long rowIn = inBase + (long)mapY[oy] * inW;
-                            long rowOut = outBase + (long)oy * outW;
-
-                            for (int ox = 0; ox < outW; ox++)
-                                d[(int)(rowOut + ox)] = s[(int)(rowIn + mapX[ox])];
-                        }
-                    }
-                });
+                ForPlanes(batches * channels, outH, (t, oy0, oy1) =>
+                    ResizeNearestTable(input.AsSpan<byte>(), output.AsSpan<byte>(), t, inH, inW, outW,
+                        mapY, mapX, oy0, oy1));
 
                 return;
             }
 
 
-            ParallelRange.For(batches * channels, (begin, end) =>
+            // nearest 且恰好 2× 上采样（DB 的 FPN 六次 Resize 全是这一形状）：
+            // 每 8 个输入元素展开成 16 个输出，不再逐点查 mapX。
+            if (FastResize2x && !linear && outH == inH * 2 && outW == inW * 2
+                && Avx2.IsSupported && IsDoubleMap(mapY, mapX))
             {
-                var s = input.AsSpan<float>();
-                var d = output.AsSpan<float>();
+                ForPlanes(batches * channels, outH, (t, oy0, oy1) =>
+                    ResizeNearest2x(input.AsSpan<float>(), output.AsSpan<float>(), t, inW, outH, outW, oy0, oy1));
 
-                for (int t = begin; t < end; t++)
+                return;
+            }
+
+            ForPlanes(batches * channels, outH, (t, oy0, oy1) =>
+            {
+                if (linear)
                 {
-                    long inBase = (long)t * inH * inW;
-                    long outBase = (long)t * outH * outW;
-
-                    if (!linear)
-                    {
-                        for (int oy = 0; oy < outH; oy++)
-                        {
-                            long rowIn = inBase + (long)mapY[oy] * inW;
-                            long rowOut = outBase + (long)oy * outW;
-
-                            for (int ox = 0; ox < outW; ox++)
-                                d[(int)(rowOut + ox)] = s[(int)(rowIn + mapX[ox])];
-                        }
-
-                        continue;
-                    }
-
-                    for (int oy = 0; oy < outH; oy++)
-                    {
-                        int y0 = mapY[oy];
-                        int y1 = Math.Min(y0 + 1, inH - 1);
-                        double wy = wyTab![oy];
-                        double iwy = 1 - wy;
-                        long topBase = inBase + (long)y0 * inW;
-                        long bottomBase = inBase + (long)y1 * inW;
-                        long rowOut = outBase + (long)oy * outW;
-
-                        for (int ox = 0; ox < outW; ox++)
-                        {
-                            int x0 = mapX[ox];
-                            int x1 = Math.Min(x0 + 1, inW - 1);
-                            double wx = wxTab![ox];
-                            double iwx = 1 - wx;
-
-                            double top = s[(int)(topBase + x0)] * iwx + s[(int)(topBase + x1)] * wx;
-                            double bottom = s[(int)(bottomBase + x0)] * iwx + s[(int)(bottomBase + x1)] * wx;
-
-                            d[(int)(rowOut + ox)] = (float)(top * iwy + bottom * wy);
-                        }
-                    }
+                    ResizeBilinear(input.AsSpan<float>(), output.AsSpan<float>(), t, inH, inW, outW,
+                        mapY, mapX, wyTab!, wxTab!, oy0, oy1);
+                }
+                else
+                {
+                    ResizeNearestTable(input.AsSpan<float>(), output.AsSpan<float>(), t, inH, inW, outW,
+                        mapY, mapX, oy0, oy1);
                 }
             });
+        }
+
+        /// <summary>按查表取最近邻的一层（float / u8 共用）。</summary>
+        private static void ResizeNearestTable<T>(
+            ReadOnlySpan<T> source,
+            Span<T> target,
+            int t,
+            int inH,
+            int inW,
+            int outW,
+            int[] mapY,
+            int[] mapX,
+            int oyBegin,
+            int oyEnd)
+            where T : unmanaged
+        {
+            int outH = mapY.Length;
+            long inBase = (long)t * inH * inW;
+            long outBase = (long)t * outH * outW;
+
+            for (int oy = oyBegin; oy < oyEnd; oy++)
+            {
+                long rowIn = inBase + (long)mapY[oy] * inW;
+                long rowOut = outBase + (long)oy * outW;
+
+                for (int ox = 0; ox < outW; ox++)
+                    target[(int)(rowOut + ox)] = source[(int)(rowIn + mapX[ox])];
+            }
+        }
+
+        /// <summary>双线性插值的一层：行内两个权重来自 <paramref name="wyTab"/> / <paramref name="wxTab"/>。</summary>
+        private static void ResizeBilinear(
+            ReadOnlySpan<float> source,
+            Span<float> target,
+            int t,
+            int inH,
+            int inW,
+            int outW,
+            int[] mapY,
+            int[] mapX,
+            double[] wyTab,
+            double[] wxTab,
+            int oyBegin,
+            int oyEnd)
+        {
+            int outH = mapY.Length;
+            long inBase = (long)t * inH * inW;
+            long outBase = (long)t * outH * outW;
+
+            for (int oy = oyBegin; oy < oyEnd; oy++)
+            {
+                int y0 = mapY[oy];
+                int y1 = Math.Min(y0 + 1, inH - 1);
+                double wy = wyTab[oy];
+                double iwy = 1 - wy;
+
+                long topBase = inBase + (long)y0 * inW;
+                long bottomBase = inBase + (long)y1 * inW;
+                long rowOut = outBase + (long)oy * outW;
+
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    int x0 = mapX[ox];
+                    int x1 = Math.Min(x0 + 1, inW - 1);
+                    double wx = wxTab[ox];
+                    double iwx = 1 - wx;
+
+                    double top = source[(int)(topBase + x0)] * iwx + source[(int)(topBase + x1)] * wx;
+                    double bottom = source[(int)(bottomBase + x0)] * iwx + source[(int)(bottomBase + x1)] * wx;
+
+                    target[(int)(rowOut + ox)] = (float)(top * iwy + bottom * wy);
+                }
+            }
+        }
+
+        /// <summary>映射表是不是纯粹的「2 倍上采样」（<c>map[i] == i / 2</c>）。</summary>
+        private static bool IsDoubleMap(int[] mapY, int[] mapX)
+        {
+            for (int i = 0; i < mapY.Length; i++)
+            {
+                if (mapY[i] != i / 2)
+                    return false;
+            }
+
+            for (int i = 0; i < mapX.Length; i++)
+            {
+                if (mapX[i] != i / 2)
+                    return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// nearest 2× 上采样的一层：行顺序由 <c>mapY = oy / 2</c> 自动给出，
+        /// 行内每 8 个输入元素用两次 <c>vpermd</c> 展开成 16 个输出。
+        /// </summary>
+        private static unsafe void ResizeNearest2x(
+            ReadOnlySpan<float> source,
+            Span<float> target,
+            int t,
+            int inW,
+            int outH,
+            int outW,
+            int oyBegin,
+            int oyEnd)
+        {
+            int inH = outH / 2;
+            long inBase = (long)t * inH * inW;
+            long outBase = (long)t * outH * outW;
+
+            var lowIndex = Vector256.Create(0, 0, 1, 1, 2, 2, 3, 3);
+            var highIndex = Vector256.Create(4, 4, 5, 5, 6, 6, 7, 7);
+
+            fixed (float* ps = source)
+            fixed (float* pd = target)
+            {
+                for (int oy = oyBegin; oy < oyEnd; oy++)
+                {
+                    float* srcRow = ps + inBase + (long)(oy / 2) * inW;
+                    float* outRow = pd + outBase + (long)oy * outW;
+
+                    int x = 0;
+                    for (; x <= inW - 8; x += 8)
+                    {
+                        var v = Avx.LoadVector256(srcRow + x);
+                        Avx.Store(outRow + 2 * x, Avx2.PermuteVar8x32(v, lowIndex));
+                        Avx.Store(outRow + 2 * x + 8, Avx2.PermuteVar8x32(v, highIndex));
+                    }
+
+                    for (; x < inW; x++)
+                    {
+                        float value = srcRow[x];
+                        outRow[2 * x] = value;
+                        outRow[2 * x + 1] = value;
+                    }
+                }
+            }
         }
     }
 

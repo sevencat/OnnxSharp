@@ -430,7 +430,8 @@ static int Ab(string[] args)
         Console.Error.WriteLine("          [--iters N] [--rounds N] [--warmup N] [--no-check]");
         Console.Error.WriteLine("       K ∈ ONNXSHARP_ATTN_FUSE_MAXSEQ | ONNXSHARP_ATTN_BLOCK_SEQ | " +
                                 "ONNXSHARP_ATTN_SCORE_BUDGET(KB) | ONNXSHARP_ATTN_LAZY_SOFTMAX | " +
-                                "ONNXSHARP_ATTN_PACK_REUSE | ONNXSHARP_GEMM_THRESHOLD | ONNXSHARP_NCHWC");
+                                "ONNXSHARP_ATTN_PACK_REUSE | ONNXSHARP_GEMM_THRESHOLD | ONNXSHARP_NCHWC | " +
+                                "ONNXSHARP_POOL_FAST | ONNXSHARP_RESIZE_FAST");
         return 2;
     }
 
@@ -678,6 +679,12 @@ static (string Name, string Alias, Func<string> Default, Action<string> Apply)[]
     ("ONNXSHARP_NCHWC", "nchwc",
         () => OnnxSharp.Kernels.NchwcConv.Enabled ? "1" : "0",
         v => OnnxSharp.Kernels.NchwcConv.Enabled = AbParseInt("ONNXSHARP_NCHWC", v) != 0),
+    ("ONNXSHARP_POOL_FAST", "pool_fast",
+        () => DnnOps.FastPool ? "1" : "0",
+        v => DnnOps.FastPool = AbParseInt("ONNXSHARP_POOL_FAST", v) != 0),
+    ("ONNXSHARP_RESIZE_FAST", "resize_fast",
+        () => DnnOps.FastResize2x ? "1" : "0",
+        v => DnnOps.FastResize2x = AbParseInt("ONNXSHARP_RESIZE_FAST", v) != 0),
     ("ONNXSHARP_GEMM_THRESHOLD", "gemm_threshold",
         () => GemmKernel.ParallelThreshold.ToString(),
         v => GemmKernel.ParallelThreshold = GemmKernel.TryParseThreshold(v, out long threshold)

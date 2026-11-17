@@ -18,6 +18,10 @@ internal static class GraphFusion
     {
         int total = 0;
 
+        // 最先做：把 Identity 这类纯透传节点从图里摘掉，后面的融合看到的边都是真实的数据流。
+        if (!Disabled("identity"))
+            total += EliminateIdentity(graph);
+
         // 顺序有讲究：先造出 SiLU，再把它吸收进上游卷积。
         total += FuseSilu(net, graph);
         total += FuseActivationIntoProducer(net, graph);
@@ -44,6 +48,76 @@ internal static class GraphFusion
         total += FuseElementWiseChains(net, graph);
 
         return total;
+    }
+
+    /// <summary>
+    /// 把 <c>Identity</c> 从图里摘掉：把它的输出引用整体改写成它的输入。
+    /// <para>
+    /// PaddleOCR 的 rec 图（PP-OCRv5 mobile）导出时会留下 58 个 <c>Identity</c>，
+    /// 每个都要「读一整张张量、再写一整张」外加一次算子派发。48×W 这么小的张量上，
+    /// 派发开销比搬运本身还贵 —— 实测这 58 个节点占 rec 前向的 24%。
+    /// </para>
+    /// <para>
+    /// 改写只是换 SSA 引用，数值完全不变。唯一不做的是「输出本身就是图输出」的那种：
+    /// 那时 dst 的 Arg 会被分配器当成必须活到最后的缓冲，改写成中间结果会破坏生命周期分析，
+    /// 留一个节点比冒这个险划算。
+    /// </para>
+    /// </summary>
+    private static int EliminateIdentity(Graph graph)
+    {
+        var prog = graph.Prog;
+        if (prog.Count == 0)
+            return 0;
+
+        var keep = new HashSet<int>();
+        foreach (var output in graph.Outputs)
+            keep.Add(output.Idx);
+
+        var rewrite = new Dictionary<int, Arg>();
+
+        foreach (var op in prog)
+        {
+            if (!string.Equals(op.Type, "Identity", StringComparison.Ordinal)
+                || op.Inputs.Count != 1
+                || op.Outputs.Count != 1)
+                continue;
+
+            var dst = op.Outputs[0];
+            if (keep.Contains(dst.Idx))
+                continue;
+
+            var src = op.Inputs[0];
+            while (rewrite.TryGetValue(src.Idx, out var next))
+                src = next;
+
+            if (src.IsEmpty || src == dst)
+                continue;
+
+            rewrite[dst.Idx] = src;
+        }
+
+        if (rewrite.Count == 0)
+            return 0;
+
+        foreach (var op in prog)
+        {
+            var inputs = op.Inputs;
+            for (int i = 0; i < inputs.Count; i++)
+            {
+                if (rewrite.TryGetValue(inputs[i].Idx, out var src))
+                    inputs[i] = src;
+            }
+        }
+
+        int removed = graph.RemoveAll(op =>
+            string.Equals(op.Type, "Identity", StringComparison.Ordinal)
+            && op.Outputs.Count == 1
+            && rewrite.ContainsKey(op.Outputs[0].Idx));
+
+        if (VerboseFusion)
+            Console.Error.WriteLine($"fusion: Identity -{removed}");
+
+        return removed;
     }
 
     /// <summary>

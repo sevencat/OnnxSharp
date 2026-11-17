@@ -3059,3 +3059,126 @@ cd .tmp/facebench               # 预处理 / forward / 解码 三段
 dotnet run -c Release -- ..\lena.jpg 20 5
 ```
 
+## 37. 2026-11-17 收工：池化 / Resize 行切分 + Identity 消除 + 物理核默认，全模型复测
+
+本轮不再碰 GEMM 与 Conv（§26~§34 已把 `1×1` 的账算干），改的是**「Conv 之外那 15%」里最便宜的三块**，
+外加一个测量之外的默认值错误（默认线程数用逻辑核）。
+
+### 37.1 改动清单
+
+| 文件 | 改动 | 落点 |
+|---|---|---|
+| `Ops/DnnOps.cs` | `MaxPool` 新增 2×2/s1 滑窗内核（竖向两行 `Avx.Max` 进 row buffer 再横向求 max）与 3×3/s2 内核 | OCR det/rec、YuNet |
+| `Ops/DnnOps.cs` | `Resize` 全路径（nearest / bilinear × u8 / f32）按行切分，最近邻 2× 单独走表驱动内核 | yolo 的 upsample、OCR det |
+| `Ops/DnnOps.cs` | 池化 / Resize 的并行粒度由「每平面」改成「平面 × 行块」 —— 原来 16 个平面在 16 线程上铺不满就等于串行 | 同上 |
+| `Ops/DnnOps.cs` | `GlobalAveragePool` 走整平面快速路径（两路 AVX 累加 + 行切分，部分和用 float 数组归并而非原子加） | SE 模块 0.24 → **0.10 ms** |
+| `Core/GraphFusion.cs` | 新增 `EliminateIdentity`：单入单出的 `Identity` 直接重写消费者 | rec 图删 58 个节点 |
+| `Threading/ParallelRange.cs` | 默认线程数 `ProcessorCount`（32 逻辑核）→ **物理核数**（Windows 用 `GetLogicalProcessorInformationEx`，=16） | 见 37.2 最后一条 |
+| `Ocr/PaddleOCR/PaddleOcrPipeline.cs` | 喂给引擎的输入张量按形状缓存复用（`SetInput` 只引用不拷贝），顺带加 `OcrTimings` 分段 | 每帧省 5 MB 进 LOH |
+
+> `ParallelRange` 那条是**纠错而不是提速**：超线程对这些 FP 内核没有吞吐收益，多出来的 16 个自旋
+> worker 只跟机器上别的进程抢时间片。负载 35% 时 OCR 端到端中位数从 **184 ms 回到 35 ms**，
+> 而安静窗口下的 min 几乎不变 —— 说明它治的是尾巴，不是均值。
+
+### 37.2 OCR（PaddleOCR，4 线程，同会话 min / median，ms）
+
+| 段 | 优化前 | 现在 | |
+|---|---:|---:|---|
+| det 1×3×288×896 | 17.89 / 26.12 | **13.18 / 14.56** | −26% |
+| cls 1×3×80×160 | 1.86 / 2.77 | **1.55 / 1.77** | −17% |
+| rec 1×3×48×384 | 4.36 / 5.32 | **2.90 / 3.57** | −33% |
+| rec 1×3×48×400 | 4.82 / 5.21 | **3.68 / 4.07** | −24% |
+| **端到端（min）** | 34.3 | **24.2** | −29% |
+| vs `Sdcb.SimdPaddleOCR` | 1.66× | **1.25×** | |
+
+分段（单帧 24.3 ms）：`pre 0.53 + det 13.48 + post 0.54 + cls 2.78 + rec 7.00`。
+
+识别文本与置信度（0.957 / 0.982）与优化前逐位一致。
+
+### 37.3 全模型四引擎复测（4 线程，iters 30 / rfdetr 20，warmup 5，rounds 4）
+
+`python bench/run_all.py --threads 4 --rounds 4`，每轮轮转引擎顺序、各引擎取自己最好的一轮；
+外部负载约 35%（qbittorrent / xray / 微信常驻），perf% 138（**未撞温度墙**）。
+
+对照列用 **§28**（11-16 同口径四引擎，`--iters 30 --rounds 2`），不要用 §8.3 —— 中间还夹着 NCHWc（§23/§24）、
+64 字节对齐（§30）、整数 GEMM（§34）三轮改动，拿 §8.3 作基线会把它们的收益算到本轮头上。
+
+| 模型（median ms） | onnxsharp | onnxruntime-cpu | opencv-dnn | simdyolo | 我们上轮（§28） | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| yolo11n 640² | 30.4 | **23.8** | 48.8 | 31.2 | 29.6 | +2.7% |
+| yolov8n 640² | 35.8 | **28.2** | 50.8 | 31.3 | 34.4 | +4.1% |
+| yolov8s 640² | 90.2 | **79.5** | 151.8 | 83.2 | 87.4 | +3.2% |
+| yolo11s 640² | 76.6 | **63.5** | 129.7 | 77.8 | 77.2 | −0.8% |
+| rfdetr-small 512² | 198.0 | **187.7** | 314.8 | 跑不了 | 200.0 | −1.0% |
+
+倍率（我们 ÷ 对方，>1 为更慢）：
+
+| 模型 | vs ORT | vs OpenCV | vs SimdYolo |
+|---|---:|---:|---:|
+| yolo11n | 1.28 | **0.62** | 0.97 |
+| yolov8n | 1.27 | **0.70** | 1.14 |
+| yolov8s | 1.13 | **0.59** | 1.08 |
+| yolo11s | 1.21 | **0.59** | 0.98 |
+| rfdetr-small | **1.05** | **0.63** | N/A |
+
+**本轮对 yolo / rfdetr 的收益 = 0（噪声内）**，而且整个会话比 §28 那天一致偏慢 2~4%
+（我们 +2.7/+4.1/+3.2/−0.8/−1.0，ORT 23.5→23.8 / 27.8→28.2 / 76.4→79.5 / 63.5→63.5 / 187.2→187.7，
+SimdYolo 29.9→31.2 / 29.4→31.3 / 76.2→83.2 / 77.5→77.8）—— **三个引擎同向偏移，说明是机器状态，不是代码**。
+只有 OpenCV 的 s 档偏 11%（136.5→151.8），与 §33.1 记的「今天 OpenCV 处于坏状态」同源。
+
+> **为什么 yolo 吃不到这轮改动**：yolo11n 的池化只有 SPPF 的 3 个 5×5/s1（20×20×256），Resize 只有 1 个 2×
+> upsample，Identity 在融合后本来就是 0 个 —— 这几处在 §28 的预算里合计不到 1 ms，而本轮的判据是「换掉退化路径」，
+> 不是「造出新算力」。受益的是**池化/Resize 占比高**的图：OCR det（FPN 上采样 + 池化，13 ms 级）与 YuNet int8。
+
+### 37.4 YuNet（单引擎，本仓库没有跨引擎脚本）
+
+| | 4 线程 min / median | 16 线程 min / median | 上次（§36） |
+|---|---:|---:|---:|
+| `yunet.onnx` fp32 640² | 5.7 / 5.9 | 5.2 / 8.2 | 5.4~5.9 / 6.1~7.8 |
+| `yunet_int8.onnx` | **20.3 / 20.6** | 23.8 / 32.7 | 22.95 / 23.44 |
+
+- fp32 无变化（符合 §36.4：瓶颈是「层数 × 每层固定开销」，本轮没碰 Conv）。
+- int8 快 11%，仍是 fp32 的 3.5×；QDQ 每层多两遍全张量往返的结论不变。
+- int8 在 16 线程反而更慢 —— 图太碎，并行收益为负，这和 37.1 的「少开线程」是同一条规律的两种表现。
+- 精度无回归：`face` 的 score **0.9135 / 0.8944**，框与 5 个关键点与 §36.2 逐位一致。
+
+### 37.5 目标线复核
+
+| 目标（4 线程 median） | 基线 | 目标 | 现在 | |
+|---|---:|---:|---:|---|
+| rfdetr-small | 262.5 | ≤210 | **198.0** | **达成**（−24.6%，§28 那轮就到了；本轮 −1.0% 只是维持） |
+| yolo11n | 39.1 | ≤27 | 30.4 | 差 **12.6%**（§33.1 时 29.2，差 8%） |
+
+rfdetr 主线可以关。yolo11n 的余量在「大量中等尺寸 Conv」，按 §26~§34 的账只剩微内核深度与
+NCHWc 覆盖面两条路，都不是本轮这种「顺手改」的量级。**本轮没有推进这条线**。
+
+### 37.6 遗留
+
+- **median 尖刺**：OCR 单帧仍偶发 100~400 ms（SimdPaddleOCR 也有，幅度小）。已排除输入分配的
+  LOH，怀疑是自旋线程与外部负载的时间片争用 —— 物理核默认值把它从「常态」压成了「偶发」，没有根除。
+- yolo11n 距目标线还差 12.6%；Conv 之外的零钱已经捡完（本轮证明这部分对 yolo 只有 <1 ms）。
+- 本轮收益未做开关式单项剥离；OCR 的对照是「同一段代码改前/改后同会话」，可信度高于 yolo 列。
+
+### 37.7 复现
+
+```powershell
+$env:ONNXSHARP_THREADS='4'
+$cli='tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe'
+
+# 四引擎全表（同会话、每轮轮转、各取最好一轮）
+python bench/run_all.py --threads 4 --rounds 4 --iters 30
+
+# YuNet
+& $cli bench .tmp/yunet/yunet.onnx      --input 'input=.tmp/yunet/yunet_input.f32' --iters 40 --warmup 10
+& $cli bench .tmp/yunet/yunet_int8.onnx --input 'input=.tmp/yunet/yunet_input.f32' --iters 40 --warmup 10
+& $cli face .tmp/yunet/yunet.onnx .tmp/lena.jpg      # 0.9135
+& $cli face .tmp/yunet/yunet_int8.onnx .tmp/lena.jpg # 0.8944
+
+# OCR 端到端 + 分段
+cd .tmp; dotnet ..\tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.dll ocr ocr_test.bmp `
+  --det ocr-models/det.onnx --rec ocr-models/rec.onnx --cls ocr-models/cls.onnx --dict ocr-models/dict.txt
+```
+
+回归：`OnnxSharp.slnx` 全量编译通过、零警告；测试 **116/118（2 skipped）、0 failed**。
+改动未提交。
+

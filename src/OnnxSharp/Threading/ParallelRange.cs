@@ -1,4 +1,5 @@
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 
 namespace OnnxSharp.Threading;
 
@@ -39,7 +40,62 @@ public static class ParallelRange
         {
             _maxDegreeOfParallelism = threads;
         }
+        else
+        {
+            // 没指定就取物理核数：超线程对这里的 FP 密集 kernel 没有吞吐收益，
+            // 却让自旋线程池的争用翻倍（32 逻辑核的机器上，OCR 端到端中位数从 35 ms 涨到 184 ms）。
+            _maxDegreeOfParallelism = Math.Max(1, Math.Min(Environment.ProcessorCount, PhysicalCoreCount()));
+        }
     }
+
+    /// <summary>
+    /// 物理核数（Windows 走 <c>GetLogicalProcessorInformationEx</c>，其它平台或失败时退回逻辑核数）。
+    /// </summary>
+    private static int PhysicalCoreCount()
+    {
+        if (!OperatingSystem.IsWindows())
+            return Environment.ProcessorCount;
+
+        try
+        {
+            int length = 0;
+            GetLogicalProcessorInformationEx(0 /* RelationProcessorCore */, IntPtr.Zero, ref length);
+            if (length <= 0)
+                return Environment.ProcessorCount;
+
+            IntPtr buffer = Marshal.AllocHGlobal(length);
+            try
+            {
+                if (!GetLogicalProcessorInformationEx(0, buffer, ref length))
+                    return Environment.ProcessorCount;
+
+                int cores = 0;
+                for (int offset = 0; offset + 8 <= length; )
+                {
+                    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX { DWORD Relationship; DWORD Size; ... }
+                    int size = Marshal.ReadInt32(buffer, offset + 4);
+                    if (size <= 0)
+                        break;
+
+                    cores++;
+                    offset += size;
+                }
+
+                return cores > 0 ? cores : Environment.ProcessorCount;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+        catch
+        {
+            return Environment.ProcessorCount;
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetLogicalProcessorInformationEx(int relationshipType, IntPtr buffer, ref int returnedLength);
 
     /// <summary>可用线程数（0 表示自动）。</summary>
     public static int MaxDegreeOfParallelism

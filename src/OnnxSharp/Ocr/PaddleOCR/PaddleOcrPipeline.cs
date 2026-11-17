@@ -1,12 +1,13 @@
-﻿using OnnxSharp.Core;
+﻿using System.Diagnostics;
+using OnnxSharp.Core;
 using OnnxSharp.Tensors;
 
 namespace OnnxSharp.Ocr.PaddleOCR;
 
 /// <summary>
-/// PaddleOCR 涓夋寮忔祦姘寸嚎锛欴B 妫€娴?鈫掞紙鍙€夛級鏂囨湰琛屾柟鍚戝垎绫?鈫?CTC 璇嗗埆銆?
+/// PaddleOCR 三段式流水线：DB 检测 →（可选）文本行方向分类 → CTC 识别。
 /// <para>
-/// <b>鐢ㄦ硶</b>锛?
+/// <b>用法</b>：
 /// <code>
 /// var model = PaddleOcrModel.FromFiles("det.onnx", "rec.onnx", "ppocr_keys.txt", "cls.onnx");
 /// var ocr = new PaddleOcrPipeline(model);
@@ -15,12 +16,12 @@ namespace OnnxSharp.Ocr.PaddleOCR;
 /// </code>
 /// </para>
 /// <para>
-/// <b>涓轰粈涔堣銆屾寜灏哄浠藉浘銆?/b>锛歅P-OCRv6 鐨?det / rec 閮芥槸鍏ㄥ姩鎬佸鍑猴紙<c>x[N,3,H,W]</c>锛夛紝
-/// 寮曟搸闈?<see cref="Net.ReadModel(string, int[])"/> 鎶婅緭鍏ョ淮鍥哄畾鎴愬叿浣撳€兼墠鑳芥姌鍙犲舰鐘堕摼銆?
-/// 浜庢槸姣忎釜 <c>(H,W)</c> 缁勫悎瀵瑰簲涓€浠界壒鍖栧悗鐨勫浘锛氭娴嬫寜 32 瀵归綈銆佽瘑鍒寜 16 鍒嗘《锛?
-/// 杩欓噷鎸夊舰鐘剁紦瀛橈紙榛樿 det 2 浠?/ rec 8 浠斤級锛屽悓涓€灏哄鐨勫悗缁皟鐢ㄤ笉闇€瑕侀噸鏂板鍏ャ€?
+/// <b>为什么要「按尺寸份图」</b>：PP-OCRv6 的 det / rec 都是全动态导出（<c>x[N,3,H,W]</c>），
+/// 引擎靠 <see cref="Net.ReadModel(string, int[])"/> 把输入维固定成具体值才能折叠形状链。
+/// 于是每个 <c>(H,W)</c> 组合对应一份特化后的图：检测按 32 对齐、识别按 16 分桶；
+/// 这里按形状缓存（默认 det 2 份 / rec 8 份），同一尺寸的后续调用不需要重新导入。
 /// </para>
-/// <para>涓嶅仛绾跨▼瀹夊叏锛氫竴涓疄渚嬩覆琛屼娇鐢紱澶氱嚎绋嬭鍚勮嚜鎸佹湁涓€涓疄渚嬶紙妯″瀷瀛楄妭鍙互鍏变韩锛夈€?/para>
+/// <para>不做线程安全：一个实例串行使用；多线程请各自持有一个实例（模型字节可以共享）。</para>
 /// </summary>
 public sealed class PaddleOcrPipeline
 {
@@ -38,25 +39,37 @@ public sealed class PaddleOcrPipeline
     private float[] _recBuffer = Array.Empty<float>();
     private readonly float[] _clsBuffer = new float[3 * ClsHeight * ClsWidth];
 
+    // 喂给引擎的输入张量按形状缓存：引擎的 SetInput 只引用不拷贝，所以可以原地复用。
+    // 键与对应 Net 缓存的键一致，清 Net 缓存时一起清。
+    private readonly Dictionary<int, Tensor> _detInputs = new();
+    private readonly Dictionary<int, Tensor> _recInputs = new();
+    private readonly Dictionary<int, Tensor> _clsInputs = new();
+
     public PaddleOcrPipeline(PaddleOcrModel model, PaddleOcrOptions? options = null)
     {
         _model = model ?? throw new ArgumentNullException(nameof(model));
         Options = options ?? new PaddleOcrOptions();
     }
 
-    /// <summary>璇嗗埆娴佺▼鍙傛暟锛堝彲鍦ㄦ瀯閫犲悗缁х画鏀癸紝涓嬩竴甯х敓鏁堬級銆?/summary>
+    /// <summary>识别流程参数（可在构造后继续改，下一帧生效）。</summary>
     public PaddleOcrOptions Options { get; }
 
     public PaddleOcrModel Model => _model;
 
     /// <summary>
-    /// 鏁撮〉璇嗗埆锛氳繑鍥炴寜闃呰椤哄簭鎺掑垪鐨勬枃鏈锛堝潗鏍囨槸<b>婧愬浘鍍忕礌</b>锛夈€?
+    /// 上一帧的分段耗时；仅当 <see cref="PaddleOcrOptions.CollectTimings"/> 为 <c>true</c> 时才更新，
+    /// 否则一直是 <c>null</c>（关掉计时就不付 <see cref="Stopwatch"/> 的代价）。
     /// </summary>
-    /// <param name="pixels">浜ら敊鍍忕礌鍐呭瓨锛涙瘡琛?<paramref name="rowStride"/> 瀛楄妭锛? = 鎸夊绱у噾鎺掑垪锛夈€?/param>
-    /// <param name="width">鍥惧儚瀹斤紙鍍忕礌锛夈€?/param>
-    /// <param name="height">鍥惧儚楂橈紙鍍忕礌锛夈€?/param>
-    /// <param name="format">鍍忕礌鎺掑垪锛岄粯璁?BGR24锛圤penCV / 澶氭暟鐩告満 SDK锛夈€?/param>
-    /// <param name="rowStride">婧愬浘姣忚瀛楄妭鏁帮紙鍚灏惧榻愬～鍏咃級锛? 琛ㄧず <c>width * 姣忓儚绱犲瓧鑺傛暟</c>銆?/param>
+    public OcrTimings? LastTimings { get; private set; }
+
+    /// <summary>
+    /// 整页识别：返回按阅读顺序排列的文本行（坐标是<b>源图像素</b>）。
+    /// </summary>
+    /// <param name="pixels">交错像素内存；每行 <paramref name="rowStride"/> 字节（0 = 按宽紧凑排列）。</param>
+    /// <param name="width">图像宽（像素）。</param>
+    /// <param name="height">图像高（像素）。</param>
+    /// <param name="format">像素排列，默认 BGR24（OpenCV / 多数相机 SDK）。</param>
+    /// <param name="rowStride">源图每行字节数（含行尾对齐填充）；0 表示 <c>width * 每像素字节数</c>。</param>
     public IReadOnlyList<OcrLine> Run(
         ReadOnlySpan<byte> pixels,
         int width,
@@ -67,7 +80,10 @@ public sealed class PaddleOcrPipeline
         if (width <= 0 || height <= 0)
             throw new ArgumentException($"invalid image size {width}x{height}");
 
-        // ---- 1) DB 妫€娴?----
+        Stopwatch? stage = Options.CollectTimings ? Stopwatch.StartNew() : null;
+        double preMs = 0, detMs = 0, postMs = 0, clsMs = 0, recMs = 0;
+
+        // ---- 1) DB 检测 ----
         (int detWidth, int detHeight) = DetectSize(width, height);
         Net detNet = GetDetectionNet(detWidth, detHeight);
         EnsureDetBuffer(3 * detWidth * detHeight);
@@ -76,16 +92,39 @@ public sealed class PaddleOcrPipeline
             0, 0, width, height, detWidth, detHeight,
             OcrImage.DetMean, OcrImage.DetStd, _detBuffer, detWidth);
 
-        detNet.SetInput(detNet.InputNames[0],
-            Tensor.FromArray(_detBuffer.AsSpan(0, 3 * detHeight * detWidth), new TensorShape(1, 3, detHeight, detWidth)));
+        // 喂给引擎的张量按形状复用：每次新建会分配 3 MB（>85 KB 直接进 LOH），
+        // 几十帧就攒够一次 Gen2，端到端延迟出现数百毫秒的尖刺（实测单帧 991 ms）。
+        Tensor detInput = InputFor(_detInputs, (detHeight << 16) | detWidth,
+            new TensorShape(1, 3, detHeight, detWidth));
+        _detBuffer.AsSpan(0, 3 * detHeight * detWidth).CopyTo(detInput.AsSpan<float>());
+
+        if (stage is not null)
+        {
+            preMs = stage.Elapsed.TotalMilliseconds;
+            stage.Restart();
+        }
+
+        detNet.SetInput(detNet.InputNames[0], detInput);
         Tensor probability = detNet.Forward();
+
+        if (stage is not null)
+        {
+            detMs = stage.Elapsed.TotalMilliseconds;
+            stage.Restart();
+        }
 
         List<DbPostprocess.Box> boxes = DbPostprocess.Detect(
             probability.AsSpan<float>(),
             detWidth, detHeight,
             Options.DetThreshold, Options.BoxThreshold, Options.UnclipRatio);
 
-        // ---- 2) 閫愭瑁佸壀 鈫?鏂瑰悜鍒嗙被 鈫?璇嗗埆 ----
+        if (stage is not null)
+        {
+            postMs = stage.Elapsed.TotalMilliseconds;
+            stage.Restart();
+        }
+
+        // ---- 2) 逐框裁剪 → 方向分类 → 识别 ----
         float scaleX = (float)width / detWidth;
         float scaleY = (float)height / detHeight;
         bool useClassification = Options.UseClassification && _model.HasClassification;
@@ -108,21 +147,36 @@ public sealed class PaddleOcrPipeline
             bool rotate = useClassification &&
                 IsUpsideDown(pixels, width, height, format, rowStride, x, y, cropWidth, cropHeight);
 
+            if (stage is not null)
+            {
+                clsMs += stage.Elapsed.TotalMilliseconds;
+                stage.Restart();
+            }
+
             (string text, float score) = Recognize(
                 pixels, width, height, format, rowStride, x, y, cropWidth, cropHeight, rotate);
+
+            if (stage is not null)
+            {
+                recMs += stage.Elapsed.TotalMilliseconds;
+                stage.Restart();
+            }
 
             if (text.Length != 0)
                 lines.Add(new OcrLine(text, score, x, y, cropWidth, cropHeight));
         }
 
+        if (stage is not null)
+            LastTimings = new OcrTimings(preMs, detMs, postMs, clsMs, recMs);
+
         return lines;
     }
 
-    // ---------------- 妫€娴?----------------
+    // ---------------- 检测 ----------------
 
     /// <summary>
-    /// 妫€娴嬭緭鍏ュ昂瀵革細鏈€闀胯竟鍘嬪埌 <see cref="PaddleOcrOptions.DetLimitSide"/>锛?
-    /// 瀹介珮閮藉彇 32 鐨勬暣鏁板€嶏紙PaddleOCR 鐨?<c>limit_type=min</c> 瑙勫垯锛夈€?
+    /// 检测输入尺寸：最长边压到 <see cref="PaddleOcrOptions.DetLimitSide"/>，
+    /// 宽高都取 32 的整数倍（PaddleOCR 的 <c>limit_type=min</c> 规则）。
     /// </summary>
     internal (int Width, int Height) DetectSize(int width, int height)
     {
@@ -141,11 +195,25 @@ public sealed class PaddleOcrPipeline
             return net;
 
         if (_detNets.Count >= Math.Max(1, Options.DetShapeCacheSize))
+        {
             _detNets.Clear();
+            _detInputs.Clear();
+        }
 
         net = _model.CreateDetectionNet(width, height);
         _detNets[key] = net;
         return net;
+    }
+
+    /// <summary>取一个按 <paramref name="key"/> 复用的输入张量（形状不符时重建）。</summary>
+    private static Tensor InputFor(Dictionary<int, Tensor> cache, int key, TensorShape shape)
+    {
+        if (cache.TryGetValue(key, out Tensor? tensor) && tensor.Shape.Equals(shape))
+            return tensor;
+
+        tensor = Tensor.Allocate(shape, DType.F32);
+        cache[key] = tensor;
+        return tensor;
     }
 
     private void EnsureDetBuffer(int size)
@@ -154,7 +222,7 @@ public sealed class PaddleOcrPipeline
             _detBuffer = new float[size];
     }
 
-    // ---------------- 鏂瑰悜鍒嗙被 ----------------
+    // ---------------- 方向分类 ----------------
 
     private bool IsUpsideDown(
         ReadOnlySpan<byte> pixels,
@@ -173,12 +241,16 @@ public sealed class PaddleOcrPipeline
             x, y, cropWidth, cropHeight, ClsWidth, ClsHeight,
             OcrImage.Half, OcrImage.Half, _clsBuffer, ClsWidth);
 
-        _clsNet.SetInput(_clsNet.InputNames[0], Tensor.FromArray(_clsBuffer, new TensorShape(1, 3, ClsHeight, ClsWidth)));
+        Tensor clsInput = InputFor(_clsInputs, (ClsHeight << 16) | ClsWidth,
+            new TensorShape(1, 3, ClsHeight, ClsWidth));
+        _clsBuffer.CopyTo(clsInput.AsSpan<float>());
+
+        _clsNet.SetInput(_clsNet.InputNames[0], clsInput);
         ReadOnlySpan<float> logits = _clsNet.Forward().AsSpan<float>();
         if (logits.Length < 2)
             return false;
 
-        // cls 鍥炬湯灏炬槸 2 绫?softmax锛歱1 灏辨槸銆屽€掔疆銆嶇殑姒傜巼
+        // cls 图末尾是 2 类 softmax：p1 就是「倒置」的概率
         float p1 = logits[1];
         if (logits[0] > 1.0001f || logits[1] > 1.0001f)
         {
@@ -191,7 +263,7 @@ public sealed class PaddleOcrPipeline
         return p1 > Options.UpsideDownThreshold;
     }
 
-    // ---------------- 璇嗗埆 ----------------
+    // ---------------- 识别 ----------------
 
     /// <summary>
     /// 识别一块<b>已经裁好</b>的文本行区域（流程与 <see cref="Run"/> 内部相同）。
@@ -212,7 +284,7 @@ public sealed class PaddleOcrPipeline
         int recHeight = Math.Max(8, Options.RecHeight);
         int maxWidth = Math.Max(RecWidthStep, Options.RecMaxWidth);
 
-        // 绛夋瘮缂╂斁鍒伴珮 recHeight锛涘搴︽寜 16 鍒嗘《锛堟《瀹戒互澶栬ˉ 0锛屼笌 PaddleOCR 鐨?padding 涓€鑷达級
+        // 等比缩放到高 recHeight；宽度按 16 分桶（桶宽以外补 0，与 PaddleOCR 的 padding 一致）
         int resizedWidth = Math.Clamp(
             (int)MathF.Round(recHeight * (float)cropWidth / cropHeight),
             RecWidthStep, maxWidth);
@@ -229,8 +301,11 @@ public sealed class PaddleOcrPipeline
             x, y, cropWidth, cropHeight, resizedWidth, recHeight,
             OcrImage.Half, OcrImage.Half, _recBuffer, bucket, rotate);
 
-        net.SetInput(net.InputNames[0],
-            Tensor.FromArray(_recBuffer.AsSpan(0, size), new TensorShape(1, 3, recHeight, bucket)));
+        Tensor recInput = InputFor(_recInputs, (recHeight << 16) | bucket,
+            new TensorShape(1, 3, recHeight, bucket));
+        _recBuffer.AsSpan(0, size).CopyTo(recInput.AsSpan<float>());
+
+        net.SetInput(net.InputNames[0], recInput);
         ReadOnlySpan<float> logits = net.Forward().AsSpan<float>();
 
         return CtcDecoder.Decode(logits, _model.Classes.Count, _model.Classes);
@@ -243,7 +318,10 @@ public sealed class PaddleOcrPipeline
             return net;
 
         if (_recNets.Count >= Math.Max(1, Options.RecShapeCacheSize))
+        {
             _recNets.Clear();
+            _recInputs.Clear();
+        }
 
         net = _model.CreateRecognitionNet(width, height);
         _recNets[key] = net;

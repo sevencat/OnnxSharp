@@ -31,7 +31,8 @@
 
 `OnnxSharp` 是一个自己实现的 ONNX 运行时：读 ONNX 文件 → 建图 → 常量折叠 + 算子融合 → 缓冲池 + 多线程 SIMD 内核 → 按节点执行。语义对齐 OpenCV 5 `dnn` 与 SimdYolo 的做法，目标是「纯托管、无 P/Invoke、纯 CPU 也能跑检测模型」。
 
-实测（四引擎同会话，见 [性能](#性能)）：**对 ONNXRuntime 与 SimdYolo 还差不少** —— 默认线程下约 **1.4× / 1.8×**（min 口径），双方都限到 4 线程后收窄到 **1.06~1.26×**（F32 图；int8 decoder 1.67×）；**对 OpenCV 5 `dnn` 基本打平**（~1.2×，4 线程下还略快）。
+实测（四引擎同会话，见 [性能](#性能)）：4 线程下 **对 ONNXRuntime 还差 1.05~1.28×**（F32 图；int8 decoder 1.67×），
+**对 SimdYolo 打平**（0.97~1.14×），**对 OpenCV 5 `dnn` 全面领先**（0.59~0.70×）。默认线程数 = 物理核数。
 
 这个引擎能写出来，主要是站在 **SimdYolo** 和 **OpenCV 5 `dnn`** 的肩膀上：算子语义、预处理约定、性能基线和验证方法都大量借鉴了它们。感谢两个项目的作者与贡献者，具体借鉴点见 [致谢](#致谢)。
 
@@ -89,7 +90,7 @@
 | 算子 | 76 个注册算子，覆盖 YOLO11/v8、RF-DETR、PP-OCRv6 与 sherpa Paraformer 的 encoder 段导出图（清单见 [支持算子](#支持算子)） |
 | 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链、`MatMul+ArgMax`、`MatMul+Add(bias)`→带按列 bias 的 GEMM、手写 LayerNorm→`LayerNormalization`、`DQL+MatMulInteger+Cast+Mul+Add`→`DynamicQuantizeMatMul`、整条 multi-head attention→`FusedAttention`（序列长度 ≤128 时）、YOLO 的 DFL→`DflSoftmax`）、按输入 shape 签名缓存形状/类型推断、常驻 intra-op 线程池（调用线程参与 + 自旋领任务，不再每次 `Parallel.For`） |
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
-| 线程 | 默认 `Environment.ProcessorCount`，可用 `ONNXSHARP_THREADS` 覆盖。**基准与调优一律按 4 线程** —— 目标不是占满整机，而是少核下也够快 |
+| 线程 | 默认 **物理核数**（Windows 上取 `GetLogicalProcessorInformationEx`，其余平台退回 `ProcessorCount`），可用 `ONNXSHARP_THREADS` 覆盖。超线程对这些 FP 密集内核没有吞吐收益，多出来的自旋线程只会互相抢时间片。**基准与调优一律按 4 线程** —— 目标不是占满整机，而是少核下也够快 |
 | 视觉门面 | `OnnxSharp.Vision`：letterbox / stretch 预处理、YOLO 解码 + NMS、RF-DETR 解码、YuNet 人脸（框 + 5 点关键点 + NMS），返回**原图坐标**的框 |
 | OCR 门面 | `OnnxSharp.Ocr.PaddleOCR`：PP-OCRv6 det + 可选 cls + rec，DB 后处理 + CTC 解码，返回**原图坐标**的文本行 |
 | 动态图 | `Net.ReadModel(path, 输入形状)` 把全动态输入（`x[N,3,H,W]`）**特化**成静态图，导入期即可折叠形状链 |
@@ -301,7 +302,7 @@ foreach (OcrLine line in ocr.Run(pixels, width, height, OcrPixelFormat.Bgra32, s
   （检测 2 份 / 识别 8 份，见 `PaddleOcrOptions.DetShapeCacheSize` / `RecShapeCacheSize`）。
 - 模型包里**只有 ONNX 与字典、没有推理代码**，所以本库不依赖 `Sdcb.SimdPaddleOCR` 的引擎，只借它的模型资源
   （`tools/scripts/extract_ocr_models.ps1` 把资源原样解出）。它作为**外部对照基准**跑过一次同模型同图的
-  4 线程对比（我们慢 1.7~2.1×，见 [bench.md](bench.md) §35），基准代码在 `.tmp/ocrbench`（不进仓库）。
+  4 线程同会话 median 慢 1.12~1.23×（`bench.md` §35 时 1.7~2.1×，已收窄，见 §37.2），基准代码在 `.tmp/ocrbench`（不进仓库）。
 
 ### 库用法 6：语音识别（sherpa-onnx，不在引擎里）
 
@@ -472,7 +473,7 @@ var shared = new YuNetDetector(net);
 OnnxSharp.Cli face yunet.onnx group.jpg [--conf 0.6] [--iou 0.3] [--max-faces 10] [--json out.json] [--out marked.jpg]
 ```
 
-int8 模型（`yunet_int8.onnx`）API 完全一样，换个路径就能跑 —— 但当前比 fp32 **慢 2.9×**（原因见[性能](#性能)与 `bench.md` §36）。
+int8 模型（`yunet_int8.onnx`）API 完全一样，换个路径就能跑 —— 但当前比 fp32 **慢 3.5×**（20.3 vs 5.7 ms，原因见[性能](#性能)与 `bench.md` §36 / §37.4）。
 
 ### 命令行
 
@@ -682,35 +683,38 @@ OnnxSharp.Cli features sherpa\model.int8.onnx test.wav --out feats.f32
 
 OCR（PP-OCRv6 tiny，**同一套 det/cls/rec 模型、同一份像素**，对手是 `Sdcb.SimdPaddleOCR 2.0.0`，4 线程）：
 
-| 图 | OnnxSharp | SimdPaddleOCR | 倍率 |
-|---|---|---|---|
-| 900×300，2 行（min） | 34.8 | 18.2 | **1.9×** |
-| 大图，3 行（min） | 59.7 | 34.3 | **1.7×** |
+| 图（median） | OnnxSharp | SimdPaddleOCR | 倍率 | §35 当时（min 口径） |
+|---|---|---:|---:|---:|
+| 900×300，2 行 | 40.5 | 33.0 | **1.23×** | 1.9×（34.8 / 18.2） |
+| 大图，3 行 | 53.3 | 47.7 | **1.12×** | 1.7×（59.7 / 34.3） |
 
-> OCR 是目前**最大的单项差距**：det 一项 19.7 ms 就超过对方整条管线（18.2 ms），
-> 根因是小通道卷积的固定开销 + 逐行串行 rec。文本结果与对方一致，分解与下一步见 [bench.md](bench.md) §35。
+> 口径从 min 换成 median：这台机器偶发百毫秒级尖刺（偶发时 min 也会被污染），同一会话内两张图的
+> min 倍率是 0.93× 与 1.42×（自相矛盾），median 倍率则一致（1.23× / 1.12×）。绝对值偏高是因为本次
+> 会话有 ~30% 常驻负载。安静窗口下的分段（min）：**det 13.2 / cls 1.6 / rec 2.9 ms，端到端 24.2 ms**
+> —— 优化前是 det 17.9 / cls 1.9 / rec 4.4、端到端 34.3。`det` 已经不再慢于对方整条管线。
+> 根因与改动见 [bench.md](bench.md) §35 / §37.2。
 
 人脸（YuNet，640²，0.22 MB；体积太小，没进上表的四引擎同会话对照）：
 
 | 段 | min | median |
 |---|---:|---:|
-| 纯 forward（53 层 Conv） | 5.4 | 6.1 |
+| 纯 forward（53 层 Conv） | 5.4~5.7 | 5.9~6.1 |
 | 预处理（拉伸到 640² + BGR→CHW） | 1.7 | 2.8 |
 | 解码（12 输出 + NMS） | ~0.5 | ~0.5 |
 | **端到端** | **8.4** | **10.9** |
 
 > 53 层 Conv 占 forward 的 94%，`Conv_0`（3→16，3×3，s2）一层就 15%。
-> int8 版能跑但**慢 2.9×**（每层多两趟 f32 物化）；三条优化尝试均为中性或负收益，见 [bench.md](bench.md) §36。
+> int8 版能跑但**慢 3.5×**（每层多两趟 f32 物化，20.3 vs 5.7 ms；池化/Resize 行切分后已比 §36 的 22.95 快 11%）；
+> 三条优化尝试均为中性或负收益，见 [bench.md](bench.md) §36 / §37.4。
 
-**结论**：ORT 仍是最快的 CPU 引擎，差距按计算域分层 —— **F32 图上落后 1.06~1.26×**，
+**结论**：ORT 仍是最快的 CPU 引擎，差距按计算域分层 —— **F32 图上落后 1.05~1.28×**，
 int8 的 decoder 落后 1.67×（还剩 ORT 的 `vpdpbusd` 峰值与我们 F32 路径的差），
-**OCR 落后 1.7~2.1×**（不同对手，最弱的一环）；
-OpenCV / SimdYolo 我们已领先或打平（OpenCV 那一天本身处于坏状态，跨会话只比倍率方向，
-历史口径见 [bench.md](bench.md) §4 的 1.21~1.23×）。
+**OCR 落后 1.1~1.3×**（不同对手）；OpenCV 已全面领先 0.59~0.70×，SimdYolo 打平（0.97~1.14×）。
+OpenCV 那一天本身处于坏状态，跨会话只比倍率方向，历史口径见 [bench.md](bench.md) §4 的 1.21~1.23×。
 
 > 口径提醒：不含预处理与后处理；对后台负载敏感，同代码重跑 ±8% 属正常；
 > 跨会话的绝对值不作数，只比同会话内的倍率与方向（理由见 `bench.md` §31.5）。
-> 全部数字与复现命令在 [bench.md](bench.md)（本表是 §33 + §34.5）。
+> 全部数字与复现命令在 [bench.md](bench.md)（本表是 §28 + §34.5 + §37）。
 
 ### 优化与结果
 
@@ -761,10 +765,10 @@ OpenCV / SimdYolo 我们已领先或打平（OpenCV 那一天本身处于坏状�
 | `DynamicQuantizeMatMul` 改走整数内核 | 它的成本就是 F32 GEMM 本身（等效 ≈512 GFLOPS），换过去还多一趟 `int32 → float` | 负收益 |
 | 自写 native int8 内核 / P-Invoke | —— | **已不需要**：`net11.0` 下 `AvxVnni` 可用，256 位路径已到理论峰值 |
 
-**当前最弱的一环（由数据指认，不是感觉）**：同模型同图对上 `Sdcb.SimdPaddleOCR`，OCR 落后 1.7~2.1×，
-其中 det 单段（19.7 ms）就慢过对方整条管线（18.2 ms）。分段是 det 19.7 / cls 13.0 / rec 10.1 ——
-三项都在「小通道 + 小图」的固定开销区间，所以下一步不是换内核，而是**砍 op 次数与派发**：
-cls 两行合一批、rec 多行合批并行、det 的小通道 Conv 豁免 NCHWc 打包（见 [bench.md](bench.md) §35.5）。
+**当前最弱的一环（由数据指认，不是感觉）**：同模型同图对上 `Sdcb.SimdPaddleOCR`，OCR 仍落后 **1.1~1.3×**
+（§35 时是 1.7~2.1×）。§35 定位到的三项「小通道 + 小图」固定开销已吃掉大半（det 17.9 → 13.2 ms，
+rec 4.4 → 2.9 ms，见 [bench.md](bench.md) §37.2）；剩下的量级是 det 的 Conv（6.5 ms，实测 87~195 GMAC/s）
+与逐元素链（约 2.5 ms，纯内存受限），**没有单项超过 5%**，所以这一环暂时不再作为主线。
 
 **一条经验**：所有有效改动都来自「先量再改」。§29 证明 3×3 的打包浪费只有 5.7%；
 §30 用 `GEMM_ALIGN` 量出图内对齐率 A 18% / B 8% / C 0%，才找到 1.2 ms；
@@ -778,12 +782,12 @@ cls 两行合一批、rec 多行合批并行、det 的小通道 Conv 豁免 NCHW
 | yolo11n | 端到端输出与 ONNXRuntime 逐值对齐（回归用例）；检测结果与 SimdYolo 逐框一致（最大 0.005 px） |
 | yolov8n / yolo11s / yolov8s | 跑通并纳入基准 |
 | rfdetr-small | 跑通并纳入基准；解码结果与官方 `rfdetr.export._runtime.decode_detections` 逐框一致（41/41 框，坐标 0.00 px）；原始输出与 ONNXRuntime 对齐（512² 随机输入：dets `2.3e-4`、labels `5.0e-5`）。*（rfdetr-medium 的本地导出已丢失，历史数字见 bench.md，当前无法复测）* |
-| PP-OCRv6 tiny（det / rec / cls） | det 与 rec 的**原始输出**与 ONNXRuntime 对齐（64² + 960² 输入：max\|diff\| 1.4e-7 / 7.6e-6）；900×300 合成图两行文字全对（`Hello OnnxSharp 123` 0.957、`第二行文字 PaddleOCR` 0.982），与 `Sdcb.SimdPaddleOCR` 同模型同图的输出**逐字一致**；车牌大图上主行 `浙A ES8381` 一致，低置信度小框因 1~2 px 检测差异给出不同字符（`e`↔`8`、`A3M15X`↔`浙A：3M15X`），属模型噪声。性能：比它慢 **1.7~2.1×**（`bench.md` §35） |
+| PP-OCRv6 tiny（det / rec / cls） | det 与 rec 的**原始输出**与 ONNXRuntime 对齐（64² + 960² 输入：max\|diff\| 1.4e-7 / 7.6e-6）；900×300 合成图两行文字全对（`Hello OnnxSharp 123` 0.957、`第二行文字 PaddleOCR` 0.982），与 `Sdcb.SimdPaddleOCR` 同模型同图的输出**逐字一致**；车牌大图上主行 `浙A ES8381` 一致，低置信度小框因 1~2 px 检测差异给出不同字符（`e`↔`8`、`A3M15X`↔`浙A：3M15X`），属模型噪声。性能：同会话 median 比它慢 **1.12~1.23×**（§35 时 1.7~2.1×，见 `bench.md` §35 / §37.2） |
 | 单算子微模型 | GEMM / attention / 逐元素链，用于内核定点调优 |
 | sherpa Paraformer encoder + CIF（int8） | 用手写脚本把 `model.int8.onnx` 在第一个 `Loop`（CIF）前切开，5715 节点的 encoder 子图**直接跑通**（`speech[1,96,560]` → `[1,97,320]`）；`DynamicQuantizeLinear` + `MatMulInteger`(+s8 权重、per-column 零点) 与 ONNXRuntime **逐位一致**（max\|diff\| = 0）。CIF 用 `Speech/Paraformer/ContinuousIntegrateAndFire` 重写（绕开 `Loop`/`Sequence*`），与 ORT 录的 `frames`/`fires`/`frame.7`/`integrate.7` **逐位一致**，token 数 21 = ORT 21。当前 encoder 纯 forward（76 帧、4 线程）**30.3 ms**，同图 ORT 24.1 ms |
 | **Paraformer 端到端（中文）** | Windows 自带的 Microsoft Huihui 合成 4.54 s 中文 wav → 76 帧特征 → 16 个 token → **「今天气真不错我们出去走一走吧」**，与 ORT 全模型参考文本**逐字一致**；整链纯 C#。**热态 min 48 ms / 中位 65 ms**（feat 4 / encoder 37 / decoder 6，4 线程），冷启动 ~1.1 s；ORT 两段合计 27.5 ms（不含特征前端）。演进：81~87 → 68~70 → **48** |
 | **YuNet（人脸检测，fp32）** | 官方 `face_detection_yunet` 静态导出（`[1,3,640,640]`，106 节点 / 8 种算子）。**端到端与 OpenCV `cv2.FaceDetectorYN` 逐值对齐**：同一个 640×640 输入下框差 **0.00 px**、5 点关键点差 **3e-5 px**、分数差 5e-7（`YuNetTests`）；512×512 lena 检出 1 张脸 score 0.9135，坐标换回原图空间；预处理是「整图拉伸 + BGR + 0..255 原值」。`face` 子命令可直接出框 / JSON / 画框图。稳态（640×640，**4 线程**）：纯 forward **5.4 ms 最小 / 6.1 ms 中位**；端到端（拉伸预处理 1.7 + forward + 解码 0.5）**8.4 ms 最小 / 10.9 ms 中位**。53 层 Conv 占 forward 的 94%，`Conv_0`（3→16，3×3，s2）一层就占 15%，已试过的三条优化路都是中性或负收益（[bench.md](bench.md) §36） |
-| YuNet int8（`yunet_int8.onnx`） | ✅ 支持：53 `QLinearConv` + 16 `DequantizeLinear` + 5 `QuantizeLinear` + 6 `QLinearSigmoid` + 2 `QLinearAdd` + 4 `MaxPool` 全匹配，跑通。同图对 fp32：score 0.8944 vs 0.9135、框中心差 ~1 px；但**慢 2.9×**（22.95 vs 5.4 ms/帧，4 线程）—— `QLinearConv` 每层多两趟 f32 物化（RQ→DQ 搬运），小模型上省下的带宽抵不过开销。根因与三条尝试见 [bench.md](bench.md) §36 |
+| YuNet int8（`yunet_int8.onnx`） | ✅ 支持：53 `QLinearConv` + 16 `DequantizeLinear` + 5 `QuantizeLinear` + 6 `QLinearSigmoid` + 2 `QLinearAdd` + 4 `MaxPool` 全匹配，跑通。同图对 fp32：score 0.8944 vs 0.9135、框中心差 ~1 px；但**慢 3.5×**（20.3 vs 5.7 ms/帧，4 线程；比 §36 的 22.95 快 11%）—— `QLinearConv` 每层多两趟 f32 物化（RQ→DQ 搬运），小模型上省下的带宽抵不过开销。根因与三条尝试见 [bench.md](bench.md) §36 / §37.4 |
 | SAM3（vision / geometry / text 编码器 + decoder） | 框提示分段跑通，decoder 与 ONNXRuntime **逐值一致**；行人框提示 top-1 **0.932** |
 
 > 跨引擎性能对照（OnnxSharp / ONNXRuntime CPU / OpenCV 5 dnn / SimdYolo）见 [bench.md](bench.md)。
@@ -876,7 +880,7 @@ bench/                四引擎 × 6 模型的对照脚本与产物
 
 `OnnxSharp` is a from-scratch ONNX inference engine in pure C# — **CPU only, FP32, zero third-party dependencies**. It runs ONNX exports of YOLO11 / YOLOv8 / RF-DETR, and ships an optional vision facade that turns an image into detections in source-image coordinates.
 
-Semantics follow OpenCV 5 `dnn` and SimdYolo. Measured on four engines in the same session (see [Performance](#performance)): **still clearly behind ONNXRuntime and SimdYolo** — about **1.4× / 1.8×** with each engine at its default thread count, narrowing to **1.06–1.26×** (1.67× on the int8 decoder) when both sides are pinned to 4 threads; **roughly on par with OpenCV 5 `dnn`** (~1.2×, slightly ahead at 4 threads).
+Semantics follow OpenCV 5 `dnn` and SimdYolo. Measured on four engines in the same session (see [Performance](#performance)) at 4 threads: **still 1.05–1.28× behind ONNXRuntime** on F32 graphs (1.67× on the int8 decoder), **on par with SimdYolo** (0.97–1.14×), and **ahead of OpenCV 5 `dnn`** across the board (0.59–0.70×). The default thread count is the physical core count.
 
 This engine stands on the shoulders of **SimdYolo** and **OpenCV 5 `dnn`**: operator semantics, preprocessing conventions, performance baselines and the validation methodology are heavily borrowed from both. Thanks to their authors and contributors — details in [Acknowledgements](#acknowledgements).
 
@@ -935,7 +939,7 @@ The **requirements, reference material and acceptance criteria** come from the m
 | Operators | 76 registered ops, covering YOLO11/v8, RF-DETR, PP-OCRv6 and the encoder part of sherpa Paraformer exports |
 | Graph passes | Constant folding (Shape→Gather→Concat→Reshape chains), operator fusion (Conv+SiLU, element-wise chains, `MatMul`+`ArgMax`, manual LayerNorm → `LayerNormalization`) |
 | Runtime | Static buffer pool (outputs detach), shape inference, `Parallel.For` + AVX2/AVX-512 |
-| Threads | `Environment.ProcessorCount` by default, overridable via `ONNXSHARP_THREADS`. **All benchmarks and tuning assume 4 threads** — the goal is not to saturate the machine |
+| Threads | **Physical core count** by default (via `GetLogicalProcessorInformationEx` on Windows, falling back to `ProcessorCount`), overridable via `ONNXSHARP_THREADS`. SMT buys nothing on these FP-bound kernels, the extra spinning workers only steal time slices. **All benchmarks and tuning assume 4 threads** — the goal is not to saturate the machine |
 | Vision | `OnnxSharp.Vision`: letterbox / stretch preprocessing, YOLO decode + NMS, RF-DETR decode, YuNet faces (box + 5 landmarks + NMS) |
 | OCR | `OnnxSharp.Ocr.PaddleOCR`: PP-OCRv6 det + optional cls + rec, DB post-processing, CTC — text lines in source pixels |
 | Dynamic graphs | `Net.ReadModel(path, inputShape)` **specialises** a fully dynamic input (`x[N,3,H,W]`) so shape chains fold at import |
@@ -1114,7 +1118,7 @@ OnnxSharp.Cli face yunet.onnx group.jpg [--conf 0.6] [--iou 0.3] [--max-faces 10
 ```
 
 The int8 model (`yunet_int8.onnx`) uses the exact same API — just point it at the other file. It is
-currently **2.9× slower** than fp32 (see [Performance](#performance) and `bench.md` §36).
+currently **3.5× slower** than fp32, 20.3 vs 5.7 ms (see [Performance](#performance) and `bench.md` §36 / §37.4).
 
 **Stage-by-stage**
 
@@ -1346,37 +1350,41 @@ Speech (sherpa Paraformer int8, Chinese, `huihui.wav` → 76 feature frames / 16
 OCR (PP-OCRv6 tiny, **same det/cls/rec models and the same pixels**, against `Sdcb.SimdPaddleOCR 2.0.0`,
 4 threads):
 
-| Image | OnnxSharp | SimdPaddleOCR | Ratio |
-|---|---|---|---|
-| 900×300, 2 lines (min) | 34.8 | 18.2 | **1.9×** |
-| large, 3 lines (min) | 59.7 | 34.3 | **1.7×** |
+| Image (median) | OnnxSharp | SimdPaddleOCR | Ratio | §35 back then (min) |
+|---|---|---:|---:|---:|
+| 900×300, 2 lines | 40.5 | 33.0 | **1.23×** | 1.9× (34.8 / 18.2) |
+| large, 3 lines | 53.3 | 47.7 | **1.12×** | 1.7× (59.7 / 34.3) |
 
-> OCR is the **weakest link**: `det` alone (19.7 ms) is slower than their whole pipeline (18.2 ms) —
-> narrow-channel convolution overhead plus per-line serial recognition. Text output matches theirs;
-> breakdown and next steps in [bench.md](bench.md) §35.
+> Switched from min to median: this machine has occasional 100 ms spikes (they pollute `min` too),
+> so within one session the min ratios were 0.93× and 1.42× (self-contradictory) while the median
+> ratios agreed (1.23× / 1.12×). Absolute values are high because that session carried ~30% background
+> load. Quiet-window breakdown (min): **det 13.2 / cls 1.6 / rec 2.9 ms, end to end 24.2 ms** — it was
+> det 17.9 / cls 1.9 / rec 4.4, end to end 34.3 before. `det` alone is no longer slower than their whole
+> pipeline. See [bench.md](bench.md) §35 / §37.2.
 
 Faces (YuNet, 640², 0.22 MB — too small for the four-engine table above):
 
 | Stage | min | median |
 |---|---:|---:|
-| Pure forward (53 Conv layers) | 5.4 | 6.1 |
+| Pure forward (53 Conv layers) | 5.4~5.7 | 5.9~6.1 |
 | Preprocess (stretch to 640² + BGR→CHW) | 1.7 | 2.8 |
 | Decode (12 outputs + NMS) | ~0.5 | ~0.5 |
 | **End to end** | **8.4** | **10.9** |
 
 > 94% of forward is those 53 Conv layers, and `Conv_0` (3→16, 3×3, s2) alone is 15%.
-> The int8 build runs but is **2.9× slower** (two extra f32 materialisations per layer);
-> all three optimisations tried were neutral or negative — [bench.md](bench.md) §36.
+> The int8 build runs but is **3.5× slower** (two extra f32 materialisations per layer, 20.3 vs 5.7 ms;
+> 11% faster than the 22.95 in §36 after the pool/resize row split); all three optimisations tried were
+> neutral or negative — [bench.md](bench.md) §36 / §37.4.
 
 **Verdict**: ONNXRuntime is still the fastest CPU engine, and the gap now splits by compute domain —
-**1.06~1.26× behind on F32 graphs**, 1.67× behind on the int8 decoder (that remainder is ORT's
-`vpdpbusd` peak against our F32 `DynamicQuantizeMatMul`), **1.7~2.1× behind on OCR** (different
-opponent, our worst area). OpenCV and SimdYolo are matched or beaten (that OpenCV day was in a bad
-state; cross-session comparisons only use ratios, see [bench.md](bench.md) §4).
+**1.05~1.28× behind on F32 graphs**, 1.67× behind on the int8 decoder (that remainder is ORT's
+`vpdpbusd` peak against our F32 `DynamicQuantizeMatMul`), **1.1~1.3× behind on OCR** (different
+opponent); OpenCV is beaten across the board (0.59~0.70×) and SimdYolo is on par (0.97~1.14×). That
+OpenCV day was in a bad state; cross-session comparisons only use ratios, see [bench.md](bench.md) §4.
 
 > Excludes pre/post-processing; sensitive to background load (±8% between runs); absolute numbers are
 > not comparable across sessions, only ratios measured within one session are. Everything, with
-> reproduction commands, lives in [bench.md](bench.md) (this table is §33 + §34.5).
+> reproduction commands, lives in [bench.md](bench.md) (this table is §28 + §34.5 + §37).
 
 ### Optimizations & results
 
@@ -1416,10 +1424,11 @@ and repro commands are in [bench.md](bench.md) — the single source of truth.
 | Hand-written native int8 kernel / P-Invoke | — | **Not needed**: with `net11.0`, `AvxVnni` is available and the 256-bit path already hits the theoretical peak |
 
 **Our weakest link (pointed at by data, not by feeling)**: against `Sdcb.SimdPaddleOCR` with identical
-models and pixels, OCR is 1.7~2.1× behind, and `det` alone (19.7 ms) loses to their entire pipeline
-(18.2 ms). The split is det 19.7 / cls 13.0 / rec 10.1 — all three sit in the "narrow channels + small
-image" fixed-overhead regime, so the next step is **fewer ops and fewer dispatches** (batch the two cls
-crops, batch/parallelise rec lines, let narrow-channel convs skip NCHWc packing) — see [bench.md](bench.md) §35.5.
+models and pixels, OCR is still **1.1~1.3×** behind (it was 1.7~2.1× back in §35). Most of the
+"narrow channels + small image" fixed overhead identified there is gone — det 17.9 → 13.2 ms, rec
+4.4 → 2.9 ms ([bench.md](bench.md) §37.2). What is left is det's Conv (6.5 ms, measured 87~195 GMAC/s)
+and its elementwise chain (~2.5 ms, purely memory bound) — **no single item above 5%**, so this is no
+longer the main line.
 
 **One lesson**: every real win came from measuring first. §29 showed 3×3 packing waste is only 5.7%;
 §30 measured the in-graph alignment rate (A 18% / B 8% / C 0%) and found 1.2 ms; §32 inferred from the
@@ -1437,7 +1446,7 @@ Conversely, roughly **half of the "obviously optimisable here" intuitions were k
 | sherpa Paraformer encoder (int8) | The 5715-node encoder sub-graph (split before the first `Loop`) runs end-to-end (`speech[1,96,560]` → `[1,97,320]`); `DynamicQuantizeLinear` + `MatMulInteger` (s8 weights, per-column zero points) match ONNXRuntime **bit-exactly** (max\|diff\| = 0). Current encoder pure forward (76 frames, 4 threads): **30.3 ms** vs ORT 24.1 ms |
 | **Paraformer end-to-end (Chinese)** | 4.54 s Chinese wav → 76 feature frames → 16 tokens → the reference sentence, character-for-character identical to ONNXRuntime; the whole chain is pure C#. **48 ms min / 65 ms median** warm (feat 4 / encoder 37 / decoder 6, 4 threads); ORT enc+dec 27.5 ms (front-end excluded) |
 | **YuNet (face detection, fp32)** | The official static `face_detection_yunet` export (`[1,3,640,640]`, 106 nodes, 8 op types). **Matches OpenCV `cv2.FaceDetectorYN` value-by-value** on the same 640×640 input: box **0.00 px**, 5 landmarks **3e-5 px**, score 5e-7 (`YuNetTests`). Detects 1 face (score 0.9135) on 512×512 lena, with coordinates mapped back to the original image; preprocessing is "stretch + BGR + raw 0..255". `face` CLI prints boxes / JSON / a marked image. Steady state (640×640, **4 threads**): forward **5.4 ms min / 6.1 ms median**; end to end (stretch 1.7 + forward + decode 0.5) **8.4 ms min / 10.9 ms median**. The 53 Conv layers are 94% of forward and `Conv_0` (3→16, 3×3, s2) alone is 15%; the three optimisations tried were all neutral or negative ([bench.md](bench.md) §36) |
-| YuNet int8 (`yunet_int8.onnx`) | ✅ supported: 53 `QLinearConv` + 16 `DequantizeLinear` + 5 `QuantizeLinear` + 6 `QLinearSigmoid` + 2 `QLinearAdd` + 4 `MaxPool` all match, runs end to end. vs fp32 on the same image: score 0.8944 vs 0.9135, box centre within ~1 px — but **2.9× slower** (22.95 vs 5.4 ms/frame, 4 threads), because each `QLinearConv` materialises f32 twice (RQ→DQ round trip) and a model this small cannot win that back. Root cause and the three attempted fixes in [bench.md](bench.md) §36 |
+| YuNet int8 (`yunet_int8.onnx`) | ✅ supported: 53 `QLinearConv` + 16 `DequantizeLinear` + 5 `QuantizeLinear` + 6 `QLinearSigmoid` + 2 `QLinearAdd` + 4 `MaxPool` all match, runs end to end. vs fp32 on the same image: score 0.8944 vs 0.9135, box centre within ~1 px — but **3.5× slower** (20.3 vs 5.7 ms/frame, 4 threads; 11% faster than the 22.95 in §36 after the pool/resize row split), because each `QLinearConv` materialises f32 twice (RQ→DQ round trip) and a model this small cannot win that back. Root cause and the three attempted fixes in [bench.md](bench.md) §36 / §37.4 |
 | SAM3 (vision / geometry / text encoders + decoder) | Box-prompted segmentation runs; decoder matches ONNXRuntime **value-by-value**; pedestrian box prompt top-1 **0.932** |
 
 > Cross-engine numbers (OnnxSharp / ONNXRuntime CPU / OpenCV 5 dnn / SimdYolo) live in [bench.md](bench.md).
