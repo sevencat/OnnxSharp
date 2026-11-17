@@ -3,11 +3,11 @@
 namespace OnnxSharp.Ocr.PaddleOCR;
 
 /// <summary>
-/// 涓€濂?PaddleOCR 妯″瀷锛坉et / rec / 鍙€?cls + 瀛楀吀锛夈€?
+/// 一套 PaddleOCR 模型（det / rec / 可选 cls + 字典）。
 /// <para>
-/// 妯″瀷鍙互<b>瀛楄妭</b>褰㈠紡鎸佹湁锛氭棦鍙互浠?ONNX 鏂囦欢璇伙紝涔熷彲浠ョ洿鎺ュ悆 nuget 妯″瀷鍖?
-/// 锛?c>Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny</c> / <c>TextLineOrientation</c>锛夐噷鐨勫祵鍏ヨ祫婧?鈥斺€?
-/// 閭ｄ簺鍖呭彧鎻愪緵 ONNX 娴佷笌瀛楀吀锛屼笉鍚帹鐞嗕唬鐮侊紝鎵€浠ュ拰鏈紩鎿庝笉鍐茬獊銆?
+/// 模型只以<b>字节</b>形式持有：既可以从 ONNX 文件读，也可以直接吃 nuget 模型包
+/// （<c>Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny</c> / <c>TextLineOrientation</c>）里的嵌入资源 ——
+/// 那些包只提供 ONNX 流与字典，不含推理代码，所以和本引擎不冲突。
 /// </para>
 /// </summary>
 public sealed class PaddleOcrModel
@@ -26,16 +26,16 @@ public sealed class PaddleOcrModel
         Name = name;
     }
 
-    /// <summary>妯″瀷鍚嶏紙浠呯敤浜庢棩蹇楋級銆?/summary>
+    /// <summary>模型名（仅用于日志）。</summary>
     public string Name { get; }
 
-    /// <summary>CTC 绫诲埆琛細绱㈠紩 0 = blank锛屾湯浣?= 绌烘牸锛圥addleOCR 绾﹀畾锛夈€?/summary>
+    /// <summary>CTC 类别表：索引 0 = blank，末位 = 空格（PaddleOCR 约定）。</summary>
     public IReadOnlyList<string> Classes => _classes;
 
-    /// <summary>鏄惁甯︽枃鏈鏂瑰悜鍒嗙被妯″瀷銆?/summary>
+    /// <summary>是否带文本行方向分类模型。</summary>
     public bool HasClassification => _classification is not null;
 
-    /// <summary>浠?ONNX 鏂囦欢 + 瀛楀吀鏂囦欢鍔犺浇銆?/summary>
+    /// <summary>从 ONNX 文件 + 字典文件加载。</summary>
     public static PaddleOcrModel FromFiles(
         string detectionPath,
         string recognitionPath,
@@ -54,7 +54,7 @@ public sealed class PaddleOcrModel
             Path.GetFileNameWithoutExtension(detectionPath));
     }
 
-    /// <summary>浠庢祦鍔犺浇锛堟ā鍨嬪寘鐨?<c>OpenRead()</c> 鍙互鐩存帴浼犺繘鏉ワ級銆?/summary>
+    /// <summary>从流加载（模型包的 <c>OpenRead()</c> 可以直接传进来）。</summary>
     public static PaddleOcrModel FromStreams(
         Stream detection,
         Stream recognition,
@@ -74,7 +74,7 @@ public sealed class PaddleOcrModel
             name ?? "paddleocr");
     }
 
-    /// <summary>浠庡唴瀛樺瓧鑺傚姞杞斤紙瀛楀吀鏄枃鏈唴瀹癸紝涓嶆槸璺緞锛夈€?/summary>
+    /// <summary>从内存字节加载（字典是文本内容，不是路径）。</summary>
     public static PaddleOcrModel FromBytes(
         byte[] detection,
         byte[] recognition,
@@ -94,8 +94,8 @@ public sealed class PaddleOcrModel
     }
 
     /// <summary>
-    /// PaddleOCR 瀛楀吀瑙ｆ瀽锛氭瘡琛屼竴涓瓧绗︼紙绌鸿涔熻淇濈暀 鈥斺€?瀛楀吀閲岀‘瀹炴湁绌虹櫧瀛楃锛夛紝
-    /// 绱㈠紩 0 琛?blank锛屾湯灏捐ˉ涓€涓┖鏍硷紙<c>use_space_char</c>锛夈€?
+    /// PaddleOCR 字典解析：每行一个字符（空行也要保留 —— 字典里确实有空白字符），
+    /// 索引 0 表示 blank，末尾补一个空格（<c>use_space_char</c>）。
     /// </summary>
     private static string[] ParseDictionary(string text)
     {
@@ -113,7 +113,7 @@ public sealed class PaddleOcrModel
                 break;
         }
 
-        // 鏂囦欢鏈熬鐨勬崲琛屼細澶氳В鏋愬嚭涓€鏉＄┖涓诧紝鍘绘帀瀹冿紙涓棿鐨勭┖琛屼繚鐣欙級銆?
+        // 文件末尾的换行会多解析出一条空项，去掉它（中间的空行保留）。
         if (raw.Count > 0 && raw[^1].Length == 0)
             raw.RemoveAt(raw.Count - 1);
 

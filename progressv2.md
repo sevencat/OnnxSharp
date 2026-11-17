@@ -350,6 +350,46 @@ v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→
 
 ## 6. 日志
 
+### 2026-11-18（车牌专用 OCR + yolo26s 支持，`bench.md §40`）
+
+- **车牌特化不是换模型**：`Ocr/Plate/` 新增 7 个文件 —— 把通用 CTC 在 6906 类上的 beam 压到车牌字符集
+  （31 省 + 24 字母 + 10 数字 + 6 后缀 ≈ 70 类，前缀打包进 `long`：7 位 rank + 高 8 位长度），
+  再加逐位约束（`PlateCharset.AllowedAt`：省/字母/数字/后缀，字母与数字排除 `I`/`O`）
+  与形态校验（`PlateNumber`：7 位燃油 / 8 位新能源 / 学警挂港澳 / 使领）。
+- **置信度换成对齐口径**：对最终序列做 CTC Viterbi（2L+1 状态）取逐字后验再几何平均，
+  比「beam 路径分」更能指出弱字（实测第一张 `浙 91% … 8 94%`，第二张 `新 17% A 44%`）。
+- **流水线不复制预处理**：`PaddleOcrPipeline` 拆出 `DetectBoxes`（返回已缩放到源图的框）与
+  `RecognizeLogits`，`PlateReader` 只做「宽高比筛 → 逐框解码 → 排序限数」。
+- **实测**（3200×1800，`--limit 960`）：`浙AES8381 97.6% NewEnergy`、`新A3M15X 62.9% Fuel`，
+  整图 825 ms（检测主导），load 7 ms；单框 rec best 3.6~5.1 ms —— beam 8 与 greedy 的差
+  落在降频噪声里（`avg` 17~30 ms 抖动），**不据此下结论**，要判需给 `plate` 加进程内交替计时。
+- **yolo26s 落地**：480×640 非方形输入、stride 8/16/32 ⇒ 6300 锚点，`detect` 的 `yoloFields`
+  改为首次 `Forward` 后按输出形状推断（84 字段自动匹配 `CocoLabels`，`--labels coco` 变可选）；
+  4 线程 forward 55.3 ms / decode 0.9 ms。新增 ORT golden 用例
+  `yolo26s: end-to-end matches onnxruntime golden`（容差 2e-2），`YoloGoldenTests.Matches`
+  参数化后 yolo11 / yolo26 共用同一套对比逻辑。
+- **修命名冲突**：`plate --box`（单框）与 `ocr --box`（DB 框分数阈值）撞名，单框入口改 `--crop`。
+- **修编码**：`DbPostprocess.cs` / `PaddleOcrModel.cs` 注释是 GBK 字节被当 UTF-8 读出的乱码
+  （原字符不可逆），按语义重写为 UTF-8；代码一行未动。
+- **`--direct` 入口**（「上游已抠出车牌」的场景正式化）：`PlateReader.ReadWhole(...)` +
+  `plate --direct` —— 整张图就是车牌时跳过 DB，直接 rec + 受限解码。
+  `仅车牌1.png` **100.0%**（best 4.45 ms）、`仅车牌2.png` **99.6%**（7.45 ms），
+  比同图走 DB 的 99.9% / 99.3% 还高一点（DB 框会裁掉号牌边缘）。反向验证：把 3840×2160 的整图
+  喂给 `--direct` 返回 **0 张**，形态校验 + 分数下限挡住了误用。
+- **一张图验证三件事**（`tests/Image/20260828092321383_121.jpg`，3840×2160）：yolo26s 出 2×`car`
+  （forward 44.9 ms / decode 0.8 ms）；车牌 `浙ABM770` 83.5% / `浙ACP5872` 82.7%；
+  普通 OCR 出 `浙A BM770` 与 **`H浙ACP5872`** —— 多出的 `H` 被车牌的受限解码剪掉，
+  这是「字符集 + 逐位规则」最直接的一次收益。车牌分偏低的原因被逐字后验定位到省字
+  （33% / 24%），是 DB 框把 3.1:1 的号牌压成 258×110 所致，**不是解码问题**。
+- **README / 版本**：包版本 `0.4.0` → **`0.5.0`**（`dotnet pack` 产出 `Sevencat.OnnxSharp.0.5.0.nupkg`）。
+  README 中英双份补齐：车牌三入口（`DetectAndRead` / `Read` / `ReadWhole`，对应 CLI
+  `默认` / `--crop` / `--direct`）、`plate` 子命令与参数表、以及新小节「OCR 模型从哪来」——
+  四条获取路径（仓库脚本解包 / 直读 `Sdcb.SimdPaddleOCR.Models.*` 的嵌入资源、纯托管无 native /
+  Sdcb 引擎共用同一份 ONNX / `paddle2onnx` 自导），其中「直读嵌入资源」那段代码在
+  `.tmp/readme-sample` 里真实编译运行过（`6906 类，cls True`）。
+- 回归：`OnnxSharp.slnx -c Release` 0 警告 0 错误；两套 TFM `122/124 passed, 2 skipped, 0 failed`
+  （新增 `PlateOcrTests` 5 例）。
+
 ### 2026-11-18（首层 `ic=3` 直接卷积 AVX-512 版：1.6×，并修 `convbench` 计时顺序偏置，`bench.md §39`）
 
 - §38.4 里唯一输给 MLAS 的层是 `3→16 640² k3s2`（1T 16.8 vs 18.0，16T 20.5 vs 123.4）。

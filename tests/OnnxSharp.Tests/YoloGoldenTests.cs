@@ -6,7 +6,7 @@ using OnnxSharp.Tensors;
 namespace OnnxSharp.Tests;
 
 /// <summary>
-/// M2 验收：yolo11n 端到端跑通，并与 onnxruntime 的 golden 逐元素对比。
+/// M2 验收：yolo11n / yolo26s 端到端跑通，并与 onnxruntime 的 golden 逐元素对比。
 /// golden 由 <c>tools/scripts/gen_golden.py</c> 生成。
 /// </summary>
 internal static class YoloGoldenTests
@@ -14,27 +14,38 @@ internal static class YoloGoldenTests
     private const string Model = @"F:\ai\models\yolo\yolo11n.onnx";
     private const string GoldenPrefix = @"F:\ai\models\yolo\golden\yolo11n";
 
+    private const string Model26 = @"F:\ai\models\yolo26\yolo26s.onnx";
+    private const string GoldenPrefix26 = @"F:\ai\models\yolo26\golden\yolo26s";
+
     /// <summary>卷积累加顺序不同会带来微小误差；yolo 输出量级约 0~640。</summary>
     private const float MaxAbsoluteError = 2e-2f;
 
     public static IEnumerable<TestCase> Cases()
     {
         yield return new("yolo11n: end-to-end matches onnxruntime golden", MatchesGolden);
+        yield return new("yolo26s: end-to-end matches onnxruntime golden", MatchesGolden26);
     }
 
+    /// <summary>yolo26s 的输入是非方形 480×640（stride 8/16/32 ⇒ 6300 个锚点）。</summary>
+    private static void MatchesGolden26()
+        => Matches(Model26, GoldenPrefix26, new TensorShape(1, 3, 480, 640), "images");
+
     private static void MatchesGolden()
+        => Matches(Model, GoldenPrefix, new TensorShape(1, 3, 640, 640), "images");
+
+    private static void Matches(string model, string goldenPrefix, TensorShape inputShape, string inputName)
     {
-        if (!File.Exists(Model))
-            throw new TestSkipException($"model not found: {Model}");
+        if (!File.Exists(model))
+            throw new TestSkipException($"model not found: {model}");
 
-        var inputPath = GoldenPrefix + ".input0.bin";
-        var outputPath = GoldenPrefix + ".output0.bin";
+        var inputPath = goldenPrefix + ".input0.bin";
+        var outputPath = goldenPrefix + ".output0.bin";
         if (!File.Exists(inputPath) || !File.Exists(outputPath))
-            throw new TestSkipException($"golden not found: {GoldenPrefix}.* (run tools/scripts/gen_golden.py)");
+            throw new TestSkipException($"golden not found: {goldenPrefix}.* (run tools/scripts/gen_golden.py)");
 
-        var net = Net.ReadModel(Model);
-        var input = ReadFloats(inputPath, new TensorShape(1, 3, 640, 640));
-        net.SetInput("images", input);
+        var net = Net.ReadModel(model);
+        var input = ReadFloats(inputPath, inputShape);
+        net.SetInput(inputName, input);
 
         var watch = Stopwatch.StartNew();
         var output = net.Forward();

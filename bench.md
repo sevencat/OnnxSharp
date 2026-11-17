@@ -3457,3 +3457,160 @@ $cli convbench --threads 16 --iters 200 --shape 3,16,640,640,3,2,1
 `DnnOps` 里已**无条件**调用（内核自己判形状），开关是 `ONNXSHARP_FIRSTCONV=0`，
 `ab`/`--a`/`--b` 认 `firstconv=`（`AbFlags` 表新加一行）。需要 AVX-512（`Avx512F.IsSupported`）。
 
+## 40. 2026-11-18 车牌专用 OCR（受限解码 + 形态校验）与 yolo26s
+
+三件事都不是「换个模型」：OCR 侧是**在既有 PaddleOCR 流水线上做算法特化**（外加一个
+「车牌裁剪图直读」入口），检测侧是**新模型形状（480×640 非方形）**的通用化。
+
+### 40.1 为什么不能直接复用通用 CTC 解码
+
+通用 `CtcDecoder` 在 6906 类上做前缀 beam：每帧把全部类别排序取 top-k。车牌字符集只有
+`31 省 + 24 字母 + 10 数字 + 6 后缀` 约 70 类，剩下 6800 多类对结果只能是噪声 ——
+`S`/`5`、`B`/`8`、`0`/`O` 这类同形竞争会白吃 beam 宽度，还会让 beam 里堆满永远不会成立的字符。
+所以特化全在「先砍类别、再按位置约束、最后用形态兜底」：
+
+| 层 | 做法 | 文件（`src/OnnxSharp/Ocr/Plate/`） |
+|---|---|---|
+| 字符集 | `PlateCharset`：rank ↔ 字符；`AllowedAt(position, length)` 逐位规则（省 / 字母 / 数字 / 后缀，字母与数字排除 `I`、`O`） | `PlateCharset.cs` |
+| 概率 | 只把字符集内 ~70 类取 `log`（blank 单算），自动判 softmax / 原始 logits | `PlateDecoder.BuildLogProbabilities` |
+| 解码 | CTC 前缀 beam（log 域 Pb/Pnb 两状态）；前缀打包进 `long`（每字符 7 位 rank + 高 8 位长度），非法长度直接剪 | `PlateBeamSearch.cs` |
+| 置信度 | 对最终序列做 CTC Viterbi 对齐（2L+1 状态）取**逐字后验**，几何平均 | `PlateAlignment.cs` |
+| 形态 | `PlateNumber.TryParse`：7 位燃油 / 8 位新能源 / 尾字 学·警·挂·港·澳 / 首字 使·领，逐位校验后判类型 | `PlateNumber.cs` |
+| 流水线 | `PlateReader`：DB 检测 → 宽高比筛（1.6~6.5）→ 逐框受限解码 → 按分排序取 top-N | `PlateReader.cs` |
+
+`PaddleOcrPipeline` 为此拆出两个内部入口 `DetectBoxes`（返回**已缩放到源图**的框）与
+`RecognizeLogits`（返回 `[1,T,C]` 原始 logits），通用 `ocr` 与 `plate` 共用，没有第二份预处理代码。
+
+### 40.2 实测：3200×1800 真实图（4 线程，`--limit 960`）
+
+```powershell
+$cli plate F:/ai/20260828093055568_121.jpg --det .tmp/ocr-models/det.onnx `
+     --rec .tmp/ocr-models/rec.onnx --dict .tmp/ocr-models/dict.txt --limit 960
+```
+
+| 输出 | 分数 | 类型 | 框 |
+|---|---:|---|---|
+| `浙AES8381` | 97.6% | NewEnergy（8 位） | 1755,203 187×64 |
+| `新A3M15X` | 62.9% | Fuel（7 位） | 1766,1478 212×85 |
+
+逐字后验直接指出弱字，不用再猜「为什么这张不准」：
+
+```
+浙 91% A 100% E 100% S  98% 8 100% 3 100% 8 94% 1 100%
+新 17% A  44% 3 100% M  94% 1  68% 5 100% X 81%        ← 低分框，肉眼也糊
+```
+
+整图端到端 **825 ms**（`load` 7 ms；DB 在 960×540 上跑，检测主导），输出 2 张。
+
+**三种入口**（决定「要不要先找车牌」）：
+
+| 入口 | 场景 | DB 检测 | 单位 |
+|---|---|---|---|
+| 默认 | 整图，自己找车牌 | 跑 | 整图 |
+| `--crop x,y,w,h` | 上游给了框，框在整图里 | 跳过 | 单块 |
+| `--direct` | 上游已把车牌抠成一张图，输入就是车牌 | 跳过 | 整图（即那块） |
+
+`tests/Image/` 的两张纯车牌图（`--direct`）：
+
+| 图 | 输出 | 分数 | 类型 | rec best（beam 8，n=20） |
+|---|---|---:|---|---:|
+| `仅车牌1.png` 135×46 | `浙ABM770` | **100.0%** | Fuel | 4.45 ms |
+| `仅车牌2.png` 175×49 | `浙ACP5872` | **99.6%** | NewEnergy | 7.45 ms |
+
+同一张图走默认通路（DB 先找行再认）是 99.9% / 99.3%：`--direct` 不只省掉一次 DB 前向，
+分数还略高 —— DB 的框会把车牌边缘裁掉一点。首次调用 0.2~0.3 s 是 rec 图的导入（形状特化），
+稳态才是上表的毫秒数。
+
+反向验证：把 3840×2160 的整图直接喂给 `--direct`（`result : 0 张`）——形态校验 +
+逐字几何平均分把它拦住了，不会因为「用户选错通路」而吐出一个假号牌。
+
+单框稳态（`--crop 1755,203,187,64 --iters 20`，交替跑 3 轮）：
+
+| 模式 | rec best | 说明 |
+|---|---:|---|
+| beam 8 + 结构约束 | 3.63 ~ 5.11 ms | 默认 |
+| greedy（`--greedy`） | 4.36 ~ 5.02 ms | **与 beam 分不开** |
+
+同一框在同一进程里只有单模式，跨进程交替读数被降频抹平（`avg` 在 17~30 ms 间跳），
+所以**不据此宣称 greedy 更快** —— 要这个结论得给 `plate` 加进程内交替计时（同 §39.3）。
+首次调用约 280~330 ms 是 rec 图的导入（形状特化），稳态才是上表。
+
+### 40.3 一张图同时验证三件事（`tests/Image/20260828092321383_121.jpg`，3840×2160）
+
+两辆车、两块蓝牌，正好是三条通路的共用样例：
+
+| 通路 | 命令要点 | 结果 | 耗时 |
+|---|---|---|---:|
+| yolo26s 检测 | `detect F:\ai\models\yolo26\yolo26s.onnx <img> --conf 0.35 --iters 10` | 2×`car` 0.9049 / 0.8912 | forward 44.93 ms，decode 0.78 ms |
+| 车牌（默认，走 DB） | `plate <img> --det ... --rec ... --dict ... --limit 960` | `浙ABM770` 83.5% Fuel、`浙ACP5872` 82.7% NewEnergy | 964 ms |
+| 普通 OCR | `ocr <img> --det ... --rec ... --dict ... --limit 960` | `浙A BM770` (0.857)、**`H浙ACP5872`** (0.834) | 617 ms |
+
+三条通路正好互补：
+
+- **yolo26s**：3840×2160 缩 0.1667× 到 640×480、上下各 pad 60，出的 `car` 框换算回原图坐标
+  （1951.8,1055.4 / 1831.6,1.8），和车牌框位置对得上。
+- **普通 OCR 多认一个字**：第二块牌出来 `H浙ACP5872` —— DB 框把号牌左侧的贴字/边框带了进来。
+  车牌路径的受限解码把它剪掉了（`H` 不在逐位允许集里），输出干净的 `浙ACP5872`。
+  这就是「字符集 + 逐位规则」最直接的一次收益。
+- **车牌分数低于 §40.2 那张图**（83.5% vs 97.6%），逐字后验直接指出原因：省字只有 **33% / 24%**，
+  后 7 位都在 90~100%。3840 宽图上 DB 给的框是 258×110（真实号牌约 3.1:1），省字被压窄，
+  **是检出框精度问题而不是解码问题** —— 换成上游给框（`--crop`）/ `--direct` 就回到 99%+。
+
+### 40.4 yolo26s：非方形输入
+
+模型 `F:\ai\models\yolo26\yolo26s.onnx`（38 MB）。输出布局仍是 `[1,84,N]` / `[1,N,84]`，
+`84 = 4 + 80` 由字段数反推为 COCO，因此 `detect` 不必再传 `--labels coco`：
+
+```powershell
+$cli detect F:\ai\models\yolo26\yolo26s.onnx F:/ai/20260828093055568_121.jpg --conf 0.4 --iters 5
+```
+
+```
+input      : [1, 3, 480, 640]  (3200x1800 -> 640x480 (scale 0.2000x0.2000, pad 0,60))
+preprocess : 2.12 ms
+forward    : 55.33 ms  (min of 5)
+decode     : 0.92 ms
+detections : 2   car 0.9103 [1497.0, 0.3, 701.5x298.5] / car 0.8726 [1486.2, 588.5, 780.0x1084.2]
+```
+
+- **新形状**：yolo26s 输入是 480×640（yolo11 是 640×640），stride 8/16/32 下锚点
+  `60×80 + 30×40 + 15×20 = 6300`。解码按输出形状自适应，letterbox 的 pad 是 `(0, 60)`，
+  坐标反算回原图仍准（检测框贴图像上下边）。
+- **标签推断**：以前 `detect` 把「第二维 = 84 ⇒ COCO」当路径判断，现在在首次 `Forward` 之后
+  由输出形状推断 `yoloFields`，`--labels coco` 变成可选。
+- **正确性**：新增 `yolo26s: end-to-end matches onnxruntime golden`
+  （golden 由 `tools/scripts/gen_golden.py` 走 ORT 生成，逐元素容差 2e-2，输入 `[1,3,480,640]`）。
+  `YoloGoldenTests` 参数化成 `Matches(model, goldenPrefix, inputShape, inputName)`，yolo11 与 yolo26 共用一套对比逻辑。
+
+### 40.5 顺带修掉的东西
+
+- 新增 `PlateReader.ReadWhole(...)` + `plate --direct`：整张图就是车牌时跳过 DB，
+  这是「上游检测器先抠车牌、再把裁剪图丢进来识别」的正式入口。
+- `plate` 的 `--box` 与 `ocr` 的 `--box`（DB 框分数阈值）撞名：单框入口改名 **`--crop x,y,w,h`**，
+  `--box` 恢复为阈值语义（`--crop` / `--direct` 与 `--iters` 一起用才计时）。
+- `Ocr/PaddleOCR/DbPostprocess.cs`、`PaddleOcrModel.cs` 的注释是 GBK 字节被当 UTF-8 读出来的乱码
+  （原字符已不可逆），按语义重写为 UTF-8 中文；代码一行未动。
+- 主帮助补上 `plate` 子命令（之前只在 `plate` 自己的 usage 里）。
+
+### 40.5 回归与复现
+
+- `dotnet build OnnxSharp.slnx -c Release`：0 警告 0 错误。
+- 单测两套 TFM：`122/124 passed, 2 skipped, 0 failed`，其中新增 `PlateOcrTests` 5 例
+  （字符集/rank 唯一性与逐位规则、号牌解析、受限解码屏蔽字符集外赢家、beam 比贪心多保一字、非法长度被拒）。
+
+本节命令里 `tests\Image\` 下的三张图（`20260828092321383_121.jpg`、`仅车牌1.png`、`仅车牌2.png`）
+是本地素材，尚未纳入 git；换成任意等价图片即可复现。
+
+```powershell
+$cli = 'tools\OnnxSharp.Cli\bin\Release\net11.0\OnnxSharp.Cli.exe'
+& $cli plate <image> --det .tmp/ocr-models/det.onnx --rec .tmp/ocr-models/rec.onnx `
+     --dict .tmp/ocr-models/dict.txt --limit 960 --json out.json
+& $cli plate <image> ... --crop 1755,203,187,64 --iters 20        # 单框稳态（beam 8）
+& $cli plate <image> ... --crop 1755,203,187,64 --greedy           # 贪心对照
+& $cli plate <image> ... --no-structure --loose --score 0.3        # 关逐位约束 / 关形态校验 / 放宽阈值
+& $cli plate tests\Image\仅车牌1.png ... --direct --iters 20       # 输入本身就是一张车牌
+& $cli detect F:\ai\models\yolo26\yolo26s.onnx <image> --conf 0.4 --iters 40
+& $cli detect F:\ai\models\yolo26\yolo26s.onnx tests\Image\20260828092321383_121.jpg --conf 0.35
+& $cli ocr tests\Image\20260828092321383_121.jpg --det ... --rec ... --dict ... --limit 960
+```
+

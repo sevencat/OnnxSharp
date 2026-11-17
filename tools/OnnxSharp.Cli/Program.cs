@@ -38,6 +38,7 @@ return args[0].ToLowerInvariant() switch
     "features" => Features(args),
     "asr" => Asr(args),
     "ocr" => Ocr(args),
+    "plate" => Plate(args),
     "sam3" => Sam3(args),
     "gemmbench" => GemmBench(args),
     "parbench" => ParBench(args),
@@ -77,6 +78,11 @@ static int Usage()
     Console.WriteLine("                                      # 输入已预处理好的 F32，跳过 letterbox");
     Console.WriteLine("  OnnxSharp.Cli ocr <image> --det det.onnx --rec rec.onnx --dict keys.txt [--out marked.jpg]");
     Console.WriteLine("                     [--cls cls.onnx] [--limit 960] [--box 0.6] [--unclip 1.6] [--json]");
+    Console.WriteLine("  OnnxSharp.Cli plate <image> --det det.onnx --rec rec.onnx --dict keys.txt [--beam 8]");
+    Console.WriteLine("                     [--greedy] [--no-structure] [--loose] [--score 0.5]");
+    Console.WriteLine("                     [--direct | --crop x,y,w,h] [--json]");
+    Console.WriteLine("                                      # 车牌专用：受限字符集 + 逐位约束 + 号牌形态校验");
+    Console.WriteLine("                                      # --direct：输入已是一张车牌裁剪图，跳过检测");
     Console.WriteLine("  OnnxSharp.Cli face <yunet.onnx> <image> [--conf 0.6] [--iou 0.3] [--topk 5000]");
     Console.WriteLine("                     [--max-faces N] [--json out.json] [--out marked.jpg]");
     Console.WriteLine("                                      # YuNet 人脸检测：框 + 5 点关键点，坐标是原图像素");
@@ -1814,6 +1820,9 @@ static int Detect(string[] args)
     float? iou;
     string inputDescription;
 
+    // 检测头每锚点的字段数（4+类别数），只有 yolo 家族才有意义
+    int yoloFields = 0;
+
     if (!rfdetr)
     {
         var detectorOptions = new DetectorOptions
@@ -1859,6 +1868,14 @@ static int Detect(string[] args)
             var forward = Stopwatch.StartNew();
             var output = net.Forward();
             forwardMilliseconds = Math.Min(forwardMilliseconds, forward.Elapsed.TotalMilliseconds);
+
+            if (yoloFields == 0 && detectorOptions.Layout != OutputLayout.EndToEnd && output.Shape.Rank == 3)
+            {
+                // 84×6300 与 6300×84 都取小的那一维（端到端 [1,300,6] 上面已经排除了）
+                int first = output.Shape[1];
+                int second = output.Shape[2];
+                yoloFields = first < second ? first : second;
+            }
 
             var decode = Stopwatch.StartNew();
             detections = detector.Decode(output, transform);
@@ -1930,7 +1947,10 @@ static int Detect(string[] args)
                            $"({sourceWidth}x{sourceHeight} -> stretch, {detector.BoxesOutputName}/{detector.LogitsOutputName})";
     }
 
-    var labels = LoadLabels(options.GetString("--labels"));
+    // 没显式给 --labels 时按检测头维度猜：84 = 4 + 80，就是 COCO 那套公开权重
+    // （yolov8 / yolo11 / yolo26 都一样）。自定义类别数的模型不会误判。
+    var labels = LoadLabels(options.GetString("--labels"))
+        ?? (yoloFields == CocoLabels.DetectionFields ? CocoLabels.Names : null);
 
     Console.WriteLine($"model      : {modelPath}");
     if (image is { } sourceImage)
@@ -2058,7 +2078,7 @@ static int Face(string[] args)
 
 // ---------------- 画框 / 保存（ImageFacade） ----------------
 /// <summary>把检测框画到源图上并另存（ImageFacade 自绘 + 内置中文字体，纯托管）。</summary>
-static void SaveDetections(CliImage image, IReadOnlyList<Detection> detections, string[]? labels, string path)
+static void SaveDetections(CliImage image, IReadOnlyList<Detection> detections, IReadOnlyList<string>? labels, string path)
 {
     var drawn = new FacadeDetection[detections.Count];
     for (int i = 0; i < drawn.Length; i++)
@@ -2206,6 +2226,226 @@ static int Ocr(string[] args)
     Console.WriteLine($"  result : {lines.Count} 行，{watch.Elapsed.TotalMilliseconds:F1} ms（limit {ocrOptions.DetLimitSide}）");
     foreach (OcrLine line in lines)
         Console.WriteLine("    " + line);
+    return 0;
+}
+
+// ---------------- 车牌 OCR：DB 找行 → 受限 CTC 解码 ----------------
+
+static int Plate(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("usage: plate <image> --det det.onnx --rec rec.onnx --dict ppocr_keys.txt");
+        Console.Error.WriteLine("                     [--beam 8] [--greedy] [--no-structure] [--loose] [--score 0.5] [--max 4]");
+        Console.Error.WriteLine("                     [--no-aspect] [--limit 960] [--det-conf 0.3] [--box 0.6] [--unclip 1.6]");
+        Console.Error.WriteLine("                     [--direct] [--crop x,y,w,h] [--iters N] [--json out.json]");
+        Console.Error.WriteLine("       --direct 整张图就是一张车牌（上游检测器已抠出的裁剪图）——不跑 DB 检测；");
+        Console.Error.WriteLine("       --crop x,y,w,h 在整图里指定一块车牌区域——同样跳过 DB 检测；");
+        Console.Error.WriteLine("       --iters 只与 --direct / --crop 一起用，量的是单张 rec 的稳态耗时（首次含图导入）");
+        return 2;
+    }
+
+    string imagePath = args[1];
+    CliOptions options = ParseOptions(args, 2);
+
+    string? detPath = options.GetString("--det");
+    string? recPath = options.GetString("--rec");
+    string? dictPath = options.GetString("--dict");
+
+    if (detPath is null || recPath is null || dictPath is null)
+    {
+        Console.Error.WriteLine("plate 需要 --det / --rec / --dict（PaddleOCR 的 det.onnx / rec.onnx / 字典）");
+        return 2;
+    }
+
+    if (!File.Exists(imagePath))
+    {
+        Console.Error.WriteLine($"image not found: {imagePath}");
+        return 2;
+    }
+
+    var ocrOptions = new PaddleOcrOptions
+    {
+        DetLimitSide = options.GetInt("--limit", 960),
+        DetThreshold = options.GetFloat("--det-conf", 0.3f),
+        BoxThreshold = options.GetFloat("--box", 0.6f),
+        UnclipRatio = options.GetFloat("--unclip", 1.6f),
+        RecMaxWidth = options.GetInt("--rec-width", 640),
+        UseClassification = false,
+    };
+
+    var readerOptions = new OnnxSharp.Ocr.Plate.PlateReaderOptions
+    {
+        Decoder = new OnnxSharp.Ocr.Plate.PlateDecoderOptions
+        {
+            BeamWidth = options.Has("--greedy") ? 1 : options.GetInt("--beam", 8),
+            UseStructure = !options.Has("--no-structure"),
+            Validate = !options.Has("--loose"),
+        },
+        MinScore = options.GetFloat("--score", 0.5f),
+        MaxPlates = options.GetInt("--max", 4),
+        FilterByAspect = !options.Has("--no-aspect"),
+    };
+
+    var loadWatch = System.Diagnostics.Stopwatch.StartNew();
+    PaddleOcrModel model = PaddleOcrModel.FromFiles(detPath, recPath, dictPath);
+    var pipeline = new PaddleOcrPipeline(model, ocrOptions);
+    var reader = new OnnxSharp.Ocr.Plate.PlateReader(pipeline, readerOptions);
+    loadWatch.Stop();
+
+    using CliImage image = CliImage.Load(imagePath);
+
+    // 两条「跳过 DB 检测」的通路：
+    //   --direct          整张图就是一张车牌（上游检测器已抠出 / 手工裁好的裁剪图）
+    //   --crop x,y,w,h    在整图里指定一块车牌区域（车牌检测器已经在跑的场景）
+    // 注意不能叫 --box：那是 DB 的框分数阈值（和 ocr 子命令保持一致）。
+    byte[] pixels = image.Pixels;
+    int imageWidth = image.Width;
+    int imageHeight = image.Height;
+
+    string? cropText = options.GetString("--crop");
+    bool direct = options.Has("--direct");
+    int[]? crop = null;
+
+    if (cropText is not null)
+    {
+        crop = cropText.Split(',').Select(int.Parse).ToArray();
+        if (crop.Length != 4)
+        {
+            Console.Error.WriteLine("--crop 需要 x,y,w,h");
+            return 2;
+        }
+    }
+
+    if (direct && crop is not null)
+    {
+        Console.Error.WriteLine("--direct（整图即车牌）与 --crop（指定一块）只能选一个");
+        return 2;
+    }
+
+    string mode = direct ? "direct" : crop is not null ? "crop" : "detect";
+    bool skipDetect = direct || crop is not null;
+
+    // --direct / --crop / --iters 共用这一条，保证「显示的结果」与「计时测的事」是同一件事
+    OnnxSharp.Ocr.Plate.PlateResult? ReadSingle() => direct
+        ? reader.ReadWhole(pixels, imageWidth, imageHeight, OcrPixelFormat.Rgb24)
+        : reader.Read(pixels, imageWidth, imageHeight, OcrPixelFormat.Rgb24, 0, crop![0], crop![1], crop[2], crop[3]);
+
+    var watch = System.Diagnostics.Stopwatch.StartNew();
+    IReadOnlyList<OnnxSharp.Ocr.Plate.PlateResult> plates;
+
+    if (skipDetect)
+    {
+        OnnxSharp.Ocr.Plate.PlateResult? single = ReadSingle();
+        plates = single is null ? [] : [single];
+    }
+    else
+    {
+        plates = reader.DetectAndRead(pixels, imageWidth, imageHeight, OcrPixelFormat.Rgb24);
+    }
+
+    watch.Stop();
+
+    // --iters N：只给 --direct / --crop 做稳态计时（rec 图像第一次调用要付约 300 ms 的图导入）
+    int iters = options.GetInt("--iters", 1);
+    double bestMs = 0;
+    double avgMs = 0;
+
+    if (iters > 1 && skipDetect && plates.Count > 0)
+    {
+        bestMs = double.MaxValue;
+        double total = 0;
+
+        for (int i = 0; i < iters; i++)
+        {
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            ReadSingle();
+            timer.Stop();
+
+            bestMs = Math.Min(bestMs, timer.Elapsed.TotalMilliseconds);
+            total += timer.Elapsed.TotalMilliseconds;
+        }
+
+        avgMs = total / iters;
+    }
+
+    string? jsonPath = options.GetString("--json");
+    if (!string.IsNullOrEmpty(jsonPath))
+    {
+        using var stream = File.Create(jsonPath);
+        using var json = new Utf8JsonWriter(stream, new JsonWriterOptions
+        {
+            Indented = true,
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+
+        json.WriteStartObject();
+        json.WriteString("image", Path.GetFileName(imagePath));
+        json.WriteNumber("width", image.Width);
+        json.WriteNumber("height", image.Height);
+        json.WriteString("model", model.ToString());
+        json.WriteString("mode", mode);
+        json.WriteNumber("beam", readerOptions.Decoder.BeamWidth);
+        json.WriteBoolean("structure", readerOptions.Decoder.UseStructure);
+        json.WriteNumber("elapsedMs", Math.Round(watch.Elapsed.TotalMilliseconds, 2));
+        json.WriteStartArray("plates");
+
+        foreach (OnnxSharp.Ocr.Plate.PlateResult plate in plates)
+        {
+            json.WriteStartObject();
+            json.WriteString("text", plate.Text);
+            json.WriteNumber("score", Math.Round(plate.Score, 4));
+            json.WriteNumber("probability", Math.Round(plate.Decoding.Probability, 6));
+            json.WriteString("kind", plate.Plate?.Kind.ToString() ?? "Unknown");
+            json.WriteString("province", plate.Plate?.Province.ToString() ?? string.Empty);
+            json.WriteString("letter", plate.Plate?.Letter.ToString() ?? string.Empty);
+            json.WriteString("serial", plate.Plate?.Serial ?? string.Empty);
+            json.WriteStartArray("box");
+            json.WriteNumberValue(plate.X);
+            json.WriteNumberValue(plate.Y);
+            json.WriteNumberValue(plate.Width);
+            json.WriteNumberValue(plate.Height);
+            json.WriteEndArray();
+            json.WriteStartArray("chars");
+            foreach (float score in plate.Decoding.CharScores)
+                json.WriteNumberValue(Math.Round(score, 4));
+            json.WriteEndArray();
+            json.WriteEndObject();
+        }
+
+        json.WriteEndArray();
+        json.WriteEndObject();
+        json.Flush();
+
+        Console.WriteLine($"{Path.GetFileName(imagePath)} {image.Width}x{image.Height}  ->  {Path.GetFullPath(jsonPath)}");
+        Console.WriteLine($"  result : {plates.Count} 张，{watch.Elapsed.TotalMilliseconds:F1} ms");
+        return 0;
+    }
+
+    Console.WriteLine($"{Path.GetFileName(imagePath)} {image.Width}x{image.Height}");
+    Console.WriteLine($"  model  : {model}  (beam {readerOptions.Decoder.BeamWidth}, structure {(readerOptions.Decoder.UseStructure ? "on" : "off")})");
+    Console.WriteLine($"  load   : {loadWatch.ElapsedMilliseconds} ms");
+    Console.WriteLine(skipDetect
+        ? $"  result : {plates.Count} 张，{watch.Elapsed.TotalMilliseconds:F1} ms（{(direct ? "direct：整图即车牌，无 DB" : "crop：指定块，无 DB")}）"
+        : $"  result : {plates.Count} 张，{watch.Elapsed.TotalMilliseconds:F1} ms（limit {ocrOptions.DetLimitSide}）");
+
+    if (iters > 1 && bestMs > 0)
+        Console.WriteLine($"  rec    : best {bestMs:F2} ms / avg {avgMs:F2} ms  (n={iters}, beam {readerOptions.Decoder.BeamWidth})");
+
+    foreach (OnnxSharp.Ocr.Plate.PlateResult plate in plates)
+    {
+        string kind = plate.Plate?.Kind.ToString() ?? "-";
+        Console.WriteLine($"    {plate.Text,-10} {plate.Score,6:P1}  {kind,-9}  [{plate.X},{plate.Y} {plate.Width}x{plate.Height}]");
+
+        if (plate.Decoding.CharScores.Length > 0)
+        {
+            Console.Write("        ");
+            for (int i = 0; i < plate.Decoding.CharScores.Length && i < plate.Text.Length; i++)
+                Console.Write($"{plate.Text[i]}{plate.Decoding.CharScores[i],5:P0} ");
+            Console.WriteLine();
+        }
+    }
+
     return 0;
 }
 
@@ -2504,11 +2744,15 @@ static OutputLayout ParseOutputLayout(string? text) => text?.ToLowerInvariant() 
     _ => OutputLayout.Auto,
 };
 
-static string[]? LoadLabels(string? path)
-    => path is null ? null : File.ReadAllLines(path).Select(line => line.Trim()).ToArray();
+static IReadOnlyList<string>? LoadLabels(string? path)
+    => path is null
+        ? null
+        : path.Equals("coco", StringComparison.OrdinalIgnoreCase)
+            ? CocoLabels.Names
+            : File.ReadAllLines(path).Select(line => line.Trim()).ToArray();
 
-static string LabelOf(string[]? labels, int classId)
-    => labels is not null && classId >= 0 && classId < labels.Length ? labels[classId] : $"class{classId}";
+static string LabelOf(IReadOnlyList<string>? labels, int classId)
+    => labels is not null && classId >= 0 && classId < labels.Count ? labels[classId] : $"class{classId}";
 
 static void WriteDetectJson(
     string path,
@@ -2523,7 +2767,7 @@ static void WriteDetectJson(
     double forwardMilliseconds,
     double decodeMilliseconds,
     IReadOnlyList<Detection> detections,
-    string[]? labels)
+    IReadOnlyList<string>? labels)
 {
     using var stream = File.Create(path);
     using var json = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
@@ -2551,7 +2795,7 @@ static void WriteDetectJson(
     {
         json.WriteStartObject();
         json.WriteNumber("classId", detection.ClassId);
-        if (labels is not null && detection.ClassId >= 0 && detection.ClassId < labels.Length)
+        if (labels is not null && detection.ClassId >= 0 && detection.ClassId < labels.Count)
             json.WriteString("name", labels[detection.ClassId]);
         json.WriteNumber("score", Math.Round(detection.Score, 5));
         json.WriteNumber("x", Math.Round(detection.X, 2));

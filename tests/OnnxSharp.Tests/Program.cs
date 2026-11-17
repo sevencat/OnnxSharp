@@ -26,6 +26,7 @@ cases.AddRange(FbankTests.Cases());
 cases.AddRange(AsrEndToEndTests.Cases());
 cases.AddRange(AsrEncoderTests.Cases());
 cases.AddRange(OcrTests.Cases());
+cases.AddRange(PlateOcrTests.Cases());
 cases.AddRange(Sam3Tests.Cases());
 cases.AddRange(YoloGoldenTests.Cases());
 cases.AddRange(SafeTensorTests.Cases());

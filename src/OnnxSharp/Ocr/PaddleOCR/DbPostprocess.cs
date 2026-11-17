@@ -1,11 +1,11 @@
 ﻿namespace OnnxSharp.Ocr.PaddleOCR;
 
 /// <summary>
-/// DB锛圖ifferentiable Binarization锛夋娴嬪悗澶勭悊锛氭鐜囧浘 鈫?鏂囨湰妗嗐€?
+/// DB（Differentiable Binarization）检测后处理：概率图 → 文本框。
 /// <para>
-/// 绠€鍖栫増 PaddleOCR <c>DBPostProcess</c>锛? 閭诲煙杩為€氬煙 鈫?杞村榻愬鎺ユ 鈫?鎸?
-/// <c>闈㈢Н 脳 unclip_ratio / 鍛ㄩ暱</c> 澶栨墿锛圥addleOCR 鐢?pyclipper 鍋氬杈瑰舰澶栨墿锛?
-/// 杩欓噷鍙湪杞村榻愭涓婂鎵╋細绔栨帓 / 鍊炬枩鏂囨湰浠嶈兘妗嗕綇锛屽彧鏄鏄鐨勶級銆?
+/// 简化版 PaddleOCR <c>DBPostProcess</c>：邻域连通域 → 轴对齐外接框 → 按
+/// <c>面积 × unclip_ratio / 周长</c> 外扩（PaddleOCR 用 pyclipper 做多边形外扩，
+/// 这里只在轴对齐框上外扩：竖排 / 倾斜文本仍能框住，只是框是正的）。
 /// </para>
 /// </summary>
 internal static class DbPostprocess
@@ -88,7 +88,7 @@ internal static class DbPostprocess
             boxes.Add(new Box(minX - grow, minY - grow, boxWidth + 2 * grow, boxHeight + 2 * grow, score));
         }
 
-        // 闃呰椤哄簭锛氬厛涓婂悗涓嬨€佸厛宸﹀悗鍙筹紙鍚屼竴琛屽唴鎸?x 鎺掞級
+        // 阅读顺序：先上后下、先左后右（同一行内按 x 排）
         boxes.Sort((a, b) =>
         {
             float dy = a.Y - b.Y;
@@ -100,7 +100,7 @@ internal static class DbPostprocess
         return boxes;
     }
 
-    /// <summary>鎶婃鐜囧浘鍧愭爣绯荤殑妗嗙缉鏀惧埌鍘熷浘锛屽苟瑁佸壀鍒板浘鍐呫€?/summary>
+    /// <summary>把概率图坐标系的框缩放到原图，并裁剪到图内。</summary>
     public static Box Scale(Box box, float scaleX, float scaleY, int imageWidth, int imageHeight)
     {
         float x = MathF.Max(0, box.X * scaleX);

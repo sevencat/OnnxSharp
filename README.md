@@ -93,6 +93,7 @@
 | 线程 | 默认 **物理核数**（Windows 上取 `GetLogicalProcessorInformationEx`，其余平台退回 `ProcessorCount`），可用 `ONNXSHARP_THREADS` 覆盖。超线程对这些 FP 密集内核没有吞吐收益，多出来的自旋线程只会互相抢时间片。**基准与调优一律按 4 线程** —— 目标不是占满整机，而是少核下也够快 |
 | 视觉门面 | `OnnxSharp.Vision`：letterbox / stretch 预处理、YOLO 解码 + NMS、RF-DETR 解码、YuNet 人脸（框 + 5 点关键点 + NMS），返回**原图坐标**的框 |
 | OCR 门面 | `OnnxSharp.Ocr.PaddleOCR`：PP-OCRv6 det + 可选 cls + rec，DB 后处理 + CTC 解码，返回**原图坐标**的文本行 |
+| 车牌门面 | `OnnxSharp.Ocr.Plate`：同一份 det/rec 上的**解码侧特化** —— 受限字符集（~70 类）+ 逐位规则 + CTC Viterbi 逐字后验 + 号牌形态校验；`DetectAndRead`（整图）/ `Read`（已给框）/ `ReadWhole`（输入本身就是车牌裁剪图） |
 | 动态图 | `Net.ReadModel(path, 输入形状)` 把全动态输入（`x[N,3,H,W]`）**特化**成静态图，导入期即可折叠形状链 |
 | 像素输入 | RGB 或 BGR（`bgr` 开关）+ 任意行跨度（`rowStride`，字节）—— OpenCV `Mat`、相机 SDK 的对齐缓冲可直接喂，不必先压成紧凑数组 |
 | 工具 | `OnnxSharp.Cli`：结构 dump、跑一次、计时、逐算子 profile、直接图片检测 |
@@ -101,10 +102,10 @@
 
 ### 安装
 
-**仓库**：[github.com/sevencat/OnnxSharp](https://github.com/sevencat/OnnxSharp) ｜ **NuGet**：[`Sevencat.OnnxSharp`](https://www.nuget.org/packages/Sevencat.OnnxSharp) ｜ **版本**：`0.4.0` —— 包名带前缀，命名空间仍是 `OnnxSharp`。
+**仓库**：[github.com/sevencat/OnnxSharp](https://github.com/sevencat/OnnxSharp) ｜ **NuGet**：[`Sevencat.OnnxSharp`](https://www.nuget.org/packages/Sevencat.OnnxSharp) ｜ **版本**：`0.5.0` —— 包名带前缀，命名空间仍是 `OnnxSharp`。
 
 ```powershell
-dotnet add package Sevencat.OnnxSharp --version 0.4.0
+dotnet add package Sevencat.OnnxSharp --version 0.5.0
 ```
 
 包的版本列表、依赖与各 TFM 的产物见 NuGet 页面：[nuget.org/packages/Sevencat.OnnxSharp](https://www.nuget.org/packages/Sevencat.OnnxSharp#versions-body-tab)。
@@ -117,7 +118,7 @@ dotnet add package Sevencat.OnnxSharp --version 0.4.0
 
 ```powershell
 dotnet build OnnxSharp.slnx -c Release
-dotnet run --project tests/OnnxSharp.Tests -c Release    # 59 个用例（3 个需本地模型，缺失则 SKIP），全通过退出码 0
+dotnet run --project tests/OnnxSharp.Tests -c Release    # 124 个用例（含 yolo26 / OCR 的 golden 对比，缺本地模型则 SKIP），全通过退出码 0
 ```
 
 准备一个 ONNX 模型（例如 `yolo11n.onnx`）和一张图，用 CLI 直接检测：
@@ -160,6 +161,28 @@ page.jpg 3200x1800
   result : 3 行，849.4 ms
     浙A ES8381  (0.883)  [1752,199,198x68]
     浙A：:3M15X  (0.802)  [1769,1482,202x72]
+```
+
+车牌用**同一份** det/rec，换 `plate` 子命令（受限字符集 + 逐位约束 + 号牌形态校验）：
+
+```powershell
+& $cli plate page.jpg --det .tmp\ocr-models\det.onnx --rec .tmp\ocr-models\rec.onnx `
+                      --dict .tmp\ocr-models\dict.txt --limit 960
+```
+
+```
+page.jpg 3200x1800
+  result : 2 张，850.7 ms（limit 960）
+    浙AES8381    97.6%  NewEnergy  [1755,203 187x64]
+        浙  91% A 100% E 100% S  98% 8 100% 3 100% 8  94% 1 100%
+    新A3M15X     62.9%  Fuel       [1766,1478 212x85]
+        新  17% A  44% 3 100% M  94% 1  68% 5 100% X  81%
+```
+
+如果车牌已经被别的办法（YOLO / 颜色分割 / 手工）抠成一张图，加 `--direct` 就跳过检测直接识别：
+
+```powershell
+& $cli plate plate-crop.png ... --direct     # 输入就是车牌：浙ABM770 100.0%
 ```
 
 ### 库用法 1：自己管张量
@@ -276,8 +299,8 @@ var kept = DetectionNms.Suppress(candidates, iouThreshold: 0.45f, maxDetections:
 ```csharp
 using OnnxSharp.Ocr.PaddleOCR;
 
-// 模型来自 PP-OCRv6 的 ONNX 导出；也可以直接吃 nuget 模型包的嵌入资源：
-//   PaddleOcrModel.FromStreams(ChineseV6TinyModel.Detection.OpenRead(), ...)
+// 模型来自 PP-OCRv6 的 ONNX 导出；也可以直接吃 nuget 模型包的嵌入资源（见「OCR 模型从哪来」）：
+//   PaddleOcrModel.FromStreams(ChineseV6TinyModels.Default.Detection.OpenRead(), ...)
 var model = PaddleOcrModel.FromFiles("det.onnx", "rec.onnx", "ppocr_keys.txt", "cls.onnx");
 
 var ocr = new PaddleOcrPipeline(model, new PaddleOcrOptions
@@ -303,6 +326,54 @@ foreach (OcrLine line in ocr.Run(pixels, width, height, OcrPixelFormat.Bgra32, s
 - 模型包里**只有 ONNX 与字典、没有推理代码**，所以本库不依赖 `Sdcb.SimdPaddleOCR` 的引擎，只借它的模型资源
   （`tools/scripts/extract_ocr_models.ps1` 把资源原样解出）。它作为**外部对照基准**跑过一次同模型同图的
   4 线程同会话 median 慢 1.12~1.23×（`bench.md` §35 时 1.7~2.1×，已收窄，见 §37.2），基准代码在 `.tmp/ocrbench`（不进仓库）。
+
+#### 车牌：受限解码 + 形态校验（`OnnxSharp.Ocr.Plate`）
+
+车牌**不需要专门模型** —— 通用 PP-OCRv6 的 rec 输出 6906 类，车牌字符都在里面，特化全在解码侧：
+
+| 层 | 做法 |
+|---|---|
+| 字符集 | 31 省 + 24 字母 + 10 数字 + 6 后缀 ≈ 70 类，字母与数字排除 `I` / `O` |
+| 逐位 | `PlateCharset.AllowedAt(position, length)`：首位省、次位发牌机关字母、其余字母/数字、尾位可 学·警·挂·港·澳 |
+| 解码 | CTC 前缀 beam（log 域），前缀打包进 `long`（每字符 7 位 rank + 高 8 位长度），非法长度直接剪 |
+| 置信度 | 对最终序列做 CTC Viterbi 对齐（2L+1 状态）取**逐字后验**，几何平均 |
+| 形态 | `PlateNumber.TryParse`：7 位燃油 / 8 位新能源 / 尾字 学·警·挂·港·澳 / 首字 使·领 |
+
+为什么不能直接复用通用解码：通用 `CtcDecoder` 每帧要在 6906 类上排序取 top-k，`S`/`5`、`B`/`8`、
+`0`/`O` 这些同形竞争会白吃 beam 宽度；砍到 70 类之后 beam 8 就够用。
+
+```csharp
+using OnnxSharp.Ocr.Plate;
+
+var pipeline = new PaddleOcrPipeline(model);         // 与上面同一个 PaddleOCR 流水线
+var reader = new PlateReader(pipeline, new PlateReaderOptions
+{
+    MinScore = 0.5f,                                 // 逐字几何平均分的下限
+    MinAspect = 1.6f, MaxAspect = 6.5f,              // 只对「像车牌」的框做解码
+    MaxPlates = 4,
+});
+
+// a) 整图：DB 找行 → 宽高比筛 → 逐行车牌解码
+foreach (PlateResult plate in reader.DetectAndRead(pixels, width, height, OcrPixelFormat.Bgra32, stride))
+    Console.WriteLine($"{plate.Text} {plate.Score:P1} {plate.Plate?.Kind} [{plate.X},{plate.Y} {plate.Width}x{plate.Height}]");
+
+// b) 上游检测器给了框（YOLO / 颜色分割）——只跑 rec
+PlateResult? one = reader.Read(pixels, width, height, OcrPixelFormat.Bgra32, stride, x, y, w, h);
+
+// c) 上游已经把车牌抠成一张图——不跑 DB，整幅图当一张牌
+PlateResult? whole = reader.ReadWhole(pixels, width, height, OcrPixelFormat.Bgra32, stride);
+```
+
+`PlateResult.Decoding.CharScores` 是逐字后验，直接指出哪个字不可信（不用猜「为什么这张不准」）：
+
+```
+浙  91% A 100% E 100% S  98% 8 100% 3 100% 8  94% 1 100%
+新  17% A  44% 3 100% M  94% 1  68% 5 100% X  81%     ← 低分框，肉眼也糊
+```
+
+三种入口的实测（同一台 4 线程机器）：整图 DB 通路 825 ms；`--crop` 单框 rec 稳态 3.6~5.1 ms；
+`--direct` 对 135×46 / 175×49 的裁剪图分别 100.0% / 99.6%，稳态 4.45 / 7.45 ms。
+`--direct` 误用到整张大图不会乱出结果（形态校验 + 分数下限会拦住，返回空）。
 
 ### 库用法 6：语音识别（sherpa-onnx，不在引擎里）
 
@@ -494,6 +565,7 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | `features <model.onnx> <wav> [--out feats.f32]` | wav → fbank → LFR → CMVN（Paraformer 的 `speech` 输入），参数取自模型 metadata |
 | `asr <wav> --models <dir> [--tokens f] [--json] [--out text.txt]` | 端到端语音识别（fbank → encoder → CIF → decoder → 文本），<dir> 里放 `encoder.onnx` / `decoder.onnx` / `tokens.txt` |
 | `ocr <image> --det det.onnx --rec rec.onnx --dict keys.txt [--cls cls.onnx] [--out marked.jpg]` | PaddleOCR：DB 检测 → 方向分类 → CTC 识别，给出原图坐标的文本行（可画出标注图） |
+| `plate <image> --det det.onnx --rec rec.onnx --dict keys.txt [--direct \| --crop x,y,w,h]` | 车牌专用 OCR：受限字符集 + 逐位约束 + 号牌形态校验；`--direct` = 输入本身就是车牌裁剪图，跳过检测 |
 | `sam3 <image> --models <fp32 dir> --box x1,y1,x2,y2 [--box ...] [--out marked.jpg]` | SAM3 框提示分段：`--conf 0.3` / `--iou 0.5` 做框级 NMS / `--max-items 5` / `--format cxcywh\|xyxy\|px` |
 | `gemmbench` / `convbench` / `flopsbench` / `parbench` | 微基准：GEMM、卷积、FLOPS、并行扩展性 |
 
@@ -509,6 +581,20 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | `--labels names.txt` / `--json out.json` | 类别名（每行一个）/ 结果落盘 |
 | `--input in.bin --shape 1,3,640,640` | 跳过预处理，直接喂已预处理好的 F32 |
 | `--iters N` / `--size N` | 计时迭代数（稳态吞吐用 40）/ 动态输入模型的方形尺寸 |
+
+`plate` 的关键参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--det` / `--rec` / `--dict` | 与 `ocr` 完全相同的 PP-OCRv6 模型，车牌不另需模型 |
+| `--beam 8` / `--greedy` | 车牌前缀 beam 宽度 / 贪心解码（对照用，实测差异落在噪声内） |
+| `--no-structure` / `--loose` | 关逐位规则 / 关号牌形态校验（只剩字符集约束，用来做对照） |
+| `--score 0.5` / `--max 4` | 逐字几何平均分下限 / 最多返回几张 |
+| `--direct` | **输入本身就是一张车牌裁剪图**：跳过 DB，整幅图当一张牌 |
+| `--crop x,y,w,h` | 在整图里指定一块车牌区域：同样跳过 DB（上游车牌检测器已在跑的场景） |
+| `--limit` / `--det-conf` / `--box` / `--unclip` / `--no-aspect` | DB 检测侧参数（`--direct` / `--crop` 时无效） |
+| `--iters N` | 只与 `--direct` / `--crop` 一起用：量单张 rec 的稳态耗时（首次含图导入） |
+| `--json out.json` | 落盘（含 `mode: detect\|crop\|direct`、逐字分数与号牌各段） |
 
 `--json` 输出示例：
 
@@ -563,6 +649,80 @@ $sft = "tools\OnnxSharp.Sft2Onnx\bin\Release\net10.0\sft2onnx.exe"
 | `extract` → 骨架 | 86,042 B（320 节点 + 196 个 initializer 头） |
 | `extract` → safetensors | 10,651,800 B（196 张量） |
 | 骨架 + 权重 → `patch` 回来 | 10,720,227 B（**与原文件字节数相同**），ORT max\|diff\| = **0.0** |
+
+### OCR 模型从哪来（含车牌）
+
+OCR 是**双模型**：det（DB 检测）+ rec（CTC 识别），外加可选的 cls（文本行方向）与字典文件。
+车牌复用同一套 det/rec，**不需要额外模型**。四条路径，按「省事 → 可控」排列。
+
+**A. 仓库脚本：从 nuget 模型包原样解出（最省事）**
+
+```powershell
+powershell -File tools\scripts\extract_ocr_models.ps1                            # → .tmp\ocr-models
+powershell -File tools\scripts\extract_ocr_models.ps1 -Destination D:\models\ocr
+```
+
+脚本做的事很笨但可靠：`Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny`（PP-OCRv6 tiny 的 det / rec / 字典）与
+`Sdcb.SimdPaddleOCR.Models.TextLineOrientation`（cls）这两个包**只把 ONNX 与字典作为嵌入资源**，
+脚本用反射把资源原样 copy 出来，得到 `det.onnx` / `rec.onnx` / `dict.txt` / `cls.onnx`。
+除了 `dotnet restore` 不需要任何别的东西，也不引入 native 依赖。
+
+**B. 不落盘：代码里直接读模型包的资源流**
+
+这两个包的传递依赖只有 `Sdcb.SimdPaddleOCR.ModelProvider`（纯托管 + 嵌入资源，**不含推理引擎、不含 native**）：
+
+```powershell
+dotnet add package Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny --version 1.0.0
+dotnet add package Sdcb.SimdPaddleOCR.Models.TextLineOrientation --version 1.0.0
+```
+
+```csharp
+using OnnxSharp.Ocr.PaddleOCR;
+using Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny;
+using Sdcb.SimdPaddleOCR.Models.TextLineOrientation;
+
+var bundle = ChineseV6TinyModels.Default;                             // det / rec / 字典 三件套
+
+using Stream detection = bundle.Detection.OpenRead();
+using Stream recognition = bundle.Recognition.OpenRead();
+using var dictionary = new StreamReader(bundle.Dictionary.OpenRead());
+using Stream classification = TextLineOrientationModel.OpenRead();    // 可选：方向分类
+
+// 全程在内存里，不写临时文件（FromFiles / FromBytes 也都有）
+var model = PaddleOcrModel.FromStreams(detection, recognition, dictionary, classification);
+Console.WriteLine($"{model.Classes.Count} 类，cls {model.HasClassification}");   // 6906 类，cls True
+
+var ocr = new PaddleOcrPipeline(model, new PaddleOcrOptions { DetLimitSide = 960 });
+```
+
+（上面这段在仓库里实际编译运行过，输出就是注释里那行。）
+
+**C. 已经在用 Sdcb 的引擎？模型文件可以共用**
+
+- `Sdcb.PaddleOCR`（`PaddleOcrAll`）走的是 `Sdcb.PaddleInference` + 原生 `paddle_inference`；
+  本库**不跑** `paddle_inference`，要的是 **ONNX**（det / rec / dict，可选 cls）。
+- 手上只有 Paddle 格式（`inference.pdmodel` + `inference.pdiparams`）时，先 `paddle2onnx` 转一次（见 D）。
+- 已经是 ONNX 的（包括 `Sdcb.SimdPaddleOCR` 生态里的模型包），**同一份文件两边都能用**：
+  本仓库就用同模型同图与 `Sdcb.SimdPaddleOCR` 做过逐字对照（`bench.md` §35 / §37.2）。
+
+**D. 自己导出（模型最自由）**
+
+```powershell
+paddle2onnx --model_dir ch_PP-OCRv4_det --model_filename inference.pdmodel `
+            --params_filename inference.pdiparams --save_file det.onnx --opset_version 11
+paddle2onnx --model_dir ch_PP-OCRv4_rec --model_filename inference.pdmodel `
+            --params_filename inference.pdiparams --save_file rec.onnx --opset_version 11
+```
+
+几条从实际踩坑里来的约束：
+
+- **字典必须与 rec 配套**：`dict.txt` 每行一个字符，中间空行要保留，索引 0 是 blank，
+  末尾补一个空格（`use_space_char`）；rec 的类别数应为「字典行数 + 2」（PP-OCRv6 tiny 是 6906）。
+- **det / rec 都是全动态导出**（`x[N,3,H,W]`），要 `Net.ReadModel(path, shape)` 特化；流水线按形状缓存
+  （det 2 份 / rec 8 份，`DetShapeCacheSize` / `RecShapeCacheSize`），换尺寸不会无限增长。
+- 只支持 **PP-OCR 系列**（DB 检测 + CTC 识别 + PP-LCNet 方向分类）；SAST / 表格 / 版面识别不在范围内。
+- 检测后处理是**轴对齐框**（不做 pyclipper 多边形外扩）：竖排 / 大角度倾斜能框住，但框是正的。
+- 车牌用通用 rec 即可，特化在 `OnnxSharp.Ocr.Plate`（把 6906 类压到车牌字符集 + 逐位规则 + 形态校验）。
 
 ### 支持算子
 
@@ -783,6 +943,7 @@ rec 4.4 → 2.9 ms，见 [bench.md](bench.md) §37.2）；剩下的量级是 det
 | yolov8n / yolo11s / yolov8s | 跑通并纳入基准 |
 | rfdetr-small | 跑通并纳入基准；解码结果与官方 `rfdetr.export._runtime.decode_detections` 逐框一致（41/41 框，坐标 0.00 px）；原始输出与 ONNXRuntime 对齐（512² 随机输入：dets `2.3e-4`、labels `5.0e-5`）。*（rfdetr-medium 的本地导出已丢失，历史数字见 bench.md，当前无法复测）* |
 | PP-OCRv6 tiny（det / rec / cls） | det 与 rec 的**原始输出**与 ONNXRuntime 对齐（64² + 960² 输入：max\|diff\| 1.4e-7 / 7.6e-6）；900×300 合成图两行文字全对（`Hello OnnxSharp 123` 0.957、`第二行文字 PaddleOCR` 0.982），与 `Sdcb.SimdPaddleOCR` 同模型同图的输出**逐字一致**；车牌大图上主行 `浙A ES8381` 一致，低置信度小框因 1~2 px 检测差异给出不同字符（`e`↔`8`、`A3M15X`↔`浙A：3M15X`），属模型噪声。性能：同会话 median 比它慢 **1.12~1.23×**（§35 时 1.7~2.1×，见 `bench.md` §35 / §37.2） |
+| **PP-OCRv6 tiny + 车牌受限解码**（`Ocr/Plate`） | 车牌专用通路：字符集从 6906 压到 ~70 类 + 逐位规则 + 号牌形态校验。实测（3200×1800）：`浙AES8381` 97.6% NewEnergy、`新A3M15X` 62.9% Fuel；纯车牌裁剪图直读（`--direct`）`浙ABM770` **100.0%**、`浙ACP5872` **99.6%**。与同图普通 `ocr` 对照：普通 OCR 输出 `H浙ACP5872`（框里混进贴字），受限解码把它剪掉；把整张大图误喂给 `--direct` 返回 **0 张**（形态校验 + 分数下限兜底） |
 | 单算子微模型 | GEMM / attention / 逐元素链，用于内核定点调优 |
 | sherpa Paraformer encoder + CIF（int8） | 用手写脚本把 `model.int8.onnx` 在第一个 `Loop`（CIF）前切开，5715 节点的 encoder 子图**直接跑通**（`speech[1,96,560]` → `[1,97,320]`）；`DynamicQuantizeLinear` + `MatMulInteger`(+s8 权重、per-column 零点) 与 ONNXRuntime **逐位一致**（max\|diff\| = 0）。CIF 用 `Speech/Paraformer/ContinuousIntegrateAndFire` 重写（绕开 `Loop`/`Sequence*`），与 ORT 录的 `frames`/`fires`/`frame.7`/`integrate.7` **逐位一致**，token 数 21 = ORT 21。当前 encoder 纯 forward（76 帧、4 线程）**30.3 ms**，同图 ORT 24.1 ms |
 | **Paraformer 端到端（中文）** | Windows 自带的 Microsoft Huihui 合成 4.54 s 中文 wav → 76 帧特征 → 16 个 token → **「今天气真不错我们出去走一走吧」**，与 ORT 全模型参考文本**逐字一致**；整链纯 C#。**热态 min 48 ms / 中位 65 ms**（feat 4 / encoder 37 / decoder 6，4 线程），冷启动 ~1.1 s；ORT 两段合计 27.5 ms（不含特征前端）。演进：81~87 → 68~70 → **48** |
@@ -807,6 +968,9 @@ rec 4.4 → 2.9 ms，见 [bench.md](bench.md) §37.2）；剩下的量级是 det
 - `OnnxSharp.Ocr.PaddleOCR` 只覆盖 **PP-OCRv6 系列**（DB 检测 + CTC 识别 + 文本行方向分类）；表格识别、
   版面分析、SAST 等其它 OCR 结构未实现。检测后处理是**轴对齐框**（不做 pyclipper 的多边形外扩），
   竖排 / 大角度倾斜文本能框住但框是正的。
+- `OnnxSharp.Ocr.Plate` 是**解码侧特化**：只认中国大陆号牌形态（省 + 发牌机关字母 + 序号，7/8 位，
+  后缀 学·警·挂·港·澳、首字 使·领）。不看车牌颜色，不拼双层黄牌的上下两行，严重倾斜时因为检测框
+  是轴对齐的会掉分；`ReadWhole` / `--direct` 要求「整幅图就是一块牌」，否则应该走 `DetectAndRead`。
 - **语音识别已打通（Paraformer）**：`Speech/Paraformer/ParaformerRecognizer` 走 `wav → fbank/LFR/CMVN → encoder → CIF → decoder → 文本`，
   与 ONNXRuntime 全模型的参考文本逐字一致。**前提**：模型要先按
   `tools/scripts/split_*.py` 切成 `encoder.onnx` / `decoder.onnx`（整图里的两个 `Loop` 引擎不执行）。
@@ -828,6 +992,8 @@ src/OnnxSharp/
   Ocr/       可选门面（可整体删除，不影响推理）
     PaddleOCR/  OcrLine / OcrPixelFormat / 像素→NCHW / CTC 解码
                 + PaddleOcrModel / PaddleOcrPipeline / DbPostprocess / PaddleOcrOptions
+    Plate/      车牌特化：PlateCharset（逐位规则）/ RankTable / PlateBeamSearch / PlateAlignment
+                / PlateDecoder / PlateNumber（形态校验）/ PlateReader（DetectAndRead / Read / ReadWhole）
   Sam3/      可选门面：Sam3Segmenter（vision → geometry → decoder）+ Sam3Box / Sam3Item / Sam3Nms
   Speech/    语音（可整体删除，不影响推理）
     通用前端：WavReader / FbankOptions / FbankExtractor（kaldi fbank）/ LfrCmvn / SpeechFeatureExtractor
@@ -835,12 +1001,12 @@ src/OnnxSharp/
     Paraformer/  ContinuousIntegrateAndFire（CIF，替代图里的 Loop）/ ParaformerRecognizer（端到端）
                 其它 ASR 模型（Whisper / Zipformer / streaming paraformer）以后放同级的兄弟目录
   Imaging/   共享图像预处理：ImagePixels / ImageGeometry / AxisMap / ImageTensor（Vision / OCR / SAM3 共用）
-tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / sam3 / 微基准 + ImageFacade 图像 IO
+tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / plate / face / asr / sam3 / 微基准 + ImageFacade 图像 IO
 tools/OnnxSharp.Sft2Onnx/  safetensors → ONNX 权重补丁（patch / list），纯 C#
 tools/scripts/         dump_shapes / gen_golden / extract_ocr_models.ps1 / onnx_fp16_to_f32 / fbank_probe
                        / make_quant_model / split_before_control_flow / sherpa_encoder_probe
                        / probe_tensors / inspect_loop / compare_outputs
-tests/OnnxSharp.Tests/ 零依赖测试运行器（118 用例），直接 dotnet run
+tests/OnnxSharp.Tests/ 零依赖测试运行器（124 用例），直接 dotnet run
 bench/                四引擎 × 6 模型的对照脚本与产物
 ```
 
@@ -850,7 +1016,7 @@ bench/                四引擎 × 6 模型的对照脚本与产物
 |---|---|
 | [plan.md](plan.md) | 设计文档：架构、里程碑、算子清单、性能目标、开放问题 |
 | [misc.md](misc.md) | 决策记录与坑：语义细节、对照实验、踩过的雷 |
-| [bench.md](bench.md) | **优化史 + 性能唯一事实源**：口径、复现命令、每轮 A/B、被否证的路线（§1~§34） |
+| [bench.md](bench.md) | **优化史 + 性能唯一事实源**：口径、复现命令、每轮 A/B、被否证的路线（§1~§40，§40 是车牌特化与 yolo26） |
 | [upstream.lock](upstream.lock) | 上游 OpenCV 5 dnn 跟踪基线（机器可读） |
 
 ### 致谢
@@ -942,16 +1108,17 @@ The **requirements, reference material and acceptance criteria** come from the m
 | Threads | **Physical core count** by default (via `GetLogicalProcessorInformationEx` on Windows, falling back to `ProcessorCount`), overridable via `ONNXSHARP_THREADS`. SMT buys nothing on these FP-bound kernels, the extra spinning workers only steal time slices. **All benchmarks and tuning assume 4 threads** — the goal is not to saturate the machine |
 | Vision | `OnnxSharp.Vision`: letterbox / stretch preprocessing, YOLO decode + NMS, RF-DETR decode, YuNet faces (box + 5 landmarks + NMS) |
 | OCR | `OnnxSharp.Ocr.PaddleOCR`: PP-OCRv6 det + optional cls + rec, DB post-processing, CTC — text lines in source pixels |
+| Plates | `OnnxSharp.Ocr.Plate`: a **decoder-side** specialisation on the same det/rec — ~70-class charset, positional rules, CTC Viterbi per-character posteriors, plate shape validation; `DetectAndRead` (whole image) / `Read` (known box) / `ReadWhole` (the input *is* a cropped plate) |
 | Dynamic graphs | `Net.ReadModel(path, inputShape)` **specialises** a fully dynamic input (`x[N,3,H,W]`) so shape chains fold at import |
 | Image decoding | **Not in the library** (keeps it dependency-free); the CLI uses the ImageFacade software backend plus opt-in `Sdcb.SimdCodecs.Jpeg/Png/Bmp` format packages (registered explicitly) |
 | Written by | AI coding agents; requirements, references and review by the maintainer (see [The code is AI-written](#the-code-is-ai-written)) |
 
 ### Install
 
-**Repo**: [github.com/sevencat/OnnxSharp](https://github.com/sevencat/OnnxSharp) | **NuGet**: [`Sevencat.OnnxSharp`](https://www.nuget.org/packages/Sevencat.OnnxSharp) | **Version**: `0.4.0` — the package carries the prefix, the namespace stays `OnnxSharp`.
+**Repo**: [github.com/sevencat/OnnxSharp](https://github.com/sevencat/OnnxSharp) | **NuGet**: [`Sevencat.OnnxSharp`](https://www.nuget.org/packages/Sevencat.OnnxSharp) | **Version**: `0.5.0` — the package carries the prefix, the namespace stays `OnnxSharp`.
 
 ```powershell
-dotnet add package Sevencat.OnnxSharp --version 0.4.0
+dotnet add package Sevencat.OnnxSharp --version 0.5.0
 ```
 
 Version history, dependencies and per-TFM assets are on the NuGet page: [nuget.org/packages/Sevencat.OnnxSharp](https://www.nuget.org/packages/Sevencat.OnnxSharp#versions-body-tab).
@@ -964,7 +1131,7 @@ Requires .NET 8 or .NET 10 SDK.
 
 ```powershell
 dotnet build OnnxSharp.slnx -c Release
-dotnet run --project tests/OnnxSharp.Tests -c Release     # 59 cases (3 need local models, otherwise skipped)
+dotnet run --project tests/OnnxSharp.Tests -c Release     # 124 cases (yolo26 / OCR goldens skip when the models are absent)
 ```
 
 Detect objects in one command:
@@ -990,6 +1157,17 @@ page.jpg 3200x1800
   result : 3 行，849.4 ms
     浙A ES8381  (0.883)  [1752,199,198x68]
     浙A：:3M15X  (0.802)  [1769,1482,202x72]
+```
+
+Licence plates use the **same** det/rec through the `plate` subcommand (restricted charset + positional
+rules + plate shape validation), and `--direct` when the input already *is* a cropped plate:
+
+```powershell
+& $cli plate page.jpg --det .tmp\ocr-models\det.onnx --rec .tmp\ocr-models\rec.onnx `
+                      --dict .tmp\ocr-models\dict.txt --limit 960
+# 浙AES8381 97.6% NewEnergy / 新A3M15X 62.9% Fuel — with per-character posteriors
+
+& $cli plate plate-crop.png ... --direct      # 浙ABM770 100.0% (135×46, 4.45 ms steady state)
 ```
 
 The CLI decodes images with ImageFacade (pure managed software backend): picture formats are **opt-in**
@@ -1142,8 +1320,9 @@ Or use the static helpers: `ImagePreprocessor.Letterbox(...)`, `ImagePreprocesso
 ```csharp
 using OnnxSharp.Ocr.PaddleOCR;
 
-// Models come from the PP-OCRv6 ONNX export; the nuget model packages can be fed directly:
-//   PaddleOcrModel.FromStreams(ChineseV6TinyModel.Detection.OpenRead(), ...)
+// Models come from the PP-OCRv6 ONNX export; the nuget model packages can be fed directly
+// (see "Where do the OCR models come from" below):
+//   PaddleOcrModel.FromStreams(ChineseV6TinyModels.Default.Detection.OpenRead(), ...)
 var model = PaddleOcrModel.FromFiles("det.onnx", "rec.onnx", "ppocr_keys.txt", "cls.onnx");
 
 var ocr = new PaddleOcrPipeline(model, new PaddleOcrOptions
@@ -1170,6 +1349,70 @@ Two things worth knowing:
   `PaddleOcrOptions.DetShapeCacheSize` / `RecShapeCacheSize`).
 - The model packages contain **only ONNX + dictionary, no inference code**, so the pipeline borrows just the
   model resources (`tools/scripts/extract_ocr_models.ps1` writes them out unchanged).
+
+**Licence plates — same det/rec, a specialised decoder (`OnnxSharp.Ocr.Plate`)**
+
+No plate-specific model is needed: the stock PP-OCRv6 recogniser already emits every class the plate
+characters live in, so the work is entirely on the decoding side — the character set is cut to ~70
+classes (31 provinces + 24 letters + 10 digits + 6 suffixes, `I`/`O` excluded), each position is
+constrained (`PlateCharset.AllowedAt`), the final sequence is re-scored with a CTC Viterbi alignment
+(per-character posteriors, geometric mean), and `PlateNumber.TryParse` validates the shape
+(7-digit fuel / 8-digit new-energy / 学·警·挂·港·澳 suffix / 使·领 prefix).
+
+```csharp
+using OnnxSharp.Ocr.Plate;
+
+var reader = new PlateReader(pipeline, new PlateReaderOptions { MinScore = 0.5f, MaxPlates = 4 });
+
+// a) whole image: DB detection → aspect filter (1.6–6.5) → per-box plate decode
+foreach (PlateResult plate in reader.DetectAndRead(pixels, width, height, OcrPixelFormat.Bgra32, stride))
+    Console.WriteLine($"{plate.Text} {plate.Score:P1} {plate.Plate?.Kind}");
+
+// b) a box from your own detector — one rec pass
+PlateResult? one = reader.Read(pixels, width, height, OcrPixelFormat.Bgra32, stride, x, y, w, h);
+
+// c) the input *is* one plate (already cropped upstream) — no DB
+PlateResult? whole = reader.ReadWhole(pixels, width, height, OcrPixelFormat.Bgra32, stride);
+```
+
+`PlateResult.Decoding.CharScores` carries the per-character posterior, so a weak character is called
+out instead of guessed (`浙 91% A 100% … 8 94%`; a blurry plate reads `新 17% A 44%`). Measured:
+whole-image DB path 825 ms, `--crop` single-box rec 3.6–5.1 ms steady state, `--direct` on 135×46 /
+175×49 crops 100.0% / 99.6% at 4.45 / 7.45 ms. Feeding a full-size photo to `--direct` returns
+**0 plates** — the shape check and the score floor catch the misuse.
+
+**Where do the OCR models come from**
+
+OCR needs a det + a rec model, an optional cls model and a dictionary; plates reuse the same det/rec.
+
+- **Script (simplest)**: `powershell -File tools\scripts\extract_ocr_models.ps1` copies
+  `det.onnx` / `rec.onnx` / `dict.txt` / `cls.onnx` out of the `Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny`
+  and `...TextLineOrientation` packages — they embed the ONNX files as resources and contain **no
+  inference code**, so the script just streams them to disk.
+- **In memory**: reference those two packages (their only transitive dependency is
+  `Sdcb.SimdPaddleOCR.ModelProvider` — managed, no native runtime) and read the resources directly:
+
+```csharp
+using Sdcb.SimdPaddleOCR.Models.ChineseV6Tiny;
+using Sdcb.SimdPaddleOCR.Models.TextLineOrientation;
+
+var bundle = ChineseV6TinyModels.Default;                             // det / rec / dictionary
+using Stream detection = bundle.Detection.OpenRead();
+using Stream recognition = bundle.Recognition.OpenRead();
+using var dictionary = new StreamReader(bundle.Dictionary.OpenRead());
+using Stream classification = TextLineOrientationModel.OpenRead();    // optional
+
+var model = PaddleOcrModel.FromStreams(detection, recognition, dictionary, classification);
+// 6906 classes, cls True — no temp files, no native dependency
+```
+
+- **Already on Sdcb?** `Sdcb.PaddleOCR` (`PaddleOcrAll`) runs `paddle_inference` (native) on Paddle-format
+  models, while this library takes **ONNX**; the same ONNX files can be shared, and Paddle-format models
+  convert once with `paddle2onnx --model_dir ... --save_file det.onnx`.
+- **Model constraints**: the dictionary must match the recogniser (one character per line, blank lines
+  preserved, index 0 = blank, trailing space for `use_space_char`, classes = lines + 2); det/rec are
+  exported fully dynamic and get specialised per input shape; only the PP-OCR family (DB + CTC +
+  PP-LCNet orientation) is supported.
 
 **Speech (sherpa-onnx) is not in the engine**
 
@@ -1217,12 +1460,16 @@ code; it is deliberately not bundled here so an optional feature does not drag i
 | `bench <model.onnx> --input in.f32 [--iters N] [--warmup N]` | Timed iterations (median / min) |
 | `profile <model.onnx> --input in.f32 [--iters N] [--top N]` | Per-operator timing ranking |
 | `detect <model.onnx> <image> [--out marked.jpg]` | Preprocess + forward + decode, boxes in source pixels |
+| `ocr <image> --det det.onnx --rec rec.onnx --dict keys.txt [--cls cls.onnx] [--out marked.jpg]` | PaddleOCR: DB detection → orientation → CTC decode, text lines in source pixels (can draw a marked image) |
+| `plate <image> --det det.onnx --rec rec.onnx --dict keys.txt [--direct \| --crop x,y,w,h]` | Plate OCR: restricted charset + positional rules + plate shape validation; `--direct` = the input *is* one cropped plate (no detection) |
 | `face <yunet.onnx> <image> [--conf 0.6] [--iou 0.3] [--max-faces N] [--json out.json] [--out marked.jpg]` | YuNet face detection: box + 5 landmarks, coordinates in source pixels (can draw a marked image) |
 | `features <model.onnx> <wav> [--out feats.f32]` | fbank → LFR → CMVN (Paraformer `speech` input), params from the model metadata |
 | `asr <wav> --models <dir> [--tokens f] [--json] [--out text.txt]` | End-to-end recognition (fbank → encoder → CIF → decoder → text); `<dir>` holds `encoder.onnx` / `decoder.onnx` / `tokens.txt` |
 | `gemmbench` / `convbench` / `flopsbench` / `parbench` | Micro-benchmarks for tuning |
 
 Key `detect` flags: `--family auto|yolo|rfdetr`, `--conf`, `--iou` (YOLO), `--max-det`, `--classes`, `--layout`, `--class-agnostic`, `--background -1|none` and `--norm imagenet|255` (RF-DETR), `--labels`, `--json`, `--input <f32.bin> --shape 1,3,640,640`, `--iters N`, `--size N`.
+
+Key `plate` flags: `--direct` (the input is already one plate — skip DB), `--crop x,y,w,h` (one box you already know), `--beam` / `--greedy`, `--no-structure` / `--loose`, `--score`, `--max`, `--limit` / `--det-conf` / `--box` / `--unclip` (DB side, ignored with `--direct`/`--crop`), `--iters N` (only with `--direct`/`--crop`, steady-state single-plate rec), `--json`.
 
 > Timing note: `--iters` defaults to 1, i.e. real first-frame latency including JIT. For steady-state numbers use `--iters 40` — .NET tiered compilation promotes hot methods only after ~30 calls, otherwise results are 1.5–2× too slow.
 
@@ -1447,6 +1694,7 @@ Conversely, roughly **half of the "obviously optimisable here" intuitions were k
 | **Paraformer end-to-end (Chinese)** | 4.54 s Chinese wav → 76 feature frames → 16 tokens → the reference sentence, character-for-character identical to ONNXRuntime; the whole chain is pure C#. **48 ms min / 65 ms median** warm (feat 4 / encoder 37 / decoder 6, 4 threads); ORT enc+dec 27.5 ms (front-end excluded) |
 | **YuNet (face detection, fp32)** | The official static `face_detection_yunet` export (`[1,3,640,640]`, 106 nodes, 8 op types). **Matches OpenCV `cv2.FaceDetectorYN` value-by-value** on the same 640×640 input: box **0.00 px**, 5 landmarks **3e-5 px**, score 5e-7 (`YuNetTests`). Detects 1 face (score 0.9135) on 512×512 lena, with coordinates mapped back to the original image; preprocessing is "stretch + BGR + raw 0..255". `face` CLI prints boxes / JSON / a marked image. Steady state (640×640, **4 threads**): forward **5.4 ms min / 6.1 ms median**; end to end (stretch 1.7 + forward + decode 0.5) **8.4 ms min / 10.9 ms median**. The 53 Conv layers are 94% of forward and `Conv_0` (3→16, 3×3, s2) alone is 15%; the three optimisations tried were all neutral or negative ([bench.md](bench.md) §36) |
 | YuNet int8 (`yunet_int8.onnx`) | ✅ supported: 53 `QLinearConv` + 16 `DequantizeLinear` + 5 `QuantizeLinear` + 6 `QLinearSigmoid` + 2 `QLinearAdd` + 4 `MaxPool` all match, runs end to end. vs fp32 on the same image: score 0.8944 vs 0.9135, box centre within ~1 px — but **3.5× slower** (20.3 vs 5.7 ms/frame, 4 threads; 11% faster than the 22.95 in §36 after the pool/resize row split), because each `QLinearConv` materialises f32 twice (RQ→DQ round trip) and a model this small cannot win that back. Root cause and the three attempted fixes in [bench.md](bench.md) §36 / §37.4 |
+| **PP-OCRv6 tiny + plate restricted decoding** (`Ocr/Plate`) | Plate-specialised path: charset 6906 → ~70 classes + positional rules + shape validation. Measured (3200×1800): `浙AES8381` 97.6% NewEnergy, `新A3M15X` 62.9% Fuel; `--direct` on cropped plates `浙ABM770` **100.0%** / `浙ACP5872` **99.6%** (135×46 / 175×49). Against plain `ocr` on the same photo: plain OCR emits `H浙ACP5872` (a decal inside the box), the restricted decoder drops it; a full-size photo fed to `--direct` returns **0 plates** |
 | SAM3 (vision / geometry / text encoders + decoder) | Box-prompted segmentation runs; decoder matches ONNXRuntime **value-by-value**; pedestrian box prompt top-1 **0.932** |
 
 > Cross-engine numbers (OnnxSharp / ONNXRuntime CPU / OpenCV 5 dnn / SimdYolo) live in [bench.md](bench.md).
@@ -1468,14 +1716,15 @@ Conversely, roughly **half of the "obviously optimisable here" intuitions were k
 - WASM / IL2CPP are not targeted; NativeAOT is not validated (code stays AOT-friendly).
 - **No image decoding in the library**; bring your own pixels. The CLI decodes JPEG/PNG/BMP through ImageFacade and can draw/save the result.
 - `OnnxSharp.Vision` covers single-image, 3-channel object detection only — no segmentation, pose, OBB or keypoints.
+- `OnnxSharp.Ocr.Plate` is **decoder-side only**: mainland-China plate shapes (province + issuing letter + serial, 7 or 8 chars, 学·警·挂·港·澳 suffix, 使·领 prefix). Plate colour is ignored, two-line yellow plates are not stitched, and heavy skew loses accuracy because detection boxes are axis-aligned; `ReadWhole` / `--direct` expect *one* plate filling the image.
 
 ### Layout
 
 ```
 src/OnnxSharp/   Core (graph/runtime) · Onnx (protobuf reader) · Tensors (incl. Quantization) · Ops (incl. QuantOps) · Kernels (incl. Int8Gemm)
-                 Threading · Vision / Ocr (PaddleOCR) / Sam3 / Speech (Paraformer) — optional facades · Imaging (shared preprocessing)
-tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / sam3 / micro-benchmarks
-tests/OnnxSharp.Tests/ zero-dependency test runner (118 cases)
+                 Threading · Vision / Ocr (PaddleOCR + Plate) / Sam3 / Speech (Paraformer) — optional facades · Imaging (shared preprocessing)
+tools/OnnxSharp.Cli/   info / run / bench / profile / detect / ocr / plate / face / asr / sam3 / micro-benchmarks
+tests/OnnxSharp.Tests/ zero-dependency test runner (124 cases)
 bench/                 four-engine × six-model comparison scripts
 ```
 
@@ -1485,7 +1734,7 @@ bench/                 four-engine × six-model comparison scripts
 |---|---|
 | [plan.md](plan.md) | Design: architecture, milestones, operator list, performance targets |
 | [misc.md](misc.md) | Decision log and pitfalls |
-| [bench.md](bench.md) | **Optimisation history + performance source of truth**: methodology, commands, per-round A/B, dead ends (§1–§34) |
+| [bench.md](bench.md) | **Optimisation history + performance source of truth**: methodology, commands, per-round A/B, dead ends (§1–§40, §40 covers the plate specialisation and yolo26) |
 | [upstream.lock](upstream.lock) | Pinned OpenCV 5 dnn baseline |
 
 ### Acknowledgements

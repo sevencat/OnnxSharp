@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- 测试运行器单目标即可；产品库仍是 net8.0;net10.0 双目标 -->
+    <!-- 测试运行器覆盖两套运行时；产品库目标见 src/OnnxSharp/OnnxSharp.csproj -->
     <!-- net11.0 覆盖 AvxVnni 整数内核（net10.0 走 F32 展开，两套都要有测试） -->
     <TargetFrameworks>net10.0;net11.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>

@@ -84,6 +84,81 @@ public sealed class PaddleOcrPipeline
         double preMs = 0, detMs = 0, postMs = 0, clsMs = 0, recMs = 0;
 
         // ---- 1) DB 检测 ----
+        List<DbPostprocess.Box> boxes = DetectBoxes(
+            pixels, width, height, format, rowStride, stage,
+            out preMs, out detMs, out postMs);
+
+        // ---- 2) 逐框裁剪 → 方向分类 → 识别 ----
+        bool useClassification = Options.UseClassification && _model.HasClassification;
+
+        var lines = new List<OcrLine>(boxes.Count);
+        foreach (DbPostprocess.Box scaled in boxes)
+        {
+            int x = Math.Clamp((int)MathF.Floor(scaled.X), 0, width - 1);
+            int y = Math.Clamp((int)MathF.Floor(scaled.Y), 0, height - 1);
+            int right = Math.Clamp((int)MathF.Ceiling(scaled.X + scaled.Width), x + 1, width);
+            int bottom = Math.Clamp((int)MathF.Ceiling(scaled.Y + scaled.Height), y + 1, height);
+
+            int cropWidth = right - x;
+            int cropHeight = bottom - y;
+            if (cropWidth < 4 || cropHeight < 4)
+                continue;
+
+            bool rotate = useClassification &&
+                IsUpsideDown(pixels, width, height, format, rowStride, x, y, cropWidth, cropHeight);
+
+            if (stage is not null)
+            {
+                clsMs += stage.Elapsed.TotalMilliseconds;
+                stage.Restart();
+            }
+
+            (string text, float score) = Recognize(
+                pixels, width, height, format, rowStride, x, y, cropWidth, cropHeight, rotate);
+
+            if (stage is not null)
+            {
+                recMs += stage.Elapsed.TotalMilliseconds;
+                stage.Restart();
+            }
+
+            if (text.Length != 0)
+                lines.Add(new OcrLine(text, score, x, y, cropWidth, cropHeight));
+        }
+
+        if (stage is not null)
+            LastTimings = new OcrTimings(preMs, detMs, postMs, clsMs, recMs);
+
+        return lines;
+    }
+
+    // ---------------- 检测 ----------------
+
+    /// <summary>
+    /// 只跑 DB 检测，返回<b>源图像素坐标</b>里的文本框（按阅读顺序）。
+    /// 车牌模块用它拿到候选框后自己做受限解码，不必先走一遍通用 CTC。
+    /// </summary>
+    internal List<DbPostprocess.Box> DetectBoxes(
+        ReadOnlySpan<byte> pixels,
+        int width,
+        int height,
+        OcrPixelFormat format,
+        int rowStride)
+        => DetectBoxes(pixels, width, height, format, rowStride, null, out _, out _, out _);
+
+    private List<DbPostprocess.Box> DetectBoxes(
+        ReadOnlySpan<byte> pixels,
+        int width,
+        int height,
+        OcrPixelFormat format,
+        int rowStride,
+        Stopwatch? stage,
+        out double preMs,
+        out double detMs,
+        out double postMs)
+    {
+        preMs = detMs = postMs = 0;
+
         (int detWidth, int detHeight) = DetectSize(width, height);
         Net detNet = GetDetectionNet(detWidth, detHeight);
         EnsureDetBuffer(3 * detWidth * detHeight);
@@ -124,55 +199,15 @@ public sealed class PaddleOcrPipeline
             stage.Restart();
         }
 
-        // ---- 2) 逐框裁剪 → 方向分类 → 识别 ----
+        // 概率图坐标 → 源图像素坐标
         float scaleX = (float)width / detWidth;
         float scaleY = (float)height / detHeight;
-        bool useClassification = Options.UseClassification && _model.HasClassification;
 
-        var lines = new List<OcrLine>(boxes.Count);
-        foreach (DbPostprocess.Box box in boxes)
-        {
-            DbPostprocess.Box scaled = DbPostprocess.Scale(box, scaleX, scaleY, width, height);
+        for (int i = 0; i < boxes.Count; i++)
+            boxes[i] = DbPostprocess.Scale(boxes[i], scaleX, scaleY, width, height);
 
-            int x = Math.Clamp((int)MathF.Floor(scaled.X), 0, width - 1);
-            int y = Math.Clamp((int)MathF.Floor(scaled.Y), 0, height - 1);
-            int right = Math.Clamp((int)MathF.Ceiling(scaled.X + scaled.Width), x + 1, width);
-            int bottom = Math.Clamp((int)MathF.Ceiling(scaled.Y + scaled.Height), y + 1, height);
-
-            int cropWidth = right - x;
-            int cropHeight = bottom - y;
-            if (cropWidth < 4 || cropHeight < 4)
-                continue;
-
-            bool rotate = useClassification &&
-                IsUpsideDown(pixels, width, height, format, rowStride, x, y, cropWidth, cropHeight);
-
-            if (stage is not null)
-            {
-                clsMs += stage.Elapsed.TotalMilliseconds;
-                stage.Restart();
-            }
-
-            (string text, float score) = Recognize(
-                pixels, width, height, format, rowStride, x, y, cropWidth, cropHeight, rotate);
-
-            if (stage is not null)
-            {
-                recMs += stage.Elapsed.TotalMilliseconds;
-                stage.Restart();
-            }
-
-            if (text.Length != 0)
-                lines.Add(new OcrLine(text, score, x, y, cropWidth, cropHeight));
-        }
-
-        if (stage is not null)
-            LastTimings = new OcrTimings(preMs, detMs, postMs, clsMs, recMs);
-
-        return lines;
+        return boxes;
     }
-
-    // ---------------- 检测 ----------------
 
     /// <summary>
     /// 检测输入尺寸：最长边压到 <see cref="PaddleOcrOptions.DetLimitSide"/>，
@@ -281,6 +316,29 @@ public sealed class PaddleOcrPipeline
         int cropHeight,
         bool rotate)
     {
+        (Tensor logits, int classCount) = RecognizeLogits(
+            pixels, width, height, format, rowStride, x, y, cropWidth, cropHeight, rotate);
+
+        return CtcDecoder.Decode(logits.AsSpan<float>(), classCount, _model.Classes);
+    }
+
+    /// <summary>
+    /// 只跑到 rec 网络输出（logits / 概率，行主序 <c>steps × classCount</c>），解码交给调用方。
+    /// 车牌模块用它在同一份 rec 图上做受限解码，避免重复 import 图。
+    /// <para>返回的 <see cref="Tensor"/> 是引擎的输出缓冲，下一次 <c>Forward</c> 会被覆盖。</para>
+    /// </summary>
+    internal (Tensor Logits, int ClassCount) RecognizeLogits(
+        ReadOnlySpan<byte> pixels,
+        int width,
+        int height,
+        OcrPixelFormat format,
+        int rowStride,
+        int x,
+        int y,
+        int cropWidth,
+        int cropHeight,
+        bool rotate)
+    {
         int recHeight = Math.Max(8, Options.RecHeight);
         int maxWidth = Math.Max(RecWidthStep, Options.RecMaxWidth);
 
@@ -306,9 +364,8 @@ public sealed class PaddleOcrPipeline
         _recBuffer.AsSpan(0, size).CopyTo(recInput.AsSpan<float>());
 
         net.SetInput(net.InputNames[0], recInput);
-        ReadOnlySpan<float> logits = net.Forward().AsSpan<float>();
 
-        return CtcDecoder.Decode(logits, _model.Classes.Count, _model.Classes);
+        return (net.Forward(), _model.Classes.Count);
     }
 
     private Net GetRecognitionNet(int height, int width)
