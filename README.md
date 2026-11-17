@@ -91,7 +91,7 @@
 | 图处理 | 常量折叠（Shape→Gather→Concat→Reshape 链）、算子融合（Conv+SiLU、逐元素短链、`MatMul+ArgMax`、`MatMul+Add(bias)`→带按列 bias 的 GEMM、手写 LayerNorm→`LayerNormalization`、`DQL+MatMulInteger+Cast+Mul+Add`→`DynamicQuantizeMatMul`、整条 multi-head attention→`FusedAttention`（序列长度 ≤128 时）、YOLO 的 DFL→`DflSoftmax`）、按输入 shape 签名缓存形状/类型推断、常驻 intra-op 线程池（调用线程参与 + 自旋领任务，不再每次 `Parallel.For`） |
 | 执行 | 静态内存池（输出脱离池）、按层形状推断、`Parallel.For` + AVX2/AVX-512 向量化 |
 | 线程 | 默认 **物理核数**（Windows 上取 `GetLogicalProcessorInformationEx`，其余平台退回 `ProcessorCount`），可用 `ONNXSHARP_THREADS` 覆盖。超线程对这些 FP 密集内核没有吞吐收益，多出来的自旋线程只会互相抢时间片。**基准与调优一律按 4 线程** —— 目标不是占满整机，而是少核下也够快 |
-| 视觉门面 | `OnnxSharp.Vision`：letterbox / stretch 预处理、YOLO 解码 + NMS、RF-DETR 解码、YuNet 人脸（框 + 5 点关键点 + NMS），返回**原图坐标**的框 |
+| 视觉门面 | `OnnxSharp.Vision`：letterbox / stretch 预处理、YOLO 解码 + NMS（类别名自动从模型 metadata 的 `names` 解析）、RF-DETR 解码、YuNet 人脸（框 + 5 点关键点 + NMS），返回**原图坐标**的框 |
 | OCR 门面 | `OnnxSharp.Ocr.PaddleOCR`：PP-OCRv6 det + 可选 cls + rec，DB 后处理 + CTC 解码，返回**原图坐标**的文本行 |
 | 车牌门面 | `OnnxSharp.Ocr.Plate`：同一份 det/rec 上的**解码侧特化** —— 受限字符集（~70 类）+ 逐位规则 + CTC Viterbi 逐字后验 + 号牌形态校验；`DetectAndRead`（整图）/ `Read`（已给框）/ `ReadWhole`（输入本身就是车牌裁剪图） |
 | 动态图 | `Net.ReadModel(path, 输入形状)` 把全动态输入（`x[N,3,H,W]`）**特化**成静态图，导入期即可折叠形状链 |
@@ -130,15 +130,15 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 
 ```
 model      : yolo11n.onnx
-image      : photo.bmp 1568x1068
+image      : photo.jpg 3840x2160
 family     : yolo
-input      : [1, 3, 640, 640]  (1568x1068 -> 640x640 (scale 0.4082x0.4082, pad 0,102))
-preprocess : 2.75 ms
-forward    : 137.16 ms  (min of 3; 稳态吞吐加 --iters 40)
-decode     : 1.06 ms  (min of 3)
-detections : 24
-  #0   class0           0.7995  [1347.3, 671.9, 116.6 x 331.3]
-  #1   class0           0.7525  [1080.5, 732.2, 127.8 x 325.7]
+labels     : 80 classes  (model metadata)     # 类别表来源，见下表
+input      : [1, 3, 640, 640]  (3840x2160 -> 640x640 (scale 0.1667x0.1667, pad 0,140))
+preprocess : 1.32 ms
+forward    : 21.24 ms  (min of 40; 首帧加 --iters 1)
+decode     : 0.73 ms  (min of 40)
+detections : 1
+  #0   car              0.4323  [1847.3, 11.9, 951.6 x 978.3]
 ```
 
 > CLI 的图像 IO 走 [ImageFacade](https://github.com/sevencat/ImageFacade) 的纯托管软后端：画框与中文标签由它自绘；
@@ -238,7 +238,27 @@ foreach (var d in detector.Detect(matData, width, height, bgr: true, rowStride: 
 
 `DetectorOptions` 还可指定 `Layout`（`Auto` / `ChannelsFirst` / `ChannelsLast` / `EndToEnd`）、`ClassCount`、`ClassAgnosticNms`，以及动态输入模型的 `TargetWidth/TargetHeight`。
 
-**类别名**：ultralytics 导出的 ONNX 把类别表写在 metadata 的 `names` 里（`{0: 'person', 1: 'bicycle', …}`）。`YoloDetector` 会自动解析：`detector.ClassNames` 是按下标索引的名字表，`detector.NameOf(id)` 取单个名字；`Detect` / `Decode` 返回的每个 `Detection` 也已经填好 `Name`（缺失时为 `null`，`Label` 退回 `class{id}`）。模型没带 `names` 时可自行传表：`YoloDecoder.Decode(output, transform, options, names)`，或回退到 `CocoLabels`。
+**类别名**：ultralytics 导出的 ONNX 把类别表写在 metadata 的 `names` 里（`{0: 'person', 1: 'bicycle', …}`，是 Python dict 字符串而不是 JSON），`imgsz` 也在同一处。`YoloDetector` 构造时自动解析，坏格式 / 缺号都不会抛：
+
+```csharp
+var detector = new YoloDetector("yolo11n.onnx");
+
+detector.ClassNames                  // 80 条，下标即类别 id；模型没带 names 时是空表
+detector.NameOf(0)                   // "person"；缺号或没表时为 null
+detector.Metadata.InputHeight        // imgsz 的高/宽，int?（yolo11n 是 640 / 640；没写时 null）
+detector.Metadata.Count              // 表长度（最大 id + 1，缺号槽位是空串）
+
+// Detect / Decode 返回的 Detection 已经填好名字：Name 缺号时是 null，Label 退回 "class{id}"
+foreach (var d in detector.Detect(pixels, width, height))
+    Console.WriteLine($"{d.Label} {d.Score:F3}");   // "car 0.432"
+
+// 不用 YoloDetector（自己前向）时：手动传表，或直接解析 metadata
+var boxes = YoloDecoder.Decode(output, transform, options, names);
+var parsed = YoloMetadata.Parse(net.Metadata);       // 原样给 metadata 也行，null → Empty
+```
+
+优先级：CLI 的 `detect` 是「`--labels` 文件 > 模型 `names` > COCO 猜测（仅当检测头字段数 == 84）」，并在 `labels :` 那行打印来源；
+库里的 `YoloDetector` **不猜**——模型没带 `names` 就留空，想要 COCO 名字请自己传 `CocoLabels.Names`。
 
 ### 库用法 3：RF-DETR 一张图进、框出
 
@@ -438,6 +458,8 @@ foreach (Sam3Item item in result.Items)
 - 框提示约定：**归一化 cxcywh + label=1**（`Sam3PromptBoxFormat` 可切 `xyxy` / 模型像素）。
 - 掩码是 288² 概率，源图坐标 = `mask × result.MaskScaleX/Y`；框已经是源图像素。
 - 一次前向约 **26 s**（1008² ViT-L，FP32，16 线程 —— 早期测量，未按 4 线程口径重测），整链 30 s；纯 CPU 只适合离线批处理。
+- 轻量版 **EfficientSAM3 EV-M** 是另一套三模型导出（没有 geometry-encoder，提示走 `exemplar_*` + CLIP 文本），
+  本库没做门面、直接用 `Net` 串，见 [库用法 11](#库用法-11efficientsam3ev-m三模型分割图--框提示--掩码)。
 
 ### 库用法 8：共享的图像预处理（Vision / OCR / SAM3 同一套）
 
@@ -647,9 +669,9 @@ static float Sigmoid(float value) => 1f / (1f + MathF.Exp(-value));
   不需要反 letterbox。**要框就从掩码算 bbox**：这一版导出的 `pred_boxes` 与同 query 的掩码对不上（实测框只有掩码的 1/2~1/7），
   乘原图宽高会得到错框。
 - **输出缓冲槽**：`ForwardAll` 返回的张量指向引擎缓冲，下一次 `Forward` 会覆盖，串模型时必须 `Clone()`（上面 fpn / language_* 都做了）。
-- **耗时**（EV-M，1008²，16 线程，FP32）：image encoder ≈1.1 s、decoder ≈3.8 s、text encoder ≈8 ms；
-  同会话 onnxruntime 是 0.55 s / 3.0 s / 3 ms，比值 2.1× / 1.26× / 2.3×（机器有 ~50% 后台负载，绝对值波动可达 2×，
-  热点与逐轮原始值见 `bench.md` §41.4）。纯 CPU 只适合离线批处理。
+- **耗时**（EV-M，1008²，16 线程，FP32）：image encoder 0.8–2.0 s、decoder 2.9–4.2 s、text encoder 6–11 ms；
+  同会话 onnxruntime 是 0.44–1.4 s / 2.3–3.7 s / 3–4 ms，比值 **1.5–2.6× / 1.1–1.3× / 2.0–2.6×**
+  （机器有 ~50% 后台负载，绝对值波动可达 2×；热点与逐轮原始值见 `bench.md` §41.4）。纯 CPU 只适合离线批处理。
 - **实测结果**（提示框 = yolo26s 检出的一辆车）：`presence 0.9998`、best query 157（`score 0.9636`）、前景占 11.04%；
   掩码与 onnxruntime 的 **IoU = 1.00000**（概率图 `max|d| = 5.5e-3`，差异来自预处理双线性与 OpenCV `INTER_LINEAR` 的细微不同）。
 - 本库只算 fp32：官方导出若是 fp16，先用 `python tools/scripts/onnx_fp16_to_f32.py in.onnx out.onnx` 转换。
@@ -1076,7 +1098,7 @@ rec 4.4 → 2.9 ms，见 [bench.md](bench.md) §37.2）；剩下的量级是 det
 | **YuNet（人脸检测，fp32）** | 官方 `face_detection_yunet` 静态导出（`[1,3,640,640]`，106 节点 / 8 种算子）。**端到端与 OpenCV `cv2.FaceDetectorYN` 逐值对齐**：同一个 640×640 输入下框差 **0.00 px**、5 点关键点差 **3e-5 px**、分数差 5e-7（`YuNetTests`）；512×512 lena 检出 1 张脸 score 0.9135，坐标换回原图空间；预处理是「整图拉伸 + BGR + 0..255 原值」。`face` 子命令可直接出框 / JSON / 画框图。稳态（640×640，**4 线程**）：纯 forward **5.4 ms 最小 / 6.1 ms 中位**；端到端（拉伸预处理 1.7 + forward + 解码 0.5）**8.4 ms 最小 / 10.9 ms 中位**。53 层 Conv 占 forward 的 94%，`Conv_0`（3→16，3×3，s2）一层就占 15%，已试过的三条优化路都是中性或负收益（[bench.md](bench.md) §36） |
 | YuNet int8（`yunet_int8.onnx`） | ✅ 支持：53 `QLinearConv` + 16 `DequantizeLinear` + 5 `QuantizeLinear` + 6 `QLinearSigmoid` + 2 `QLinearAdd` + 4 `MaxPool` 全匹配，跑通。同图对 fp32：score 0.8944 vs 0.9135、框中心差 ~1 px；但**慢 3.5×**（20.3 vs 5.7 ms/帧，4 线程；比 §36 的 22.95 快 11%）—— `QLinearConv` 每层多两趟 f32 物化（RQ→DQ 搬运），小模型上省下的带宽抵不过开销。根因与三条尝试见 [bench.md](bench.md) §36 / §37.4 |
 | SAM3（vision / geometry / text 编码器 + decoder） | 框提示分段跑通，decoder 与 ONNXRuntime **逐值一致**；行人框提示 top-1 **0.932** |
-| **EfficientSAM3 EV-M**（image / text encoder + decoder） | 三模型手工串联（导出没有 geometry-encoder，提示走 `exemplar_*` + CLIP 文本，见 [库用法 11](#库用法-11efficientsam3ev-m三模型分割图--框提示--掩码)）。与 ONNXRuntime 对齐：`fpn_0/1/2` `max\|d\|` 6.3e-7 / 2.1e-5 / 8e-8，`language_*` 4.1e-6（`padding`/`embeds` 逐位一致），`pred_masks` 2.0e-3（值域 ±32）；端到端把 yolo26s 的车辆框当提示，**presence 0.9998、best query 157、掩码与 ORT IoU 1.00000**（概率图 `max\|d\| = 5.5e-3`）。性能见 [bench.md](bench.md) §41 |
+| **EfficientSAM3 EV-M**（image / text encoder + decoder） | 三模型手工串联（导出没有 geometry-encoder，提示走 `exemplar_*` + CLIP 文本，见 [库用法 11](#库用法-11efficientsam3ev-m三模型分割图--框提示--掩码)）。与 ONNXRuntime 对齐：`fpn_0/1/2` `max\|d\|` 6.3e-7 / 2.1e-5 / 8e-8，`language_*` 4.1e-6（`padding`/`embeds` 逐位一致），`pred_masks` 2.0e-3（值域 ±32）；端到端把 yolo26s 的车辆框当提示，**presence 0.9998、best query 157、掩码与 ORT IoU 1.00000**（概率图 `max\|d\| = 2.5e-5`；换成本库 `Stretch` 预处理是 5.5e-3，差异来自缩放的插值方式）。性能见 [bench.md](bench.md) §41 |
 
 > 跨引擎性能对照（OnnxSharp / ONNXRuntime CPU / OpenCV 5 dnn / SimdYolo）见 [bench.md](bench.md)。
 > 同类引擎 **Sdcb.SimdOnnx 目前跑不了 YOLO**：它的 `Softmax` 只支持最后一维，而 YOLO 的 DFL 是
@@ -1233,7 +1255,7 @@ The **requirements, reference material and acceptance criteria** come from the m
 | Graph passes | Constant folding (Shape→Gather→Concat→Reshape chains), operator fusion (Conv+SiLU, element-wise chains, `MatMul`+`ArgMax`, manual LayerNorm → `LayerNormalization`) |
 | Runtime | Static buffer pool (outputs detach), shape inference, `Parallel.For` + AVX2/AVX-512 |
 | Threads | **Physical core count** by default (via `GetLogicalProcessorInformationEx` on Windows, falling back to `ProcessorCount`), overridable via `ONNXSHARP_THREADS`. SMT buys nothing on these FP-bound kernels, the extra spinning workers only steal time slices. **All benchmarks and tuning assume 4 threads** — the goal is not to saturate the machine |
-| Vision | `OnnxSharp.Vision`: letterbox / stretch preprocessing, YOLO decode + NMS, RF-DETR decode, YuNet faces (box + 5 landmarks + NMS) |
+| Vision | `OnnxSharp.Vision`: letterbox / stretch preprocessing, YOLO decode + NMS (class names parsed from the model metadata `names`), RF-DETR decode, YuNet faces (box + 5 landmarks + NMS) |
 | OCR | `OnnxSharp.Ocr.PaddleOCR`: PP-OCRv6 det + optional cls + rec, DB post-processing, CTC — text lines in source pixels |
 | Plates | `OnnxSharp.Ocr.Plate`: a **decoder-side** specialisation on the same det/rec — ~70-class charset, positional rules, CTC Viterbi per-character posteriors, plate shape validation; `DetectAndRead` (whole image) / `Read` (known box) / `ReadWhole` (the input *is* a cropped plate) |
 | Dynamic graphs | `Net.ReadModel(path, inputShape)` **specialises** a fully dynamic input (`x[N,3,H,W]`) so shape chains fold at import |
@@ -1334,9 +1356,9 @@ var detector = new YoloDetector("yolo11n.onnx", new DetectorOptions
     MaxDetections = 300,
 });
 
-// (1) packed RGB24, row stride == width * 3
+// (1) packed RGB24, row stride == width * 3; Label comes from the model metadata `names`
 foreach (var d in detector.Detect(pixels, width, height))
-    Console.WriteLine($"{d.ClassId} {d.Score:F3} [{d.X:F1},{d.Y:F1},{d.Width:F1}x{d.Height:F1}]");
+    Console.WriteLine($"{d.ClassId} {d.Label} {d.Score:F3} [{d.X:F1},{d.Y:F1},{d.Width:F1}x{d.Height:F1}]");
 
 // (2) BGR with row padding: OpenCV Mat, camera SDK buffers
 //     matData = byte view of mat.data (Marshal.Copy / unsafe pointer), stride = (int)mat.Step()
@@ -1347,6 +1369,19 @@ foreach (var d in detector.Detect(matData, width, height, bgr: true, rowStride: 
 **Pixel input contract**: `bgr` swaps R/B (OpenCV and most camera/capture SDKs are BGR); `rowStride` is the **byte count per row** (including alignment padding), `0` means `width * 3`. Both flags exist on `Detect` and on the preprocess-only `Preprocess`, and pixels are read in place — the image is never copied or repacked.
 
 The facade does letterbox (keep aspect ratio, pad 114, bilinear) → forward → per-anchor argmax → threshold → per-class NMS → un-letterbox → clip. Boxes are in source pixels.
+
+**Class names**: ultralytics exports store the label table in the ONNX metadata as `names` — a Python dict literal (`{0: 'person', 1: 'bicycle', …}`), not JSON — together with `imgsz`. `YoloDetector` parses it at construction time; malformed entries or gaps never throw:
+
+```csharp
+detector.ClassNames              // 80 names, indexed by class id; empty when the model has no `names`
+detector.NameOf(0)               // "person"; null for a missing / unknown id
+detector.Metadata.InputHeight    // imgsz height/width as int? (640/640 for yolo11n; null when absent)
+
+var boxes = YoloDecoder.Decode(output, transform, options, names);  // own forward pass: pass a table
+YoloMetadata.Parse(net.Metadata);                                   // or parse metadata yourself
+```
+
+Every `Detection` from `Detect` / `Decode` carries `Name` (null when the model has no table) and `Label` (falls back to `class{id}`). `YoloDetector` never guesses: with no `names` you get `null`, pass `CocoLabels.Names` explicitly if you want COCO labels. The CLI's `detect` does guess in one case — `--labels` file > model `names` > COCO when the head has 84 fields — and prints the source on its `labels :` line.
 
 **RF-DETR — image in, boxes out**
 
@@ -1594,7 +1629,9 @@ code; it is deliberately not bundled here so an optional feature does not drag i
 | `asr <wav> --models <dir> [--tokens f] [--json] [--out text.txt]` | End-to-end recognition (fbank → encoder → CIF → decoder → text); `<dir>` holds `encoder.onnx` / `decoder.onnx` / `tokens.txt` |
 | `gemmbench` / `convbench` / `flopsbench` / `parbench` | Micro-benchmarks for tuning |
 
-Key `detect` flags: `--family auto|yolo|rfdetr`, `--conf`, `--iou` (YOLO), `--max-det`, `--classes`, `--layout`, `--class-agnostic`, `--background -1|none` and `--norm imagenet|255` (RF-DETR), `--labels`, `--json`, `--input <f32.bin> --shape 1,3,640,640`, `--iters N`, `--size N`.
+Key `detect` flags: `--family auto|yolo|rfdetr`, `--conf`, `--iou` (YOLO), `--max-det`, `--classes`, `--layout`, `--class-agnostic`, `--background -1|none` and `--norm imagenet|255` (RF-DETR), `--labels` (one name per line, overrides the metadata `names`), `--json`, `--input <f32.bin> --shape 1,3,640,640`, `--iters N`, `--size N`.
+
+Name table priority in `detect`: `--labels` file > model metadata `names` > COCO guess (when the head has 4+80 fields). The chosen source is printed on the `labels :` line.
 
 Key `plate` flags: `--direct` (the input is already one plate — skip DB), `--crop x,y,w,h` (one box you already know), `--beam` / `--greedy`, `--no-structure` / `--loose`, `--score`, `--max`, `--limit` / `--det-conf` / `--box` / `--unclip` (DB side, ignored with `--direct`/`--crop`), `--iters N` (only with `--direct`/`--crop`, steady-state single-plate rec), `--json`.
 
