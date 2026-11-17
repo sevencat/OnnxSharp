@@ -11,6 +11,8 @@
   + 默认线程改物理核 + OCR 输入张量复用。**收益只在池化/Resize 占比高的图**：OCR 端到端 −29%、
   YuNet int8 −11%；**yolo / rfdetr 持平（噪声内）**，四引擎同会话复测也证明这不是环境漂移。
   下一步若要继续 yolo：只剩微内核深度与 NCHWc 覆盖面两条路（`§26~§34` 已把 `1×1` 的账算干）。
+- 补测（`bench.md §38`）：与 **MLAS 单算子**对照后，落后只落在 **F32 GEMM 单线程**（−20~30%）；
+  16 线程 SGEMM 多数形状反超 ORT 1.1~2.1×、int8 打平、卷积 NCHWc 更好 ⇒ yolo 的 1.28× 不在内核。
 
 ---
 
@@ -347,6 +349,19 @@ v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→
 ---
 
 ## 6. 日志
+
+### 2026-11-17（与 MLAS 单算子对照：GEMM / int8 / Conv，`bench.md §38`）
+
+- 把 `F:\code\mlas`（ORT 内部的 GEMM/Conv 库）编的 dll 直接调起来，与我们的实现对拍（同会话、同线程口径）。
+  踩坑记录在 §38.1：修饰名导出、`ThreadPool=nullptr` ⇒ 单线程、packed 缓冲需 64 字节对齐、
+  `MlasConv` 的 `InputChannels`/`FilterCount` 是**每组**值、`MlasActivation` 不接受空指针。
+- **唯一系统性落后的是 F32 GEMM 单线程**：MLAS 84~106 GFLOPS（单核 FMA 峰值的 76~96%），
+  我们 68~87（62~79%），yolo 形状落后 19~30%；三处断崖 `n=100`(0.38×)、GEMV(0.24×)、`512×1024×1024`(0.53×)。
+- **16 线程我们不落后**：SGEMM 多数形状 1.1~2.1× 于 ORT MatMul（ORT 自己在大宽形状只吃到峰值 21%）；
+  int8 `512×1024×1024` 双方 **1067.1 vs 1066.3 GMAC/s**（0.1% 内）；卷积 NCHWc 16T 中位 437 vs MLAS NCHW 210。
+- **yolo 的 1.28× 不在内核**：同一层裸 Conv 比，我们 NCHWc 单线程与 MLAS NCHW 同档、16T 更好 —— 与 §37.5 同向。
+- 口径边界：ORT 图内走未导出的 `MlasNchwcConv`，`MlasConv` 是 fallback，§38.4 不能换算成整图性能。
+- 顺带修 `convbench --threads` 不生效（只有 `GemmBench` 设过 `MaxDegreeOfParallelism`）。
 
 ### 2026-11-17（收工：Conv 之外的零钱，OCR −29% / YuNet int8 −11%，yolo 持平，`bench.md §37`）
 

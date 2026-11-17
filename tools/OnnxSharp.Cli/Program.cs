@@ -1193,6 +1193,12 @@ static int ConvBench(string[] args)
     var options = ParseOptions(args, 0);
     int iters = options.GetInt("--iters", 20);
 
+    // 和 gemmbench 一样支持 --threads：卷积内核的分块决策读 ParallelRange.Threads，
+    // 不给就只能是默认物理核数，跟别的基准表对不齐。
+    int threads = options.GetInt("--threads", 0);
+    if (threads > 0)
+        OnnxSharp.Threading.ParallelRange.MaxDegreeOfParallelism = threads;
+
     var configs = new List<(int Ic, int Oc, int H, int W, int K, int S, int P)>();
 
     // --shape 被 ParseOptions 收进 Shapes 列表（不是 _values 字典），GetString 取不到，
