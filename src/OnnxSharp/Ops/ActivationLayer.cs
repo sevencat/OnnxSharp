@@ -38,6 +38,7 @@ public sealed class ActivationLayer : Layer
 
         LayerRegistry.Register("Clip", p => new ClipLayer(p));
         LayerRegistry.Register("HardSigmoid", p => new HardSigmoidLayer(p));
+        LayerRegistry.Register("HardSwish", p => new HardSwishLayer(p));
 
         // 不是 ONNX 算子：图级融合（Sigmoid → Mul）的产物，见 GraphFusion。
         LayerRegistry.Register("Silu", p => new ActivationLayer(p, UnaryOpKind.Silu));
@@ -165,6 +166,62 @@ public sealed class ActivationLayer : Layer
 
             for (; i < src.Length; i++)
                 dst[i] = MathF.Min(1f, MathF.Max(0f, _alpha * src[i] + _beta));
+        }
+    }
+
+    // ---------------- HardSwish ----------------
+
+    /// <summary>
+    /// <c>y = x * max(0, min(1, alpha * x + beta))</c>，ONNX 默认 <c>alpha = 1/6</c>、<c>beta = 0.5</c>。
+    /// EfficientViT（EfficientSAM3 的 image encoder）的每个 MBConv 都用它，属性可省略，故按默认值兜底。
+    /// </summary>
+    private sealed class HardSwishLayer : Layer
+    {
+        private readonly float _alpha;
+        private readonly float _beta;
+
+        public HardSwishLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _alpha = (float)parameters.GetFloat("alpha", 1.0 / 6.0);
+            _beta = (float)parameters.GetFloat("beta", 0.5);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+            => outShapes.Add(inShapes[0]);
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var src = inputs[0].AsSpan<float>();
+            var dst = outputs[0].AsSpan<float>();
+
+            int i = 0;
+            if (Fma.IsSupported)
+            {
+                var va = Vector256.Create(_alpha);
+                var vb = Vector256.Create(_beta);
+                var zero = Vector256<float>.Zero;
+                var one = Vector256.Create(1f);
+
+                for (; i + Vector256<float>.Count <= src.Length; i += Vector256<float>.Count)
+                {
+                    var x = Vector256.LoadUnsafe(ref src[i]);
+                    var gate = Fma.MultiplyAdd(x, va, vb);
+                    gate = Vector256.Min(one, Vector256.Max(zero, gate));
+                    Vector256.StoreUnsafe(x * gate, ref dst[i]);
+                }
+            }
+
+            for (; i < src.Length; i++)
+                dst[i] = src[i] * MathF.Min(1f, MathF.Max(0f, _alpha * src[i] + _beta));
         }
     }
 

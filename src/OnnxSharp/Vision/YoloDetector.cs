@@ -20,6 +20,7 @@ public sealed class YoloDetector
 {
     private readonly Net _net;
     private readonly string _inputName;
+    private readonly bool _hasClassNames;
 
     /// <summary>加载模型并准备检测器。</summary>
     /// <param name="modelPath">ONNX 文件路径。</param>
@@ -34,6 +35,8 @@ public sealed class YoloDetector
     {
         _net = net ?? throw new ArgumentNullException(nameof(net));
         Options = options ?? new DetectorOptions();
+        Metadata = YoloMetadata.Parse(_net.Metadata);
+        _hasClassNames = Metadata.Count > 0;
 
         var inputNames = _net.InputNames;
         if (inputNames.Count == 0)
@@ -60,6 +63,21 @@ public sealed class YoloDetector
 
     /// <summary>后处理参数。</summary>
     public DetectorOptions Options { get; }
+
+    /// <summary>
+    /// 从模型 metadata 解析出的类别表（ultralytics 的 <c>names</c>）；
+    /// 模型没带时是 <see cref="YoloMetadata.Empty"/>（<see cref="ClassNames"/> 为空表）。
+    /// </summary>
+    public YoloMetadata Metadata { get; }
+
+    /// <summary>类别名表，下标即类别 id；缺号槽位是空串。模型没带 <c>names</c> 时为空表。</summary>
+    public IReadOnlyList<string> ClassNames => Metadata.Names;
+
+    /// <summary>
+    /// 按类别 id 取名字；模型没带 <c>names</c>、或该 id 缺号时返回 <c>null</c>
+    /// （COCO 权重的兜底见 <see cref="CocoLabels.NameOf"/>）。
+    /// </summary>
+    public string? NameOf(int classId) => Metadata.NameOf(classId);
 
     /// <summary>模型输入张量的名字。</summary>
     public string InputName => _inputName;
@@ -115,7 +133,10 @@ public sealed class YoloDetector
         return Decode(output, transform);
     }
 
-    /// <summary>只做后处理：把检测头张量解成原图坐标的框（需要自己计时或自己前向时用）。</summary>
+    /// <summary>
+    /// 只做后处理：把检测头张量解成原图坐标的框（需要自己计时或自己前向时用）。
+    /// 返回的每个 <see cref="Detection"/> 已按模型 metadata 的类别表填好 <see cref="Detection.Name"/>。
+    /// </summary>
     public IReadOnlyList<Detection> Decode(Tensor output, in Letterbox transform)
-        => YoloDecoder.Decode(output, transform, Options);
+        => YoloDecoder.Decode(output, transform, Options, _hasClassNames ? Metadata.Names : null);
 }

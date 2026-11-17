@@ -273,7 +273,7 @@ static int Run(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.Error.WriteLine("usage: run <model.onnx> --input <file.bin> [--compare <golden.bin>] [--repeat N]");
+        Console.Error.WriteLine("usage: run <model.onnx> --input <file.bin> [--compare <golden.bin>] [--repeat N] [--dump <dir>] [--dump-tensor name=file.f32]");
         return 2;
     }
 
@@ -319,6 +319,27 @@ static int Run(string[] args)
     string? dumpDir = options.GetString("--dump");
     if (dumpDir is not null)
         Directory.CreateDirectory(dumpDir);
+
+    // 调试中间张量：--dump-tensor "<节点输出名>=<file.f32>[;...]"
+    // （大模型逐节点对齐时用，图输出之外的张量也能取到；多个用分号分隔）
+    if (options.GetString("--dump-tensor") is { Length: > 0 } probeList)
+    {
+        foreach (string probe in probeList.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int eq = probe.IndexOf('=');
+            if (eq <= 0)
+            {
+                Console.Error.WriteLine("--dump-tensor expects name=file.f32");
+                return 2;
+            }
+
+            string tensorName = probe[..eq];
+            string tensorFile = probe[(eq + 1)..];
+            var tensor = net.Impl.GetArgTensor(net.Impl.Require(tensorName));
+            File.WriteAllBytes(tensorFile, tensor.Bytes().ToArray());
+            Console.WriteLine($"tensor    : {tensorName} {tensor.Shape} {tensor.DType} -> {tensorFile}");
+        }
+    }
 
     for (int i = 0; i < first!.Count; i++)
     {
@@ -1947,15 +1968,22 @@ static int Detect(string[] args)
                            $"({sourceWidth}x{sourceHeight} -> stretch, {detector.BoxesOutputName}/{detector.LogitsOutputName})";
     }
 
-    // 没显式给 --labels 时按检测头维度猜：84 = 4 + 80，就是 COCO 那套公开权重
-    // （yolov8 / yolo11 / yolo26 都一样）。自定义类别数的模型不会误判。
-    var labels = LoadLabels(options.GetString("--labels"))
-        ?? (yoloFields == CocoLabels.DetectionFields ? CocoLabels.Names : null);
+    // 名字表优先级：--labels 文件 > 模型 metadata 的 names（ultralytics 导出自带）
+    // > 按检测头维度猜（84 = 4 + 80，就是 COCO 那套公开权重；yolov8 / yolo11 / yolo26 都一样）。
+    string? labelsPath = options.GetString("--labels");
+    var metadataLabels = YoloMetadata.Parse(net.Metadata).Names;
+    var labels = LoadLabels(labelsPath)
+        ?? (metadataLabels.Count > 0
+            ? metadataLabels
+            : yoloFields == CocoLabels.DetectionFields ? CocoLabels.Names : null);
+    string labelsSource = labelsPath is not null ? "--labels" : metadataLabels.Count > 0 ? "model metadata" : "coco default";
 
     Console.WriteLine($"model      : {modelPath}");
     if (image is { } sourceImage)
         Console.WriteLine($"image      : {imagePath} {sourceImage.Width}x{sourceImage.Height}");
     Console.WriteLine($"family     : {(rfdetr ? "rfdetr" : "yolo")}");
+    if (labels is { Count: > 0 })
+        Console.WriteLine($"labels     : {labels.Count} classes  ({labelsSource})");
     Console.WriteLine($"input      : {inputDescription}");
     if (image is not null)
         Console.WriteLine($"preprocess : {preprocessMilliseconds:F2} ms");

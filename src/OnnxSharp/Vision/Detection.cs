@@ -12,6 +12,15 @@ namespace OnnxSharp.Vision;
 /// <param name="Height">框高，恒大于 0。</param>
 public readonly record struct Detection(int ClassId, float Score, float X, float Y, float Width, float Height)
 {
+    /// <summary>
+    /// 类别名，来自模型 metadata 的 <c>names</c>（见 <see cref="YoloMetadata"/>）。
+    /// 模型的 metadata 没有类别表（或调用方没给名字表）时为 <c>null</c>，此时只能用 <see cref="ClassId"/>。
+    /// </summary>
+    public string? Name { get; init; }
+
+    /// <summary>名字缺失时退回 <c>class{ClassId}</c>（日志 / 可视化用，永不返回 null）。</summary>
+    public string Label => Name ?? $"class{ClassId}";
+
     public float Right => X + Width;
 
     public float Bottom => Y + Height;

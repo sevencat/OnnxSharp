@@ -222,9 +222,9 @@ var detector = new YoloDetector("yolo11n.onnx", new DetectorOptions
     MaxDetections = 300,     // 默认 300
 });
 
-// ① 紧凑 RGB24（行跨度 = width * 3）
+// ① 紧凑 RGB24（行跨度 = width * 3）；Name 来自模型 metadata 的 names
 foreach (var d in detector.Detect(pixels, width, height))
-    Console.WriteLine($"{d.ClassId} {d.Score:F3} [{d.X:F1},{d.Y:F1},{d.Width:F1}x{d.Height:F1}]");
+    Console.WriteLine($"{d.ClassId} {d.Label} {d.Score:F3} [{d.X:F1},{d.Y:F1},{d.Width:F1}x{d.Height:F1}]");
 
 // ② BGR + 行尾填充：OpenCV 的 Mat、相机 SDK 的缓冲都长这样
 //    matData = mat.data 的 byte 视图（Marshal.Copy / unsafe 指针），stride = (int)mat.Step()
@@ -237,6 +237,8 @@ foreach (var d in detector.Detect(matData, width, height, bgr: true, rowStride: 
 内部完成：letterbox（等比缩放 + 填 114 + 双线性）→ 推理 → 逐锚点 argmax → 阈值 → 同类 NMS → 反 letterbox → 裁剪到图内。框坐标原点在原图左上角，单位像素。
 
 `DetectorOptions` 还可指定 `Layout`（`Auto` / `ChannelsFirst` / `ChannelsLast` / `EndToEnd`）、`ClassCount`、`ClassAgnosticNms`，以及动态输入模型的 `TargetWidth/TargetHeight`。
+
+**类别名**：ultralytics 导出的 ONNX 把类别表写在 metadata 的 `names` 里（`{0: 'person', 1: 'bicycle', …}`）。`YoloDetector` 会自动解析：`detector.ClassNames` 是按下标索引的名字表，`detector.NameOf(id)` 取单个名字；`Detect` / `Decode` 返回的每个 `Detection` 也已经填好 `Name`（缺失时为 `null`，`Label` 退回 `class{id}`）。模型没带 `names` 时可自行传表：`YoloDecoder.Decode(output, transform, options, names)`，或回退到 `CocoLabels`。
 
 ### 库用法 3：RF-DETR 一张图进、框出
 
@@ -546,6 +548,130 @@ OnnxSharp.Cli face yunet.onnx group.jpg [--conf 0.6] [--iou 0.3] [--max-faces 10
 
 int8 模型（`yunet_int8.onnx`）API 完全一样，换个路径就能跑 —— 但当前比 fp32 **慢 3.5×**（20.3 vs 5.7 ms，原因见[性能](#性能)与 `bench.md` §36 / §37.4）。
 
+### 库用法 11：EfficientSAM3（EV-M）三模型分割（图 + 框提示 → 掩码）
+
+官方 EfficientSAM3 的 **EV-M** 导出拆成三个 ONNX（和「库用法 7」的 SAM3 门面不是同一套：没有 geometry-encoder，
+提示走 `exemplar_*` 槽位 + CLIP 文本），本库没有为它单独做门面，直接用 `Net` 串：
+
+| 模型 | 输入 | 输出 |
+|---|---|---|
+| `image_encoder` | `image[1,3,1008,1008]`（拉伸 + ImageNet 归一化） | `fpn_0[1,256,288,288]` / `fpn_1[1,256,144,144]` / `fpn_2[1,256,72,72]` + `pos_0/1/2` |
+| `text_encoder` | `tokens[1,16]`（int64，CLIP BPE，BOS 49406 / EOS 49407） | `language_features[16,1,256]` / `language_padding[1,16]` / `language_embeds[16,1,512]` |
+| `decoder` | `fpn_0..2` + `pos_2` + `language_*` + `exemplar_boxes[8,1,4]` / `exemplar_labels[8,1]` / `exemplar_mask[1,8]` | `pred_logits[1,200,1]` / `pred_boxes[1,200,4]` / `pred_masks[1,200,288,288]` / `presence_logit[1,1]` |
+
+```csharp
+using OnnxSharp.Core;
+using OnnxSharp.Tensors;
+using OnnxSharp.Vision;
+
+const int Size = 1008, MaskSize = 288, Slots = 8;
+
+// 1) image encoder：整图拉伸到 1008²（不填边）+ ImageNet 归一化
+var encoder = Net.ReadModel(@"esam3\efficientsam3_ev_m_image_encoder.onnx");
+encoder.SetInput("image", ImagePreprocessor.Stretch(pixels, width, height, Size, Size,
+                                                    normalization: ChannelNormalization.ImageNet));
+
+var feats = encoder.ForwardAll();
+Tensor fpn0 = Output(encoder, feats, "fpn_0").Clone();   // 输出指向引擎缓冲槽，下一次 Forward 会覆盖
+Tensor fpn1 = Output(encoder, feats, "fpn_1").Clone();
+Tensor fpn2 = Output(encoder, feats, "fpn_2").Clone();
+Tensor pos2 = Output(encoder, feats, "pos_2").Clone();
+
+// 2) text encoder：16 个 CLIP token，BOS/EOS 之后补 0；只给框时就是空文本
+var text = Net.ReadModel(@"esam3\efficientsam3_ev_m_text_encoder.onnx");
+long[] tokens = new long[16];
+tokens[0] = 49406;
+tokens[1] = 49407;
+text.SetInput("tokens", Tensor.FromInt64(tokens, new TensorShape(1, 16)));
+
+var language = text.ForwardAll();
+Tensor languageFeatures = Output(text, language, "language_features").Clone();
+Tensor languagePadding = Output(text, language, "language_padding").Clone();
+
+// 3) decoder：8 个 exemplar 槽，槽 0 放提示框（cxcywh、按原图归一化）
+var decoder = Net.ReadModel(@"esam3\efficientsam3_ev_m_decoder.onnx");
+var boxes = new float[Slots * 4];
+var labels = new long[Slots];
+var slots = new float[Slots];
+
+float x1 = 1951.8f, y1 = 1055.4f, w = 1019.4f, h = 1092.9f;   // 提示框：YOLO 检出或人工标注，原图像素
+boxes[0] = (x1 + w / 2) / width;
+boxes[1] = (y1 + h / 2) / height;
+boxes[2] = w / width;
+boxes[3] = h / height;
+labels[0] = 1;                        // 1 = 目标框，0 = 空槽
+slots[0] = 1;                         // 1 = 该槽有效
+
+decoder.SetInput("fpn_0", fpn0);
+decoder.SetInput("fpn_1", fpn1);
+decoder.SetInput("fpn_2", fpn2);
+decoder.SetInput("pos_2", pos2);
+decoder.SetInput("language_features", languageFeatures);
+decoder.SetInput("language_padding", languagePadding);
+decoder.SetInput("exemplar_boxes", Tensor.FromArray(boxes, new TensorShape(Slots, 1, 4)));
+decoder.SetInput("exemplar_labels", Tensor.FromInt64(labels, new TensorShape(Slots, 1)));
+decoder.SetInput("exemplar_mask", Tensor.FromArray(slots, new TensorShape(1, Slots)));
+
+// 4) 后处理：score = sigmoid(pred_logits) × sigmoid(presence_logit)，取最高分的 query
+var outputs = decoder.ForwardAll();
+ReadOnlySpan<float> logits = Output(decoder, outputs, "pred_logits").AsSpan<float>();
+float presence = Sigmoid(Output(decoder, outputs, "presence_logit").AsSpan<float>()[0]);
+
+int best = ArgMax(logits);
+float score = Sigmoid(logits[best]) * presence;
+
+ReadOnlySpan<float> maskLogits = Output(decoder, outputs, "pred_masks")
+    .AsSpan<float>()
+    .Slice(best * MaskSize * MaskSize, MaskSize * MaskSize);
+// 掩码是 logits：> 0 即前景；要概率图就逐点 sigmoid
+
+static Tensor Output(Net net, IReadOnlyList<Tensor> outputs, string name)
+{
+    for (int i = 0; i < outputs.Count; i++)
+        if (net.OutputNames[i] == name) return outputs[i];
+    throw new InvalidOperationException($"{name} 不在输出里");
+}
+
+static int ArgMax(ReadOnlySpan<float> values)
+{
+    int best = 0;
+    for (int i = 1; i < values.Length; i++)
+        if (values[i] > values[best]) best = i;
+    return best;
+}
+
+static float Sigmoid(float value) => 1f / (1f + MathF.Exp(-value));
+```
+
+- **掩码坐标**：预处理是整图拉伸，所以 288² 的掩码直接覆盖原图 —— 放大时按 `x * width / 288`、`y * height / 288`，
+  不需要反 letterbox。**要框就从掩码算 bbox**：这一版导出的 `pred_boxes` 与同 query 的掩码对不上（实测框只有掩码的 1/2~1/7），
+  乘原图宽高会得到错框。
+- **输出缓冲槽**：`ForwardAll` 返回的张量指向引擎缓冲，下一次 `Forward` 会覆盖，串模型时必须 `Clone()`（上面 fpn / language_* 都做了）。
+- **耗时**（EV-M，1008²，16 线程，FP32）：image encoder ≈1.1 s、decoder ≈3.8 s、text encoder ≈8 ms；
+  同会话 onnxruntime 是 0.55 s / 3.0 s / 3 ms，比值 2.1× / 1.26× / 2.3×（机器有 ~50% 后台负载，绝对值波动可达 2×，
+  热点与逐轮原始值见 `bench.md` §41.4）。纯 CPU 只适合离线批处理。
+- **实测结果**（提示框 = yolo26s 检出的一辆车）：`presence 0.9998`、best query 157（`score 0.9636`）、前景占 11.04%；
+  掩码与 onnxruntime 的 **IoU = 1.00000**（概率图 `max|d| = 5.5e-3`，差异来自预处理双线性与 OpenCV `INTER_LINEAR` 的细微不同）。
+- 本库只算 fp32：官方导出若是 fp16，先用 `python tools/scripts/onnx_fp16_to_f32.py in.onnx out.onnx` 转换。
+
+命令行等价写法（三个模型依次跑，中间结果落盘后再喂下一个）：
+
+```powershell
+$cli = 'tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe'
+
+& $cli run esam3\efficientsam3_ev_m_image_encoder.onnx --input image=image.f32   --dump ours_img
+& $cli run esam3\efficientsam3_ev_m_text_encoder.onnx  --input tokens=tokens.i64 --dump ours_txt
+
+& $cli run esam3\efficientsam3_ev_m_decoder.onnx `
+    --input fpn_0=ours_img/out0.f32 --input fpn_1=ours_img/out1.f32 --input fpn_2=ours_img/out2.f32 `
+    --input pos_2=ours_img/out5.f32 `
+    --input language_features=ours_txt/out0.f32 --input language_padding=ours_txt/out1.f32 `
+    --input exemplar_boxes=exemplar_boxes.f32 --input exemplar_labels=exemplar_labels.i64 `
+    --input exemplar_mask=exemplar_mask.f32 --dump ours_dec
+```
+
+`--dump` 按输出顺序写成 `out0.f32`、`out1.f32`…，image encoder 的 `out5` 就是 `pos_2`。
+
 ### 命令行
 
 ```powershell
@@ -578,7 +704,7 @@ $cli = "tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe"
 | `--max-det 300` / `--classes N` | 最多保留框数 / 类别数（0 = 从输出推断） |
 | `--layout auto\|cf\|cl\|e2e` / `--class-agnostic` | 检测头布局 / 跨类 NMS |
 | `--background -1\|none` / `--norm imagenet\|255` | RF-DETR 背景列 / 归一化方式 |
-| `--labels names.txt` / `--json out.json` | 类别名（每行一个）/ 结果落盘 |
+| `--labels names.txt` / `--json out.json` | 类别名（每行一个，覆盖模型 metadata 的 `names`）/ 结果落盘 |
 | `--input in.bin --shape 1,3,640,640` | 跳过预处理，直接喂已预处理好的 F32 |
 | `--iters N` / `--size N` | 计时迭代数（稳态吞吐用 40）/ 动态输入模型的方形尺寸 |
 
@@ -950,6 +1076,7 @@ rec 4.4 → 2.9 ms，见 [bench.md](bench.md) §37.2）；剩下的量级是 det
 | **YuNet（人脸检测，fp32）** | 官方 `face_detection_yunet` 静态导出（`[1,3,640,640]`，106 节点 / 8 种算子）。**端到端与 OpenCV `cv2.FaceDetectorYN` 逐值对齐**：同一个 640×640 输入下框差 **0.00 px**、5 点关键点差 **3e-5 px**、分数差 5e-7（`YuNetTests`）；512×512 lena 检出 1 张脸 score 0.9135，坐标换回原图空间；预处理是「整图拉伸 + BGR + 0..255 原值」。`face` 子命令可直接出框 / JSON / 画框图。稳态（640×640，**4 线程**）：纯 forward **5.4 ms 最小 / 6.1 ms 中位**；端到端（拉伸预处理 1.7 + forward + 解码 0.5）**8.4 ms 最小 / 10.9 ms 中位**。53 层 Conv 占 forward 的 94%，`Conv_0`（3→16，3×3，s2）一层就占 15%，已试过的三条优化路都是中性或负收益（[bench.md](bench.md) §36） |
 | YuNet int8（`yunet_int8.onnx`） | ✅ 支持：53 `QLinearConv` + 16 `DequantizeLinear` + 5 `QuantizeLinear` + 6 `QLinearSigmoid` + 2 `QLinearAdd` + 4 `MaxPool` 全匹配，跑通。同图对 fp32：score 0.8944 vs 0.9135、框中心差 ~1 px；但**慢 3.5×**（20.3 vs 5.7 ms/帧，4 线程；比 §36 的 22.95 快 11%）—— `QLinearConv` 每层多两趟 f32 物化（RQ→DQ 搬运），小模型上省下的带宽抵不过开销。根因与三条尝试见 [bench.md](bench.md) §36 / §37.4 |
 | SAM3（vision / geometry / text 编码器 + decoder） | 框提示分段跑通，decoder 与 ONNXRuntime **逐值一致**；行人框提示 top-1 **0.932** |
+| **EfficientSAM3 EV-M**（image / text encoder + decoder） | 三模型手工串联（导出没有 geometry-encoder，提示走 `exemplar_*` + CLIP 文本，见 [库用法 11](#库用法-11efficientsam3ev-m三模型分割图--框提示--掩码)）。与 ONNXRuntime 对齐：`fpn_0/1/2` `max\|d\|` 6.3e-7 / 2.1e-5 / 8e-8，`language_*` 4.1e-6（`padding`/`embeds` 逐位一致），`pred_masks` 2.0e-3（值域 ±32）；端到端把 yolo26s 的车辆框当提示，**presence 0.9998、best query 157、掩码与 ORT IoU 1.00000**（概率图 `max\|d\| = 5.5e-3`）。性能见 [bench.md](bench.md) §41 |
 
 > 跨引擎性能对照（OnnxSharp / ONNXRuntime CPU / OpenCV 5 dnn / SimdYolo）见 [bench.md](bench.md)。
 > 同类引擎 **Sdcb.SimdOnnx 目前跑不了 YOLO**：它的 `Softmax` 只支持最后一维，而 YOLO 的 DFL 是

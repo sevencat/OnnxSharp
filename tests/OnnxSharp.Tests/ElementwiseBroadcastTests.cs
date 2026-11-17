@@ -16,6 +16,8 @@ internal static class ElementwiseBroadcastTests
         yield return new("broadcast: inner-constant operand (per-row scalar)", InnerConstant);
         yield return new("broadcast: tail operand (per-column vector)", TailVector);
         yield return new("broadcast: neither side equals the output", BothBroadcast);
+        yield return new("broadcast: strided run (relative-position outer add)", StridedRun);
+        yield return new("broadcast: strided run over a parallel split", StridedRunParallel);
     }
 
     private static void InnerConstant()
@@ -46,6 +48,33 @@ internal static class ElementwiseBroadcastTests
         Check(BinaryOpKind.Sub, left, right);
     }
 
+    /// <summary>
+    /// SAM3 的相对位置外积：<c>[1,3,5,1,8] + [1,3,1,4,8]</c>。两侧都在变、各自在某些轴上广播，
+    /// 走 <c>TryApplyStridedRun</c>（段长 8，外层 5×4 段）。
+    /// </summary>
+    private static void StridedRun()
+    {
+        var left = Tensor.FromArray(Fill(3 * 5 * 8, 1f), new TensorShape(1, 3, 5, 1, 8));
+        var right = Tensor.FromArray(Fill(3 * 4 * 8, 2f), new TensorShape(1, 3, 1, 4, 8));
+        Check(BinaryOpKind.Add, left, right);
+    }
+
+    /// <summary>同样的形状但元素数过并行阈值（否则只测到串行分支）。</summary>
+    private static void StridedRunParallel()
+    {
+        var left = Tensor.FromArray(Fill(16 * 64 * 8, 3f), new TensorShape(1, 16, 64, 1, 8));
+        var right = Tensor.FromArray(Fill(16 * 64 * 8, 5f), new TensorShape(1, 16, 1, 64, 8));
+        Check(BinaryOpKind.Add, left, right);
+    }
+
+    private static float[] Fill(int count, float value)
+    {
+        var values = new float[count];
+        for (int i = 0; i < count; i++)
+            values[i] = value + i % 7;   // 每个位置不同，避免「常数」掩盖索引错位
+        return values;
+    }
+
     private static void Check(BinaryOpKind op, Tensor a, Tensor b)
     {
         var impl = new NetImpl();
@@ -55,6 +84,7 @@ internal static class ElementwiseBroadcastTests
 
         string type = op switch
         {
+            BinaryOpKind.Add => "Add",
             BinaryOpKind.Sub => "Sub",
             BinaryOpKind.Mul => "Mul",
             _ => "Div",
@@ -90,6 +120,7 @@ internal static class ElementwiseBroadcastTests
             float y = b.AsSpan<float>()[Offset(b.Shape.ToArray(), index)];
             expected[i] = op switch
             {
+                BinaryOpKind.Add => x + y,
                 BinaryOpKind.Sub => x - y,
                 BinaryOpKind.Mul => x * y,
                 _ => x / y,

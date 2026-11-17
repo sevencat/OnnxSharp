@@ -15,6 +15,8 @@ internal static class IndexOps
         LayerRegistry.Register("Gather", p => new GatherLayer(p));
         LayerRegistry.Register("GatherElements", p => new GatherElementsLayer(p));
         LayerRegistry.Register("GatherND", p => new GatherNDLayer(p));
+        LayerRegistry.Register("ScatterND", p => new ScatterNDLayer(p));
+        LayerRegistry.Register("ScatterElements", p => new ScatterElementsLayer(p));
         LayerRegistry.Register("Unsqueeze", p => new UnsqueezeLayer(p));
         LayerRegistry.Register("Squeeze", p => new SqueezeLayer(p));
     }
@@ -453,5 +455,222 @@ internal static class IndexOps
             IReadOnlyList<Tensor> outputs,
             IReadOnlyList<Tensor> temps)
             => OpUtil.CopyBytes(inputs[0], 0, outputs[0], 0, inputs[0].Count);
+    }
+
+    // ---------------- ScatterND ----------------
+
+    /// <summary>
+    /// <c>ScatterND(data, indices, updates)</c>：反向的 GatherND。indices 最后一维是坐标元组长度 r，
+    /// updates 形状 = indices.shape[:-1] + data.shape[r:]，把 updates 按坐标写进 data 的副本。
+    /// <para>
+    /// EfficientSAM3 的 decoder（<c>/geometry_encoder/ScatterND</c>）用它把 exemplar 特征写进网格；
+    /// <c>reduction</c> 缺省是 <c>none</c>，opset 16+ 的 add/mul/min/max 也支持（只对 F32）。
+    /// </para>
+    /// </summary>
+    private sealed class ScatterNDLayer : Layer
+    {
+        private enum ReductionKind { None, Add, Mul, Min, Max }
+
+        private readonly ReductionKind _reduction;
+
+        public ScatterNDLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _reduction = parameters.GetString("reduction", "none") switch
+            {
+                "none" => ReductionKind.None,
+                "add" => ReductionKind.Add,
+                "mul" => ReductionKind.Mul,
+                "min" => ReductionKind.Min,
+                "max" => ReductionKind.Max,
+                var other => throw new OnnxSharpException(
+                    $"ScatterND '{Name}': unsupported reduction '{other}'"),
+            };
+        }
+
+        private int ResolveRank(TensorShape data, TensorShape indices)
+        {
+            int r = indices.Dims[indices.Rank - 1];
+            if (r <= 0 || r > data.Rank)
+                throw new OnnxSharpException(
+                    $"ScatterND '{Name}': indices last dim {r} out of range for data rank {data.Rank}");
+            return r;
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+            => outShapes.Add(inShapes[0]);
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var data = inputs[0];
+            var indices = inputs[1];
+            var updates = inputs[2];
+            var output = outputs[0];
+
+            int r = ResolveRank(data.Shape, indices.Shape);
+            var dims = data.Shape.ToArray();
+
+            var strides = new long[dims.Length];
+            long stride = 1;
+            for (int i = dims.Length - 1; i >= 0; i--)
+            {
+                strides[i] = stride;
+                stride *= dims[i];
+            }
+
+            long slice = 1;
+            for (int i = r; i < dims.Length; i++)
+                slice *= dims[i];
+
+            if (indices.DType != DType.I64)
+                throw new OnnxSharpException($"ScatterND '{Name}': indices must be int64, got {indices.DType}");
+
+            var idx = indices.AsSpan<long>();
+            long tuples = idx.Length / r;
+
+            // 未写到的位置保持 data 原值，所以先整块拷贝。
+            OpUtil.CopyBytes(data, 0, output, 0, data.Count);
+
+            if (_reduction == ReductionKind.None)
+            {
+                for (long t = 0; t < tuples; t++)
+                {
+                    long offset = 0;
+                    for (int i = 0; i < r; i++)
+                    {
+                        long v = idx[(int)(t * r + i)];
+                        int dim = dims[i];
+                        if (v < 0)
+                            v += dim;
+                        if ((ulong)v >= (ulong)dim)
+                            throw new OnnxSharpException(
+                                $"ScatterND '{Name}': index {v} out of range for dim {dim}");
+                        offset += v * strides[i];
+                    }
+
+                    OpUtil.CopyBytes(updates, t * slice, output, offset, slice);
+                }
+
+                return;
+            }
+
+            if (output.DType != DType.F32)
+                throw new OnnxSharpException(
+                    $"ScatterND '{Name}': reduction '{_reduction}' needs float32, got {output.DType}");
+
+            var src = updates.AsSpan<float>();
+            var dst = output.AsSpan<float>();
+
+            for (long t = 0; t < tuples; t++)
+            {
+                long offset = 0;
+                for (int i = 0; i < r; i++)
+                {
+                    long v = idx[(int)(t * r + i)];
+                    int dim = dims[i];
+                    if (v < 0)
+                        v += dim;
+                    if ((ulong)v >= (ulong)dim)
+                        throw new OnnxSharpException(
+                            $"ScatterND '{Name}': index {v} out of range for dim {dim}");
+                    offset += v * strides[i];
+                }
+
+                for (long j = 0; j < slice; j++)
+                {
+                    int at = (int)(offset + j);
+                    float v = src[(int)(t * slice + j)];
+                    dst[at] = _reduction switch
+                    {
+                        ReductionKind.Add => dst[at] + v,
+                        ReductionKind.Mul => dst[at] * v,
+                        ReductionKind.Min => MathF.Min(dst[at], v),
+                        ReductionKind.Max => MathF.Max(dst[at], v),
+                        _ => v,
+                    };
+                }
+            }
+        }
+    }
+
+    // ---------------- ScatterElements ----------------
+
+    /// <summary>
+    /// <c>ScatterElements(data, indices, updates, axis)</c>：按 axis 逐元素覆盖。
+    /// 输出形状 = data 形状；updates 与 indices 同形。EfficientSAM3 的 decoder 用 <c>axis = 0</c>。
+    /// </summary>
+    private sealed class ScatterElementsLayer : Layer
+    {
+        private readonly long _axis;
+
+        public ScatterElementsLayer(LayerParams parameters)
+        {
+            Type = parameters.Type;
+            Name = parameters.Name;
+            _axis = parameters.GetInt("axis", 0);
+        }
+
+        public override void GetMemoryShapes(
+            IReadOnlyList<TensorShape> inShapes,
+            int requiredOutputs,
+            List<TensorShape> outShapes,
+            List<TensorShape> tempShapes)
+            => outShapes.Add(inShapes[0]);
+
+        public override void Forward(
+            IReadOnlyList<Tensor> inputs,
+            IReadOnlyList<Tensor> outputs,
+            IReadOnlyList<Tensor> temps)
+        {
+            var data = inputs[0];
+            var indices = inputs[1];
+            var updates = inputs[2];
+            var output = outputs[0];
+
+            if (data.Shape.Rank != indices.Shape.Rank)
+                throw new OnnxSharpException($"ScatterElements '{Name}': data/indices rank mismatch");
+
+            var dims = indices.Shape.ToArray();
+            int axis = OpUtil.NormalizeAxis(_axis, dims.Length, $"ScatterElements '{Name}'");
+            int axisDim = data.Shape[axis];
+
+            OpUtil.CopyBytes(data, 0, output, 0, data.Count);
+
+            var dataStrides = OpUtil.Strides(data.Shape.ToArray());
+            var indexStrides = OpUtil.Strides(dims);
+            var index = OpUtil.ReadInts(indices);
+            var coords = new int[dims.Length];
+
+            for (int n = 0; n < index.Length; n++)
+            {
+                int rest = n;
+                for (int d = 0; d < dims.Length; d++)
+                {
+                    coords[d] = rest / indexStrides[d];
+                    rest -= coords[d] * indexStrides[d];
+                }
+
+                int k = index[n];
+                if (k < 0)
+                    k += axisDim;
+                if ((uint)k >= (uint)axisDim)
+                    throw new OnnxSharpException(
+                        $"ScatterElements '{Name}': index {index[n]} out of range for axis dim {axisDim}");
+
+                long dest = 0;
+                for (int d = 0; d < dims.Length; d++)
+                    dest += (long)(d == axis ? k : coords[d]) * dataStrides[d];
+
+                OpUtil.CopyBytes(updates, n, output, dest, 1);
+            }
+        }
     }
 }

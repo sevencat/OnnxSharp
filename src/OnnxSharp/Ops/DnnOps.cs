@@ -820,6 +820,18 @@ internal static class DnnOps
             int inPerGroup, int outPerGroup,
             long inPlane, long outPlane)
         {
+            // 通道数够多的「2× 上采样」（EfficientViT 的 dconv_2x2：1024→512、512→256、256→256）：
+            // 逐 ci 的标量累加只有个位数 GFLOPS，换成 kH*kW 个 1×1 卷积（每相位一次 GEMM）。
+            if (outPerGroup >= 8 && inPerGroup >= 8
+                && (long)outPerGroup * inH * inW <= (1L << 23)
+                && (long)outPerGroup * inPerGroup <= (1L << 24))
+            {
+                ForwardStrideEqualsKernelGemm(x0, w0, y0, biasArray,
+                    batches, inChannels, inH, inW, outChannels, outH, outW,
+                    kH, kW, sW, inPerGroup, outPerGroup, inPlane, outPlane);
+                return;
+            }
+
             int threads = ParallelRange.Threads;
             int blocks = Math.Min(inH, Math.Max(1, threads * 2));
             int rowsPerBlock = Math.Max(1, (inH + blocks - 1) / blocks);
@@ -1097,6 +1109,82 @@ internal static class DnnOps
                     ArrayPool<float>.Shared.Return(accBuf);
                 }
             });
+        }
+
+        /// <summary>
+        /// <c>stride == kernel</c> 上采样的 GEMM 版：每个相位 <c>(kh, kw)</c> 就是一次
+        /// <c>[outC][inC] × [inC][inH*inW]</c> 的 GEMM，再按列步长 <c>sW</c> 把结果散写回输出。
+        /// 逐 ci 的标量累加在 1024→512 的 2× 上采样上只有 ~3 GFLOPS（664 ms），换成 GEMM 后约 20 ms。
+        /// </summary>
+        private static unsafe void ForwardStrideEqualsKernelGemm(
+            float* x0, float* w0, float* y0, float[]? biasArray,
+            int batches, int inChannels, int inH, int inW,
+            int outChannels, int outH, int outW,
+            int kH, int kW, int sW,
+            int inPerGroup, int outPerGroup,
+            long inPlane, long outPlane)
+        {
+            int pixels = inH * inW;
+            float[] transposed = ArrayPool<float>.Shared.Rent(outPerGroup * inPerGroup);
+            float[] acc = ArrayPool<float>.Shared.Rent(outPerGroup * pixels);
+
+            try
+            {
+                var a = new ReadOnlySpan<float>(transposed, 0, outPerGroup * inPerGroup);
+                var c = new Span<float>(acc, 0, outPerGroup * pixels);
+                var bias = biasArray is null
+                    ? ReadOnlySpan<float>.Empty
+                    : new ReadOnlySpan<float>(biasArray, 0, outPerGroup);
+
+                fixed (float* accPtr = acc)
+                {
+                    for (int kh = 0; kh < kH; kh++)
+                    {
+                        for (int kw = 0; kw < kW; kw++)
+                        {
+                            // packed 布局是 [phase][ci][co]，GEMM 要 [m][k] = [outC][inC]
+                            float* wPhase = w0 + (long)(kh * kW + kw) * inPerGroup * outPerGroup;
+
+                            for (int ci = 0; ci < inPerGroup; ci++)
+                            {
+                                float* row = wPhase + (long)ci * outPerGroup;
+                                for (int co = 0; co < outPerGroup; co++)
+                                    transposed[co * inPerGroup + ci] = row[co];
+                            }
+
+                            for (int b = 0; b < batches; b++)
+                            {
+                                float* xb = x0 + (long)b * inChannels * inPlane;
+                                GemmKernel.Multiply(a, new ReadOnlySpan<float>(xb, inPerGroup * pixels), c,
+                                    outPerGroup, inPerGroup, pixels,
+                                    ldc: pixels, parallel: true, bias: bias);
+
+                                float* yb = y0 + (long)b * outChannels * outPlane;
+
+                                for (int co = 0; co < outPerGroup; co++)
+                                {
+                                    float* srcCo = accPtr + (long)co * pixels;
+                                    float* dstCo = yb + (long)co * outPlane + (long)kh * outW;
+
+                                    for (int iy = 0; iy < inH; iy++)
+                                    {
+                                        float* s = srcCo + (long)iy * inW;
+                                        float* d = dstCo + (long)(iy * kH) * outW + kw;
+
+                                        for (int ix = 0; ix < inW; ix++)
+                                            d[ix * sW] = s[ix];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(transposed);
+                ArrayPool<float>.Shared.Return(acc);
+            }
         }
 
         /// <summary>
@@ -3067,38 +3155,17 @@ internal static class DnnOps
             var sb = b.AsSpan<float>();
             var dst = output.AsSpan<float>();
 
-            // 每个 query 都是 [C, H*W] 的加权和：标量广播 + SIMD 累加（200×256×5184 ≈ 265 MMAC）。
+            // out[q][p] = Σ_c A[q][c]·B[c][p] 就是一次 [Q,C]×[C,H*W] 的 GEMM。
+            // 早先按 query 逐个标量累加，B（256×288×288 ≈ 85 MB）要被完整重读 200 遍
+            // （17 GB 流量，780 ms）；GEMM 按列块打包 B，只搬一遍（≈ 40 ms）。
             for (int batch = 0; batch < batches; batch++)
             {
-                for (int q = 0; q < queries; q++)
-                {
-                    var target = dst.Slice((batch * queries + q) * plane, plane);
-                    target.Clear();
-
-                    for (int c = 0; c < channels; c++)
-                    {
-                        float weight = sa[(batch * queries + q) * channels + c];
-                        if (weight == 0f)
-                            continue;
-
-                        var source = sb.Slice((batch * channels + c) * plane, plane);
-                        int i = 0;
-
-                        if (Fma.IsSupported)
-                        {
-                            var vw = Vector256.Create(weight);
-                            for (; i + Vector256<float>.Count <= plane; i += Vector256<float>.Count)
-                            {
-                                var acc = Vector256.LoadUnsafe(ref target[i]);
-                                var v = Vector256.LoadUnsafe(ref source[i]);
-                                Vector256.StoreUnsafe(Fma.MultiplyAdd(v, vw, acc), ref target[i]);
-                            }
-                        }
-
-                        for (; i < plane; i++)
-                            target[i] += source[i] * weight;
-                    }
-                }
+                GemmKernel.Multiply(
+                    sa.Slice(batch * queries * channels, queries * channels),
+                    sb.Slice(batch * channels * plane, channels * plane),
+                    dst.Slice(batch * queries * plane, queries * plane),
+                    queries, channels, plane,
+                    ldc: plane);
             }
         }
     }

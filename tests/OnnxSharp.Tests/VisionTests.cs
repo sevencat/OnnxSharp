@@ -24,6 +24,10 @@ internal static class VisionTests
         yield return new("vision: decode channels-last matches channels-first", DecodeChannelsLast);
         yield return new("vision: decode end-to-end treats coords as corners", DecodeEndToEnd);
         yield return new("vision: decode clips boxes to image bounds", DecodeClips);
+        yield return new("vision: yolo metadata names map to class ids", MetadataNames);
+        yield return new("vision: yolo metadata keeps gaps and rejects unknown ids", MetadataGaps);
+        yield return new("vision: yolo metadata handles quoted keys and escapes", MetadataQuotedKeys);
+        yield return new("vision: decode fills detection names from the class table", DecodeFillsNames);
         yield return new("vision: decode rejects ambiguous layout", DecodeRejectsAmbiguous);
         yield return new("vision: rfdetr stretch fills the canvas without padding", StretchFillsCanvas);
         yield return new("vision: rfdetr stretch honours row stride", StretchHonoursRowStride);
@@ -226,6 +230,73 @@ internal static class VisionTests
         Require(second.ClassId == 1, $"second class {second.ClassId}");
         Near(second.X, 90f, "second x");
         Near(second.Y, 40f, "second y");
+    }
+
+    // ---------------- metadata（ultralytics 的 names / imgsz） ----------------
+
+    private static void MetadataNames()
+    {
+        var metadata = YoloMetadata.Parse(new Dictionary<string, string>
+        {
+            ["names"] = "{0: 'person', 1: 'bicycle', 2: 'car'}",
+            ["imgsz"] = "[480, 640]",
+        });
+
+        Require(metadata.Count == 3, $"count {metadata.Count}");
+        Require(metadata.NameOf(0) == "person", $"0 -> {metadata.NameOf(0)}");
+        Require(metadata.NameOf(2) == "car", $"2 -> {metadata.NameOf(2)}");
+        Require(metadata.NameOf(3) is null, "id 3 should be unknown");
+        Require(metadata.LabelOf(3) == "class3", $"label {metadata.LabelOf(3)}");
+        Require(metadata.InputHeight == 480 && metadata.InputWidth == 640,
+            $"imgsz {metadata.InputHeight}x{metadata.InputWidth}");
+    }
+
+    private static void MetadataGaps()
+    {
+        // 裁剪过的模型编号不连续：中间留空串，越界 / 缺号都返回 null。
+        var metadata = YoloMetadata.Parse(new Dictionary<string, string> { ["names"] = "{3: 'cat', 0: 'dog'}" });
+
+        Require(metadata.Count == 4, $"count {metadata.Count}");
+        Require(metadata.NameOf(0) == "dog", $"0 -> {metadata.NameOf(0)}");
+        Require(metadata.NameOf(1) is null, "gap must not inherit a name");
+        Require(metadata.NameOf(3) == "cat", $"3 -> {metadata.NameOf(3)}");
+        Require(metadata.LabelOf(1) == "class1", $"label {metadata.LabelOf(1)}");
+
+        // 没有 metadata：空表，不抛。
+        var empty = YoloMetadata.Parse(null);
+        Require(empty.Count == 0 && empty.NameOf(0) is null, "null metadata must parse to empty");
+    }
+
+    private static void MetadataQuotedKeys()
+    {
+        // 带引号的键 + 双引号值里的单引号 + 转义的单引号/反斜杠。
+        var metadata = YoloMetadata.Parse(new Dictionary<string, string>
+        {
+            ["names"] = "{\"0\": \"it's a: car\", '1': 'a\\'b', 2: 'c\\\\d'}",
+        });
+
+        Require(metadata.NameOf(0) == "it's a: car", $"0 -> {metadata.NameOf(0)}");
+        Require(metadata.NameOf(1) == "a'b", $"1 -> {metadata.NameOf(1)}");
+        Require(metadata.NameOf(2) == "c\\d", $"2 -> {metadata.NameOf(2)}");
+    }
+
+    private static void DecodeFillsNames()
+    {
+        var transform = new Letterbox(100, 100, 100, 100, 1, 1, 0, 0);
+        var output = Tensor.Allocate(new TensorShape(1, 6, 1), DType.F32);
+        WriteAnchorColumn(output.AsSpan<float>(), 1, 0, 50, 50, 20, 20, 0.1f, 0.9f);
+
+        var options = new DetectorOptions { ClassCount = 2 };
+
+        var named = YoloDecoder.Decode(output, transform, options, ["person", "bicycle"]);
+        Require(named.Count == 1 && named[0].ClassId == 1, $"expected the bicycle, got {named.Count} box(es)");
+        Require(named[0].Name == "bicycle", $"name {named[0].Name}");
+        Require(named[0].Label == "bicycle", $"label {named[0].Label}");
+
+        // 没给名字表时留 null，Label 退回 class{id}。
+        var unnamed = YoloDecoder.Decode(output, transform, options);
+        Require(unnamed.Count == 1 && unnamed[0].Name is null, "name should stay null without a table");
+        Require(unnamed[0].Label == "class1", $"label {unnamed[0].Label}");
     }
 
     private static void DecodeChannelsLast()

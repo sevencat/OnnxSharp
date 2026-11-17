@@ -6,13 +6,30 @@ namespace OnnxSharp.Core;
 /// <summary>对外门面（对应 OpenCV <c>cv::dnn::Net</c> 的最小子集）。</summary>
 public sealed class Net
 {
+    private static readonly IReadOnlyDictionary<string, string> EmptyMetadata =
+        new Dictionary<string, string>(0, StringComparer.Ordinal);
+
     private readonly NetImpl _impl;
 
     public Net() => _impl = new NetImpl();
 
-    private Net(NetImpl impl) => _impl = impl;
+    private Net(NetImpl impl, IReadOnlyDictionary<string, string> metadata)
+    {
+        _impl = impl;
+        Metadata = metadata;
+    }
 
     public NetImpl Impl => _impl;
+
+    /// <summary>
+    /// 模型自带的 metadata（<c>ModelProto.metadata_props</c>）：原样返回，不做解释。
+    /// <para>
+    /// 常见用途：ultralytics 导出的 YOLO 带 <c>names</c> / <c>imgsz</c> / <c>stride</c> / <c>task</c>，
+    /// 语音模型带 <c>lfr_window_size</c> / <c>neg_mean</c>。类别表请用
+    /// <see cref="Vision.YoloMetadata.Parse"/> 解析，不要自己切字符串。
+    /// </para>
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Metadata { get; } = EmptyMetadata;
 
     public Graph? MainGraph => _impl.MainGraph;
 
@@ -203,7 +220,7 @@ public sealed class Net
             GraphFusion.Run(impl, graph);
         }
 
-        return new Net(impl);
+        return new Net(impl, file.Metadata);
     }
 
     /// <summary>

@@ -172,6 +172,11 @@ public static class TensorOps
             return;
         }
 
+        // 剩下的是「两侧都在变、但各自在某些轴上广播」的通用情形（SAM3 的相对位置外积）。
+        // 通用循环每元素要维护 rank 个索引；先试整段连续的快速路径。
+        if (TryApplyStridedRun(op, dims, strideA, strideB, sa, sb, sc))
+            return;
+
         int ia = 0, ib = 0;
         for (int n = 0; n < sc.Length; n++)
         {
@@ -649,6 +654,153 @@ public static class TensorOps
                     break;
 
                 operandOffset -= operandStrides[axis] * counts[axis];
+                coords[axis] = 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 通用广播的「整段连续」快速路径：从最内维往外，只要两侧步长都还是紧凑步长就把该维并进段长，
+    /// 段内交给 AVX 内核，段外只做指针递增。
+    /// <para>
+    /// 触发者是 SAM3 的相对位置外积 <c>[1,200,72,1,8] + [1,200,1,72,8]</c>：段长 8、外层 100 万段。
+    /// 以前落到通用循环（每元素维护 5 个索引，约 5 ns/元素），8.3 M 元素要 40 ms。
+    /// </para>
+    /// </summary>
+    private static bool TryApplyStridedRun(
+        BinaryOpKind op,
+        int[] dims,
+        int[] strideA,
+        int[] strideB,
+        ReadOnlySpan<float> sa,
+        ReadOnlySpan<float> sb,
+        Span<float> sc)
+    {
+        return op switch
+        {
+            BinaryOpKind.Add => TryApplyStridedRun<AddKernel>(dims, strideA, strideB, sa, sb, sc),
+            BinaryOpKind.Sub => TryApplyStridedRun<SubKernel>(dims, strideA, strideB, sa, sb, sc),
+            BinaryOpKind.Mul => TryApplyStridedRun<MulKernel>(dims, strideA, strideB, sa, sb, sc),
+            BinaryOpKind.Div => TryApplyStridedRun<DivKernel>(dims, strideA, strideB, sa, sb, sc),
+            BinaryOpKind.Max => TryApplyStridedRun<MaxKernel>(dims, strideA, strideB, sa, sb, sc),
+            BinaryOpKind.Min => TryApplyStridedRun<MinKernel>(dims, strideA, strideB, sa, sb, sc),
+            _ => false,
+        };
+    }
+
+    private static unsafe bool TryApplyStridedRun<T>(
+        int[] dims,
+        int[] strideA,
+        int[] strideB,
+        ReadOnlySpan<float> sa,
+        ReadOnlySpan<float> sb,
+        Span<float> sc)
+        where T : struct, IBinaryKernel
+    {
+        int inner = 1;
+        int breakAxis = -1;
+
+        for (int axis = dims.Length - 1; axis >= 0; axis--)
+        {
+            if (dims[axis] == 1)
+                continue;
+
+            // 两侧都按紧凑布局走 ⇒ 这一维可以和更内层拼成一段连续读写
+            if (strideA[axis] != inner || strideB[axis] != inner)
+            {
+                breakAxis = axis;
+                break;
+            }
+
+            inner *= dims[axis];
+        }
+
+        if (breakAxis < 0 || inner < 4)
+            return false;
+
+        int outer = 1;
+        for (int axis = 0; axis <= breakAxis; axis++)
+            outer *= dims[axis];
+
+        // 外层太少时省下的索引运算还不够贴开销；段不够宽时不如直接逐元素
+        if (outer < 2)
+            return false;
+
+        fixed (float* pa = sa)
+        fixed (float* pb = sb)
+        fixed (float* pc = sc)
+        {
+            if ((long)sc.Length >= ParallelElementThreshold
+                && ParallelRange.Threads > 1
+                && outer >= ParallelRange.Threads * 4)
+            {
+                IntPtr ia = (IntPtr)pa;
+                IntPtr ib = (IntPtr)pb;
+                IntPtr ic = (IntPtr)pc;
+
+                ParallelRange.For(outer, (begin, end) => StridedRunBlock<T>(
+                    dims, strideA, strideB, breakAxis, inner,
+                    (float*)ia, (float*)ib, (float*)ic, begin, end));
+            }
+            else
+            {
+                StridedRunBlock<T>(dims, strideA, strideB, breakAxis, inner, pa, pb, pc, 0, outer);
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>处理外层段 [<paramref name="begin"/>, <paramref name="end"/>)：段在输出里是连续的。</summary>
+    private static unsafe void StridedRunBlock<T>(
+        int[] dims,
+        int[] strideA,
+        int[] strideB,
+        int breakAxis,
+        int inner,
+        float* pa,
+        float* pb,
+        float* pc,
+        int begin,
+        int end)
+        where T : struct, IBinaryKernel
+    {
+        int oa = 0;
+        int ob = 0;
+        int rest = begin;
+        var coords = new int[breakAxis + 1];
+
+        for (int axis = breakAxis; axis >= 0; axis--)
+        {
+            int extent = dims[axis];
+            if (extent <= 1)
+                continue;
+
+            int coord = rest % extent;
+            rest /= extent;
+            coords[axis] = coord;
+            oa += coord * strideA[axis];
+            ob += coord * strideB[axis];
+        }
+
+        for (int k = begin; k < end; k++)
+        {
+            ContiguousRange<T>(pa + oa, pb + ob, pc + (long)k * inner, 0, inner);
+
+            for (int axis = breakAxis; axis >= 0; axis--)
+            {
+                int extent = dims[axis];
+                if (extent <= 1)
+                    continue;
+
+                coords[axis]++;
+                oa += strideA[axis];
+                ob += strideB[axis];
+                if (coords[axis] < extent)
+                    break;
+
+                oa -= strideA[axis] * extent;
+                ob -= strideB[axis] * extent;
                 coords[axis] = 0;
             }
         }

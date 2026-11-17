@@ -3614,3 +3614,158 @@ $cli = 'tools\OnnxSharp.Cli\bin\Release\net11.0\OnnxSharp.Cli.exe'
 & $cli ocr tests\Image\20260828092321383_121.jpg --det ... --rec ... --dict ... --limit 960
 ```
 
+## 41. EfficientSAM3（EV-M）：三个 ONNX 全部跑通
+
+`F:\ai\models\esam3\` 下的 `efficientsam3_ev_m_{image_encoder,text_encoder,decoder}.onnx`
+是 SAM3 的提示式分割三件套。本轮把它们全部跑通、逐张量与 onnxruntime 对齐，并修掉路上撞到的三个内核 bug。
+
+### 41.1 张量契约
+
+| 模型 | 输入 | 输出 |
+| --- | --- | --- |
+| image_encoder | `image` F32 `[1,3,1008,1008]`（RGB/255、ImageNet mean-std、NCHW） | `fpn_0` `[1,256,288,288]`、`fpn_1` `[1,256,144,144]`、`fpn_2` `[1,256,72,72]`、`pos_0/1/2` `[1,256,H,W]` |
+| text_encoder | `tokens` I64 `[1,16]` | `language_features` `[16,1,256]`、`language_padding` `[1,16]`、`language_embeds` `[16,1,512]` |
+| decoder | `fpn_0/1/2`、`pos_2`、`language_features/padding`、`exemplar_boxes` `[8,1,4]`(归一化 `cxcywh`)、`exemplar_labels` I64 `[8,1]`、`exemplar_mask` F32 `[1,8]` | `pred_logits` `[1,200,1]`、`pred_boxes` `[1,200,4]`、`pred_masks` `[1,200,288,288]`、`presence_logit` `[1,1]` |
+
+decoder 的 200 条 query 里靠 `pred_logits` + `presence_logit` 挑赢家，`pred_masks` 是 288×288 的低分辨率 logits。
+
+### 41.2 数值对齐（同输入 vs onnxruntime）
+
+| 模型 | 输出 | max&#124;d&#124; | 相对量级 |
+| --- | --- | --- | --- |
+| image_encoder | `fpn_0` / `fpn_1` / `fpn_2` | 6.3e-7 / 2.1e-5 / 2.3e-5 | 3e-6 |
+| | `pos_0/1/2` | 6.0e-8 | 6e-8 |
+| text_encoder | `language_features` | 4.1e-6 | 1e-6 |
+| | `language_padding` / `language_embeds` | 0（逐字节一致） | — |
+| decoder | `pred_logits` / `pred_boxes` / `presence_logit` | 6.2e-5 / 8.7e-6 / 3.8e-6 | 3e-5 |
+| | `pred_masks` | 2.0e-3（值域 ±32） | 6e-5 |
+
+差异只来自累加顺序（GEMM 分块、Winograd、多线程切分），没有算子语义偏差。
+
+### 41.3 修掉的三个 bug（外加一处 20× 提速）
+
+- **`FirstConv` 末块写穿行尾**（`src/OnnxSharp/Kernels/FirstConv.cs`）：满 tile 分支用 `nb == Blocks` 判断，
+  但 1008/2 = 504 = 7×64 + 56，末块只剩 56 个像素仍走 4 次 16 宽 Store → 越界写到下一行开头（w=0..7 被污染）。
+  改成 `remaining >= Tile` 后 first conv 输出 `max|d| = 0`，image encoder 才跟上 ORT。
+- **`ConvTranspose` 相位 GEMM 散写**（`Ops/DnnOps.cs`）：`dstCo = yb + co*outPlane + kh` 把行偏移 `kh`
+  当列偏移加了，少乘 `outW`；`fpn_0/fpn_1` 87%/99% 元素错、`max|d|` 到 7.3。改成 `+ (long)kh * outW` 后归零。
+- **广播外积 Add 的并行分段**（`Tensors/TensorOps.cs`）：SAM3 的相对位置外积
+  `[1,200,72,1,8] + [1,200,1,72,8]` 以前掉进通用循环（每元素维护 5 个索引，5 ns/元素，8.3 M 元素 → 40 ms）。
+  新增 `TryApplyStridedRun`：从最内维往外把「两侧都还是紧凑步长」的轴并成一段（这里段长 8），
+  段内走 AVX、段外只推指针，并外层段并行 —— 1.2 ms（30×）。
+  第一版并行块只算了起始偏移、没同步「掉电计数器」，除首块外第一次回绕就错位；已修，
+  并补两个单测（`ElementwiseBroadcastTests`：串行段 / 跨并行阈值段）。
+- **`Einsum`（mask 预测 `einsum('bqc,bchw->bqhw')`）**：原来按 query 逐个标量累加，
+  200 条 query 每条都把 85 MB 的 `B` 完整重读一遍（17 GB 流量，780 ms）。
+  `out[q][p] = Σ_c A[q][c]·B[c][p]` 本来就是一次 `[200,256]×[256,288²]` 的 GEMM，
+  改成 `GemmKernel.Multiply` 后 40 ms 量级，decoder 整体 5.0 s → 2.9 s。
+
+### 41.4 性能
+
+同一会话交错测、取最小值。**16 线程**（默认 = 物理核数，§41 这批数据没有按 4 线程重测）。
+注意这台机器（Ryzen 9 8945HX，16C/32T）本身有 ~50% 后台负载，绝对值波动 ±50%，只能看量级与相对比值。
+
+| 模型 | OnnxSharp | onnxruntime | 比值 |
+| --- | --- | --- | --- |
+| image_encoder | 0.77–2.2 s | 0.44–1.4 s | 1.5–1.8× |
+| text_encoder | 6.4 ms（20 轮稳态） | 2.9–4.2 ms | ~2× |
+| decoder | 2.85–3.30 s | 2.30–3.04 s | 1.1–1.3× |
+
+单算子微基准（同输入、单独建模型，比整网更能说明内核水平）：
+
+| 层 | 形状 | OnnxSharp | onnxruntime |
+| --- | --- | --- | --- |
+| ConvTranspose 2×（dconv，1024→512） | `[1,1024,72,72]→[1,512,144,144]` | 121 ms | 41 ms |
+| ConvTranspose 2×（dconv，512→256） | `[1,512,144,144]→[1,256,288,288]` | 77 ms | 108 ms |
+| Conv 3×3 s1 p1（256→256） | `[1,256,288,288]` | 162 ms | 528 ms |
+
+结论：3×3 卷积（Winograd）和通道多的 2× 上采样已经比 ORT 快；1024→512 这层的相位 GEMM 还差 ORT 3 倍
+（`m = 512` 时 GEMM 走行切分，`B` 要按行块重复打包），是下一步最值得动的地方。
+
+#### 41.4.1 交错 A/B 原始值（同一会话 4 轮，`.tmp/esam3_ab.py`）
+
+每轮先让 ORT 跑 1 次，再起一个 CLI 进程跑 `bench --iters 5` 取 min，两家在同一轮里挨着测：
+
+| 模型 | OnnxSharp 每轮 ms | 最佳 | onnxruntime 每轮 ms | 最佳 | 最佳值比值 |
+| --- | --- | --- | --- | --- | --- |
+| image_encoder | 1136 / 1528 / 1469 / 1517 | **1136** | 551 / 1191 / 1499 / 1735 | **551** | 2.06× |
+| text_encoder | 13 / 37 / 8 / 12 | **8** | 4 / 5 / 4 / 3 | **3** | 2.3× |
+| decoder | 3880 / 3761 / 5150 / 3880 | **3761** | 2983 / 4124 / 4250 / 4879 | **2983** | 1.26× |
+
+image encoder 第 1 轮 1136 ms、第 4 轮 1517 ms，ORT 同一轮从 551 变 1735 —— 两家一起变慢，说明波动来自后台负载
+而不是实现本身；所以「谁快」只看同一轮的相对关系，绝对毫秒不能当基线。
+
+#### 41.4.2 profile 热点（share 按 sum-of-min）
+
+`profile` 只拿来看**排序**：同一条命令两次跑，share 能差 3~4 个百分点（负载在变），绝对值更不能当基线。
+
+```
+# image_encoder，--iters 5（254 个 op；mean 2724.7 ms/iter，sum-of-min 2328.8 ms/iter）
+Conv            81 ops   1091.7 ms   46.9%     # MBConv 的 3×3 / 1×1
+ConvTranspose    3 ops   1060.2 ms   45.5%     # 三次 2× 上采样
+HardSwish       30 ops    104.0 ms    4.5%     # 每个约 3.5 ms
+Slice 35 / Pad 7 / Concat 7 / Transpose 7 / MatMul 14 / Add 25 / FusedEltwise 2  全部 ≤0.8%
+单点：/convs.0/dconv_2x2_0/ConvTranspose 425.3 ms、/convs.0/conv_3x3/Conv 412.0 ms、/convs.1/dconv_2x2/ConvTranspose 320.7 ms
+```
+
+```
+# decoder，--iters 3（2015 个 op；mean 5435.7 ms/iter，sum-of-min 4578.4 ms/iter）
+MatMul                266 ops   2337.4 ms   51.1%
+Conv                    4 ops    686.7 ms   15.0%
+Softmax                36 ops    484.9 ms   10.6%
+Gemm                   37 ops    290.3 ms    6.3%
+Transpose             240 ops    264.4 ms    5.8%
+InstanceNormalization   2 ops    119.6 ms    2.6%
+Einsum                  1 op      52.8 ms    1.2%
+单点：/segmentation_head/pixel_decoder/conv_layers.1/Conv 495.8 ms（10.8%）
+      /segmentation_head/pixel_decoder/conv_layers.0/Conv 135.7 ms
+      /encoder/layers.{1,2,4,5}/self_attn/MatMul_3  各 123–149 ms（6 层合计约 0.8 s）
+```
+
+- image encoder 92% 在卷积/反卷积，已经是本库最强的两条内核；剩下的 HardSwish 104 ms（30 个 op）
+  可以并进前一层 Conv 的 epilogue。
+- decoder 只有 4 个 Conv 却占 15%（`conv_layers.*` 是 256→256 @288²，正是微基准里我们比 ORT 快的那档）；
+  MatMul 里约 1/3 是 6 层自注意力的 QK^T，其余是逐 query / 逐头的小矩阵乘；`Softmax` 485 ms 基本也在注意力里；
+  mask 的 `Einsum` 已从 780 ms 降到 53 ms（§41.3）。
+- profile 的 sum-of-min（4578 ms）比 `bench --iters 5` 的 min（3761 ms）大 20%：profile 把每轮 op 计时串行累加，
+  还带计时开销，两个口径不能互相换算。
+
+### 41.5 端到端：框提示分割
+
+yolo26s 检出车辆框（归一化 `cxcywh`）→ 填进 `exemplar_boxes[0]`、`exemplar_labels[0] = 1`、`exemplar_mask[0] = 1`：
+
+```
+text    : "car"
+presence: 0.9998
+best query 157 logit 3.2821 score 0.9638
+mask area 11.04%   bbox 1960 1073 2959 2159   (提示框 bbox IoU 0.955)
+mask IoU (ours vs ORT, 288x288): 1.00000
+prob max|d| = 2.480e-05  mean|d| = 1.194e-06
+```
+
+整条流水（image encoder → text encoder → decoder）全部用本库跑，decoder 吃的是**我们自己**的
+`fpn_*` / `pos_2` / `language_*`，没有借 ORT 的中间结果；可视化 `.tmp/esam3/demo/ours_mask_vis.png`
+掩码正好盖住下半辆车。
+
+### 41.6 回归与复现
+
+- `dotnet build OnnxSharp.slnx -c Release`：0 警告 0 错误。
+- `dotnet run --project tests/OnnxSharp.Tests -c Release -f net10.0`（以及 `net11.0`）：
+  `124/126 passed, 2 skipped, 0 failed`（新增的就是上面两个广播段用例）。
+- golden 与 ORT 参考脚本都在 `.tmp/`（`esam3_ref.py`、`esam3_cmp.py`、`esam3_demo*.py`、
+  `esam3_bench_ort.py`、`esam3_ab.py`），按需重跑；模型路径用 `F:\ai\models\esam3`。
+
+```powershell
+$cli = 'tools\OnnxSharp.Cli\bin\Release\net10.0\OnnxSharp.Cli.exe'
+$P   = '.tmp\esam3\demo'
+
+& $cli run F:\ai\models\esam3\efficientsam3_ev_m_image_encoder.onnx --input image=$P/image.f32 --dump $P/ours_img
+& $cli run F:\ai\models\esam3\efficientsam3_ev_m_text_encoder.onnx  --input tokens=$P/tokens.i64 --dump $P/ours_txt
+
+& $cli run F:\ai\models\esam3\efficientsam3_ev_m_decoder.onnx `
+      --input fpn_0=$P/ours_img/out0.f32 --input fpn_1=$P/ours_img/out1.f32 --input fpn_2=$P/ours_img/out2.f32 `
+      --input pos_2=$P/ours_img/out5.f32 `
+      --input language_features=$P/ours_txt/out0.f32 --input language_padding=$P/ours_txt/out1.f32 `
+      --input exemplar_boxes=$P/exemplar_boxes.f32 --input exemplar_labels=$P/exemplar_labels.i64 `
+      --input exemplar_mask=$P/exemplar_mask.f32 --dump $P/ours_dec
+```

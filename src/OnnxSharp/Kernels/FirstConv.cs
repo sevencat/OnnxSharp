@@ -169,7 +169,11 @@ internal static unsafe class FirstConv
 
                 for (int ow0 = 0; ow0 < outW; ow0 += Tile)
                 {
-                    int nb = Math.Min(Blocks, (outW - ow0 + Lane - 1) / Lane);
+                    // 本 tile 的剩余像素可能不足 Tile（例如 outW = 504 = 7*64 + 56）：
+                    // nb 只决定「要建几块面板」，满 tile 分支的 4 次 16 宽 Store 必须另有闸门，
+                    // 否则会写穿到下一行的开头（w = 0..7 被上一行尾部污染）。
+                    int remaining = outW - ow0;
+                    int nb = Math.Min(Blocks, (remaining + Lane - 1) / Lane);
 
                     // 面板只建一遍，后面所有输出通道组共用
                     for (int blk = 0; blk < nb; blk++)
@@ -184,7 +188,7 @@ internal static unsafe class FirstConv
 
                     int o = 0;
 
-                    if (nb == Blocks)
+                    if (remaining >= Tile)
                     {
                         // 满 tile：一条 K 步的 4 个权重广播能喂 4 个像素块的 16 条 FMA，
                         // 权重广播与 FMA 比降到 1:4（逐块循环里是 1:1，一半的指令在广播）。

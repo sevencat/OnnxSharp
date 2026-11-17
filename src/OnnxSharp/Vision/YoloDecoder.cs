@@ -62,9 +62,14 @@ public static class YoloDecoder
     /// <param name="output">检测头张量，形状为 <c>[1, 4+C, N]</c>、<c>[1, N, 4+C]</c> 或 <c>[1, N, 6]</c>。</param>
     /// <param name="transform">预处理时的 letterbox 参数，用于把坐标还原到原图。</param>
     /// <param name="options">阈值与布局；null 使用默认值。</param>
+    /// <param name="names">按类别编号索引的名字表，用于填 <see cref="Detection.Name"/>；null 则留空。</param>
     /// <exception cref="NotSupportedException">输出不是 F32、不是三维、或批次不为 1。</exception>
     /// <exception cref="ArgumentException">布局无法推断，或类别数与字段数不匹配。</exception>
-    public static IReadOnlyList<Detection> Decode(Tensor output, in Letterbox transform, DetectorOptions? options = null)
+    public static IReadOnlyList<Detection> Decode(
+        Tensor output,
+        in Letterbox transform,
+        DetectorOptions? options = null,
+        IReadOnlyList<string>? names = null)
     {
         options ??= new DetectorOptions();
 
@@ -151,7 +156,7 @@ public static class YoloDecoder
             if (w <= 0 || h <= 0)
                 continue;
 
-            candidates.Add(new Detection(classId, score, x, y, w, h));
+            candidates.Add(new Detection(classId, score, x, y, w, h) { Name = NameAt(names, classId) });
         }
 
         if (candidates.Count == 0)
@@ -181,6 +186,11 @@ public static class YoloDecoder
 
         return result;
     }
+
+    private static string? NameAt(IReadOnlyList<string>? names, int classId)
+        => names is not null && (uint)classId < (uint)names.Count && names[classId].Length != 0
+            ? names[classId]
+            : null;
 
     private static OutputLayout ResolveLayout(int dimension1, int dimension2, DetectorOptions options)
     {
