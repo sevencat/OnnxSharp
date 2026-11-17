@@ -434,10 +434,11 @@ internal static class DnnOps
                 return;
             }
 
-            // 3 通道输入的首层（YuNet 的 Conv_0 这类）：K=27 配 M=16，面板式与 im2col 都只有
-            // 50 GMAC/s 左右。试过「沿输出宽向量化」，实测反而更慢（1.08 vs 0.81 ms），
-            // 默认关闭，见 FirstConv.Enabled。
-            if (Kernels.FirstConv.Enabled && input.Shape.Dims[1] == 3 && Kernels.FirstConv.TryConv(
+            // 3 通道输入的首层（yolo / YuNet 的 Conv_0 这类）：K=27 配 M=16，im2col 要为
+            // 102400 个像素物化 11 MB 的 col 缓冲，面板式也摊不平这 27 个 K 步 —— 两条通用路径
+            // 都只有 20~40 GMAC/s。改沿输出宽方向 16 像素一个 zmm 直接卷：1/4/16 线程
+            // 32.8 / 131.9 / 314.2 GMAC/s，是 im2col 的 1.6×（bench.md §39）。
+            if (Kernels.FirstConv.TryConv(
                     input, weight, bias, output,
                     _group, strides[0], strides[1], dilations[0], dilations[1], pads[0], pads[1]))
             {

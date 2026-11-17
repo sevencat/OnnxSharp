@@ -431,7 +431,7 @@ static int Ab(string[] args)
         Console.Error.WriteLine("       K ∈ ONNXSHARP_ATTN_FUSE_MAXSEQ | ONNXSHARP_ATTN_BLOCK_SEQ | " +
                                 "ONNXSHARP_ATTN_SCORE_BUDGET(KB) | ONNXSHARP_ATTN_LAZY_SOFTMAX | " +
                                 "ONNXSHARP_ATTN_PACK_REUSE | ONNXSHARP_GEMM_THRESHOLD | ONNXSHARP_NCHWC | " +
-                                "ONNXSHARP_POOL_FAST | ONNXSHARP_RESIZE_FAST");
+                                "ONNXSHARP_FIRSTCONV | ONNXSHARP_POOL_FAST | ONNXSHARP_RESIZE_FAST");
         return 2;
     }
 
@@ -679,6 +679,9 @@ static (string Name, string Alias, Func<string> Default, Action<string> Apply)[]
     ("ONNXSHARP_NCHWC", "nchwc",
         () => OnnxSharp.Kernels.NchwcConv.Enabled ? "1" : "0",
         v => OnnxSharp.Kernels.NchwcConv.Enabled = AbParseInt("ONNXSHARP_NCHWC", v) != 0),
+    ("ONNXSHARP_FIRSTCONV", "firstconv",
+        () => OnnxSharp.Kernels.FirstConv.Enabled ? "1" : "0",
+        v => OnnxSharp.Kernels.FirstConv.Enabled = AbParseInt("ONNXSHARP_FIRSTCONV", v) != 0),
     ("ONNXSHARP_POOL_FAST", "pool_fast",
         () => DnnOps.FastPool ? "1" : "0",
         v => DnnOps.FastPool = AbParseInt("ONNXSHARP_POOL_FAST", v) != 0),
@@ -1264,6 +1267,31 @@ static int ConvBench(string[] args)
         return best;
     }
 
+    // 多内核交替计时（轮流跑一轮），避免「先测的那个跑在凉 CPU 上」
+    double[] BestRound(List<Action> bodies, int count)
+    {
+        for (int i = 0; i < 3; i++)
+            foreach (var body in bodies)
+                body();
+
+        var best = new double[bodies.Count];
+        Array.Fill(best, double.MaxValue);
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+
+        for (int i = 0; i < count; i++)
+        {
+            for (int k = 0; k < bodies.Count; k++)
+            {
+                watch.Restart();
+                bodies[k]();
+                watch.Stop();
+                best[k] = Math.Min(best[k], watch.Elapsed.TotalMilliseconds);
+            }
+        }
+
+        return best;
+    }
+
     foreach (var (ic, oc, h, w, k, s, p) in configs)
     {
         int oh = (h + 2 * p - k) / s + 1;
@@ -1285,8 +1313,33 @@ static int ConvBench(string[] args)
 
         double macs = (double)oc * ic * k * k * oh * ow;
 
-        double im2col = Best(() => OnnxSharp.Kernels.ConvKernels.Im2Col(
-            input, weight, bias, output, 1, s, s, 1, 1, p, p));
+        // 参考结果（不计时）：先跑一遍 im2col 留作对拍基准
+        OnnxSharp.Kernels.ConvKernels.Im2Col(input, weight, bias, output, 1, s, s, 1, 1, p, p);
+        var im2colResult = output.AsSpan<float>().ToArray();
+
+        // 3 通道首层的直接卷积（FirstConv）：先与 im2col 结果对拍，再和 im2col 交替计时
+        bool firstUsed = OnnxSharp.Kernels.FirstConv.TryConv(input, weight, bias, output, 1, s, s, 1, 1, p, p);
+        double firstDiff = 0;
+
+        if (firstUsed)
+        {
+            var got = output.AsSpan<float>();
+            for (int i = 0; i < got.Length; i++)
+                firstDiff = Math.Max(firstDiff, Math.Abs(got[i] - im2colResult[i]));
+        }
+
+        // 交替计时：笔记本上同一个 kernel 连跑会积热降频，先测谁谁占便宜（实测差 30%）
+        var bodies = new List<Action>
+        {
+            () => OnnxSharp.Kernels.ConvKernels.Im2Col(input, weight, bias, output, 1, s, s, 1, 1, p, p),
+        };
+
+        if (firstUsed)
+            bodies.Add(() => { OnnxSharp.Kernels.FirstConv.TryConv(input, weight, bias, output, 1, s, s, 1, 1, p, p); });
+
+        var times = BestRound(bodies, iters);
+        double im2col = times[0];
+        double first = firstUsed ? times[1] : double.NaN;
 
         bool packedUsed = false;
         double packed = double.NaN;
@@ -1299,6 +1352,11 @@ static int ConvBench(string[] args)
 
         string line = $"ic={ic,-4} oc={oc,-4} {h}x{w} k{k}s{s}p{p} -> {oh}x{ow}  "
             + $"im2col {im2col,7:F2} ms ({macs / im2col / 1e6,6:F1} GMAC/s)";
+
+        if (firstUsed)
+            line += $"  firstc {first,7:F2} ms ({macs / first / 1e6,6:F1})  max|d|={firstDiff:E1}";
+        else
+            line += "  firstc     --";
 
         if (packedUsed)
             line += $"  packed {packed,7:F2} ms ({macs / packed / 1e6,6:F1})";

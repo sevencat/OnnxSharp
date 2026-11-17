@@ -350,6 +350,25 @@ v[B,T,H,D] ─T[0,2,1,3]→ [B,H,T,D] ─────────────→
 
 ## 6. 日志
 
+### 2026-11-18（首层 `ic=3` 直接卷积 AVX-512 版：1.6×，并修 `convbench` 计时顺序偏置，`bench.md §39`）
+
+- §38.4 里唯一输给 MLAS 的层是 `3→16 640² k3s2`（1T 16.8 vs 18.0，16T 20.5 vs 123.4）。
+  形状本身不喂通用路径：`K=27`、`M=16`，im2col 要物化 11 MB col 缓冲。
+  新开 `Kernels/FirstConv.cs`：向量沿输出宽（16 像素/zmm）× 4 通道 × 4 像素块，
+  一条 `vbroadcastss` 喂 4 条 FMA（1:4 而非 1:1），步长 2 用一次 32 元素读 + `vpermt2ps` 抽偶数位，
+  面板 27×64 手工对齐到 64 字节。
+- 读数（`convbench --iters 200`，与 im2col 交替计时）：1T 2.15 → **1.35 ms**、
+  4T 0.56 → **0.34**、16T 0.23 → **0.14**，即 **1.6× 全线程一致**；
+  对单核峰值 32.8/55.4 = 59%，1→16 线程 9.6× 扩展。`max|d| = 0.0E+000`。
+- **方法学教训（第三次）**：`ConvBench` 先连测 im2col 再连测 firstc，本机功耗受限，
+  被烤热的那一段（firstc，512 位 FMA 功耗最高）读数**直接砍半** —— 0.70 而不是 0.34。
+  据此先后否掉了两种布局，结论全是假的。改成两个内核**轮流各跑一次**（`BestRound`）后对得上。
+  凡同进程比两个内核，必须交替计时。
+- 端到端 A/B（`ab --a firstconv=0 --b firstconv=1`）：`max|d|=0`，min 22.1 vs 22.2 ms，
+  配对中位 1.012，噪声地板 31.8% ⇒ 判不出；按上式这层 4 线程只省 0.22 ms ≈ 1%，本就在噪声以下。
+- 回归：`OnnxSharp.slnx` 零警告；两套 TFM 单测 116/118（2 skipped）、0 failed；
+  `yolo11n: end-to-end matches onnxruntime golden` 通过。`AbFlags` 新增 `firstconv=`。
+
 ### 2026-11-17（与 MLAS 单算子对照：GEMM / int8 / Conv，`bench.md §38`）
 
 - 把 `F:\code\mlas`（ORT 内部的 GEMM/Conv 库）编的 dll 直接调起来，与我们的实现对拍（同会话、同线程口径）。
