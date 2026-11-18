@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 单 dll「全包」：把主包与 Vulkan 后端的源码链接进同一个项目，编出**一个** OnnxSharp.dll。
+       不引用两个项目、不引 NuGet 依赖，包内 lib/net*/ 下只有一个程序集。
+       独立项目而非主包开关：独立的 obj/ 中间目录，避免「切换开关后增量构建复用旧 dll」的假包问题。 -->
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0;net11.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>OnnxSharp</RootNamespace>
+    <!-- 装配体标识与主包一致：用户代码 using OnnxSharp / using OnnxSharp.Vulkan 完全不变 -->
+    <AssemblyName>OnnxSharp</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageId>Sevencat.OnnxSharp.All</PackageId>
+    <PackageIcon>icon.png</PackageIcon>
+    <Description>OnnxSharp with the Vulkan compute backend compiled into the same assembly — one package, one OnnxSharp.dll (no second DLL to deploy). Mutually exclusive with Sevencat.OnnxSharp: both provide the same assembly identity, never reference both at once.</Description>
+    <PackageTags>onnx;inference;vulkan;gpu;compute;yolo;yolo11;rfdetr;all-in-one</PackageTags>
+
+    <!-- 源码全部由显式 Compile 链接，关闭默认 glob -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Exclude obj/bin：否则会连生成的两个 AssemblyInfo.cs 一起链进来，触发重复特性 -->
+    <Compile Include="..\OnnxSharp\**\*.cs"
+             Exclude="..\OnnxSharp\obj\**;..\OnnxSharp\bin\**" />
+    <Compile Include="..\OnnxSharp.Vulkan\**\*.cs"
+             Exclude="..\OnnxSharp.Vulkan\obj\**;..\OnnxSharp.Vulkan\bin\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 与主包保持一致：测试与 CLI 仍需访问 protobuf/importer 的 internal -->
+    <InternalsVisibleTo Include="OnnxSharp.Tests" />
+    <InternalsVisibleTo Include="OnnxSharp.Cli" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\assets\icon.png" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 同步点：Vulkan 项目新增嵌入资源（.spv）时必须在这里补一条，否则全包能编译，
+         但运行时 VkShaders.Load 找不到 shader。planv3.md §P3-6 有记录。 -->
+    <EmbeddedResource Include="..\OnnxSharp.Vulkan\Shaders\**\*.spv"
+                      LogicalName="OnnxSharp.Vulkan.Shaders.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

@@ -78,7 +78,7 @@ OpenCV 5.2 的 `modules/dnn` 内含两套引擎：
 | 不做 | 原因 |
 |---|---|
 | **WASM / IL2CPP / Unity 宿主** | 部署形态限定为 .NET 8/10 桌面与服务端；不做 WASM 线性内存、不做 IL2CPP 裁剪适配 |
-| CUDA / OpenCL / Vulkan / OpenVINO / CANN / WebNN / TimVX | 纯 CPU 托管 |
+| CUDA / OpenCL / OpenVINO / CANN / WebNN / TimVX | 纯 CPU 托管。**Vulkan 已移出本清单**：后续以独立可选包提供计算后端（工控机 / 跨厂商 GPU），主包仍保持零依赖 |
 | int8 量化（`int8layers`） | 目标模型全 FP32 |
 | FP16 / BF16 / FP8 | 目标模型全 FP32（`Tensor` 类型预留，kernel 后置） |
 | **图级** blocked layout（NC8HW8 / `TransformLayout`） | 首版 NCHW。**允许 kernel 内部打包/padding**（这是 SimdYolo 的做法，对图透明），但不做图级布局改写；接口预留 `Layout` 字段（见 §12 Q7） |

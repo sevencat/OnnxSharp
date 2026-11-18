@@ -1,0 +1,103 @@
+#version 450
+// P2 的第一个**重算子**：2-D 卷积，NCHW 进、NCHW 出，权重按 ONNX 原样 [M, Cg, KH, KW]。
+//
+// 这一版故意是**朴素直接卷积**：一个线程一个输出元素，内层顺序是 c → kh → kw，
+// 权重按 kw 连续读。目标是「先正确、先把段串起来」，不是性能：
+//   * 1×1 的点卷积（yolo 里占 90% 的 FLOPs）会在 P2-2 单独特化，用 shared memory 做 C 方向归约；
+//   * 3×3 需要在 P2-3 的 NHWC 重排后用向量化载入，NCHW 下每个线程的 9 次 gather 无法合并。
+// 因此这里写清楚「朴素基线」，别让后面的特化失去参照物。
+//
+// 三个数值上容易写错的点，都在下面显式处理：
+//   1. 卷积核中心不是卷积核中心：索引式是 `oh*S - P + kh*D`，pad 只从**起始侧**减，
+//      结束侧的 pad 只影响输出尺寸（已在宿主算好），不参与索引；
+//   2. 分组卷积的通道基址：g = m / outPerGroup，输入通道基址 = g * Cg，用**输出通道**算组号，
+//      不是输入通道；
+//   3. 越界必须 continue 而不是 clamp：clamp 会把边界像素重复计入，误差小但恰好能让
+//      「大致正确」的测试通过——这是最危险的一种 bug。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A    { float a[];    };  // [N, C, H, W]
+layout(binding = 1) readonly buffer Wt   { float w[];    };  // [M, Cg, KH, KW]
+layout(binding = 2)          buffer Y    { float y[];    };  // [N, M, OH, OW]
+layout(binding = 3) readonly buffer Bias { float bias[]; };  // [M]；无 bias 时绑到权重上并用 HasBias=0 忽略
+
+layout(push_constant) uniform P {
+    uint Total;        // N*M*OH*OW，线程总数
+    uint Cg;           // 每组输入通道数 = C / group
+    uint M;            // 输出通道总数
+    uint H;            // 输入高
+    uint W;            // 输入宽
+    uint OH;           // 输出高
+    uint OW;           // 输出宽
+    uint KH;           // 核高
+    uint KW;           // 核宽
+    uint SH;           // stride 高
+    uint SW;           // stride 宽
+    uint DH;           // dilation 高
+    uint DW;           // dilation 宽
+    uint PH;           // pad 起始高（结束侧不参与索引）
+    uint PW;           // pad 起始宽
+    uint Group;        // 分组数
+    uint OutPerGroup;  // M / Group
+    uint HasBias;      // 0/1
+    uint Act;          // 融合激活：0 无 / 1 Relu / 2 Sigmoid / 3 SiLU / 4 Tanh
+} pc;
+
+// 图融合把 Conv 后面的 SiLU/Relu 挂到了卷积头上（宿主编码成 pc.Act）。
+// 这里在写出前就地过一遍：少这一步不会报错、形状也全对，只会静默算出错的数。
+// 未知编号一律按「不激活」，宁可少算也不要因为越界分支把整个核搞坏。
+float Activate(float v)
+{
+    if (pc.Act == 1u) return max(v, 0.0);
+    if (pc.Act == 2u) return 1.0 / (1.0 + exp(-v));
+    if (pc.Act == 3u) return v / (1.0 + exp(-v));   // SiLU = x·sigmoid(x)
+    if (pc.Act == 4u) return tanh(v);
+    return v;
+}
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.Total) return;
+
+    // 行优先分解：[n, m, oh, ow]，与 NCHW 输出布局一致
+    uint ow = idx % pc.OW;
+    uint t  = idx / pc.OW;
+    uint oh = t % pc.OH;
+    t /= pc.OH;
+    uint m = t % pc.M;
+    uint n = t / pc.M;
+
+    // 组号由**输出通道**决定；输入通道基址随之偏移
+    uint g = m / pc.OutPerGroup;
+    uint cbase = g * pc.Cg;
+    uint C = pc.Cg * pc.Group;
+
+    float acc = pc.HasBias != 0u ? bias[m] : 0.0;
+
+    for (uint c = 0u; c < pc.Cg; ++c)
+    {
+        uint ic = cbase + c;
+        uint aChannel = (n * C + ic) * pc.H;
+        uint wChannel = (m * pc.Cg + c) * pc.KH;
+
+        for (uint kh = 0u; kh < pc.KH; ++kh)
+        {
+            int ih = int(oh * pc.SH) - int(pc.PH) + int(kh * pc.DH);
+            if (ih < 0 || ih >= int(pc.H)) continue;   // 越界跳过，不要 clamp
+
+            uint aRow = aChannel + uint(ih);
+            uint wRow = (wChannel + kh) * pc.KW;
+
+            for (uint kw = 0u; kw < pc.KW; ++kw)
+            {
+                int iw = int(ow * pc.SW) - int(pc.PW) + int(kw * pc.DW);
+                if (iw < 0 || iw >= int(pc.W)) continue;
+
+                acc += a[aRow * pc.W + uint(iw)] * w[wRow + kw];
+            }
+        }
+    }
+
+    y[idx] = Activate(acc);
+}

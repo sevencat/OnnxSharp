@@ -7,6 +7,7 @@ var cases = new List<TestCase>();
 cases.AddRange(ArgTableTests.Cases());
 cases.AddRange(BufferAllocatorTests.Cases());
 cases.AddRange(EngineTests.Cases());
+cases.AddRange(LayerPlanTests.Cases());
 cases.AddRange(OnnxReaderTests.Cases());
 cases.AddRange(OnnxShapeTests.Cases());
 cases.AddRange(TransposeKernelTests.Cases());

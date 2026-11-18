@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- 与主包保持同一组 TFM：后端需要引用主包的 Layer/Tensor/Graph -->
+    <TargetFrameworks>net8.0;net10.0;net11.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>OnnxSharp.Vulkan</RootNamespace>
+    <AssemblyName>OnnxSharp.Vulkan</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+
+    <!-- P1 期间只用 ProjectReference 接入，不产包（见 planv3.md §4 包边界）。
+         具备发包资格后改为 true，并补 PackageIcon / 图标资源。 -->
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageId>Sevencat.OnnxSharp.Vulkan</PackageId>
+    <Description>Vulkan compute backend for OnnxSharp — for industrial PCs and cross-vendor GPUs (NVIDIA / AMD / Intel iGPU). Keeps the core package managed-only and dependency-free.</Description>
+    <PackageTags>onnx;inference;vulkan;gpu;compute;backend;yolo;rfdetr</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 单向依赖：后端引用主包（Layer / Tensor / TensorShape / Graph），主包永不引用后端 -->
+    <ProjectReference Include="..\OnnxSharp\OnnxSharp.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- .spv 是入库产物（改 .comp 后跑 build-shaders.ps1 重新生成），MSBuild 只做嵌入：
+         build 与 CI 都不需要 Vulkan SDK。LogicalName 固定，供 VkShaders.Load 按名字取。
+         新增 shader 时**不需要**改这里（通配），但要同步 OnnxSharp.All 项目里的同名 ItemGroup。 -->
+    <EmbeddedResource Include="Shaders\**\*.spv"
+                      LogicalName="OnnxSharp.Vulkan.Shaders.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- 防线：.spv 是入库产物而不是构建产物。缺了要在编译前就报错，
+       否则会拖到运行时 VkShaders.Load 才炸，而那往往已经部署到工控机上了。 -->
+  <Target Name="VerifyShaderArtifacts" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <_ShaderSpv Include="Shaders\**\*.spv" />
+      <_ShaderSource Include="Shaders\**\*.comp" />
+    </ItemGroup>
+    <Error Condition="'@(_ShaderSource)' != '' and '@(_ShaderSpv)' == ''"
+           Text="Shaders 目录下有 .comp 但没有任何 .spv。请先运行: powershell -ExecutionPolicy Bypass -File src/OnnxSharp.Vulkan/build-shaders.ps1" />
+  </Target>
+
+</Project>

@@ -1,0 +1,163 @@
+#version 450
+// P2-2/P2-3：1×1 点卷积特化。yolo 里 90% 的 FLOPs 在这一类算子上，所以它值一个专用核。
+//
+// 朴素核（conv2d.comp）为什么在 1×1 上慢：它按【输出元素】分派，每个输出元素的每次 MAC
+// 都要重新载入一个 x 值——载入次数 = M×Cg×像素数，而每个值只被用一次，算力全被等内存吃掉。
+//
+// 这里做**二维寄存器分块**：一个线程算 MT 个输出通道 × TP 个连续像素。
+//   * 沿输出通道（MT）分块：`v` 载入一次被 MT 个累加器复用 ⇒ x 载入量降到 1/MT；
+//   * 沿像素（TP）分块：每通道只发一条（向量）载入，摊薄寻址开销；
+//   * MT 个 w 值在同一 warp 内是**同一地址**，走广播，等于免费。
+//
+// 算术强度（FLOP/字节）≈ TP×MT×2 / (TP×4 + MT×4)：
+//   MT=8、TP=1 → 4.0（首版）
+//   MT=8、TP=4 → 16.0（本版，接近 dGPU 的平衡点 ~20）
+// 注意 TP 的收益**不依赖** float4 指令：4 个连续像素在 warp 内仍被合并成
+// 512 B 的连续事务。收益来自「一次寻址、四次复用」，换成 vec4 只是少几条指令。
+//
+// **实测结论（别被上面的理论值骗了）**：TP=1 → TP=4 端到端只从 435 us 到 408–426 us，
+// 在噪声边缘；把内层 c 循环展开 4 次也一模一样。原因是这个规模下端到端被
+// stage in/out 的 PCIe 搬运主导（约 10 GB/s，见 benchv3.md「搬运主导」一节）：32×32 的
+// 415 us 里 kernel 只占 ~200 us。所以分块的收益上限是「把 200 us 压到多少」，
+// 不是「把 415 us 压到多少」。留着它是因为强度确实更高、尾组也被覆盖，
+// 而不是因为它已被证实能加速。
+//
+// 适用条件由宿主保证（不满足就回退朴素核，绝不在这里加分支）：
+//   KH=KW=1、DH=DW=1、PH=PW=0（1×1 永不需要 padding），且 OutPerGroup % MT == 0。
+//   最后一条是为了「块内 MT 个输出通道同属一组」——否则 cbase 会随 k 变化，`v` 就没法复用。
+//
+// push constant 与 conv2d.comp **逐字段同布局**（宿主复用同一个 Conv2DParams）：
+// 这里没用到的 KH/KW/DH/DW/PH/PW/Group 必须保留，改动布局会让两个核一起错位。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A    { float a[];    };  // [N, C, H, W]
+layout(binding = 1) readonly buffer Wt   { float w[];    };  // [M, Cg, 1, 1]
+layout(binding = 2)          buffer Y    { float y[];    };  // [N, M, OH, OW]
+layout(binding = 3) readonly buffer Bias { float bias[]; };  // [M]；无 bias 时绑到权重上并用 HasBias=0 忽略
+
+layout(push_constant) uniform P {
+    uint Total;        // **像素组数 × M/MT**（不是输出元素数：按「像素组 × 通道块」二维分派）
+    uint Cg;
+    uint M;
+    uint H;
+    uint W;
+    uint OH;
+    uint OW;
+    uint KH;           // 未使用，保留布局
+    uint KW;           // 未使用
+    uint SH;
+    uint SW;
+    uint DH;           // 未使用
+    uint DW;           // 未使用
+    uint PH;           // 未使用（恒 0）
+    uint PW;           // 未使用（恒 0）
+    uint Group;        // 未使用
+    uint OutPerGroup;
+    uint HasBias;
+    uint Act;          // 融合激活：0 无 / 1 Relu / 2 Sigmoid / 3 SiLU / 4 Tanh
+} pc;
+
+// 图融合把 Conv 后面的 SiLU/Relu 挂到了卷积头上（宿主编码成 pc.Act）。
+// 这里在写出前就地过一遍：少这一步不会报错、形状也全对，只会静默算出错的数。
+// 未知编号一律按「不激活」，宁可少算也不要因为越界分支把整个核搞坏。
+float Activate(float v)
+{
+    if (pc.Act == 1u) return max(v, 0.0);
+    if (pc.Act == 2u) return 1.0 / (1.0 + exp(-v));
+    if (pc.Act == 3u) return v / (1.0 + exp(-v));   // SiLU = x·sigmoid(x)
+    if (pc.Act == 4u) return tanh(v);
+    return v;
+}
+
+const uint MT = 8u;    // 每个线程的输出通道块；必须整除 OutPerGroup（宿主常量 PointwiseMT）
+const uint TP = 4u;    // 每个线程的连续像素块；与宿主常量 PointwiseTP 一致
+
+// 尾组（本行不足 TP 个像素）的 x 载入：只读真实存在的像素，其余补 0。
+// 补 0 的那几格累加结果无意义，但对应输出本来就不会写出去（见末尾的逐像素判断）。
+vec4 LoadTail(uint p, uint ow0)
+{
+    vec4 v = vec4(0.0);
+    v.x = a[p];
+    if (ow0 + 1u < pc.OW) v.y = a[p + pc.SW];
+    if (ow0 + 2u < pc.OW) v.z = a[p + 2u * pc.SW];
+    if (ow0 + 3u < pc.OW) v.w = a[p + 3u * pc.SW];
+    return v;
+}
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.Total) return;
+
+    // 分派是「像素组 × 通道块」的笛卡尔积（Total = 像素组数 × M/MT）。
+    // **块号放外层、像素组连续**：同一 warp 内 32 个线程处理连续 ow 的同一通道块，
+    // 于是读 x 与写 y 都是合并访问；反过来（像素固定、块连续）会退化成广播读 + 跨平面散写。
+    uint blocks = pc.M / MT;
+    uint pixGroups = pc.Total / blocks;
+    uint mb = idx / pixGroups;
+    uint pg = idx % pixGroups;
+
+    // 像素组沿 OW 切：一组 TP 个像素必须落在**同一行**，否则输出地址跨行不连续
+    // （out 的行距是 OW、in 的是 W，两者不等，跨行就没有合并性可言）。
+    uint owGroups = (pc.OW + TP - 1u) / TP;
+    uint og = pg % owGroups;
+    uint t = pg / owGroups;
+    uint oh = t % pc.OH;
+    uint n = t / pc.OH;
+
+    uint ow0 = og * TP;
+    uint full = (ow0 + TP <= pc.OW) ? 1u : 0u;   // 尾组不满 TP 个像素：逐像素判断，不越界写
+
+    uint HW = pc.H * pc.W;
+    uint HWout = pc.OH * pc.OW;
+    uint m0 = mb * MT;
+
+    // 1×1 + pad0：输出的 (oh,ow) 直接映射到输入的 (oh*SH, ow*SW)，没有 kh/kw 偏移
+    uint g = m0 / pc.OutPerGroup;   // 块内同组（宿主保证 OutPerGroup % MT == 0）
+    uint inChBase = n * pc.Cg * pc.Group * HW + (g * pc.Cg) * HW
+                    + (oh * pc.SH) * pc.W + ow0 * pc.SW;
+    uint outBase = (n * pc.M + m0) * HWout + oh * pc.OW + ow0;
+
+    vec4 acc[MT];
+    for (uint k = 0u; k < MT; ++k)
+        acc[k] = vec4(pc.HasBias != 0u ? bias[m0 + k] : 0.0);
+
+    for (uint c = 0u; c < pc.Cg; ++c)
+    {
+        uint p = inChBase + c * HW;
+        vec4 v = (full != 0u) ? vec4(a[p], a[p + pc.SW], a[p + 2u * pc.SW], a[p + 3u * pc.SW])
+                              : LoadTail(p, ow0);
+
+        uint wIdx = (m0 * pc.Cg) + c;
+        for (uint k = 0u; k < MT; ++k)
+            acc[k] += v * w[wIdx + k * pc.Cg];   // 一次载入的 TP 个 x，被 MT 个累加器复用
+    }
+
+    // 融合激活就地在累加器上做一次，两个写出分支（满组/尾组）共用。
+    for (uint k2 = 0u; k2 < MT; ++k2)
+        acc[k2] = vec4(Activate(acc[k2].x), Activate(acc[k2].y),
+                       Activate(acc[k2].z), Activate(acc[k2].w));
+
+    if (full != 0u)
+    {
+        for (uint k = 0u; k < MT; ++k)
+        {
+            uint o = outBase + k * HWout;
+            y[o] = acc[k].x;
+            y[o + 1u] = acc[k].y;
+            y[o + 2u] = acc[k].z;
+            y[o + 3u] = acc[k].w;
+        }
+    }
+    else
+    {
+        for (uint k = 0u; k < MT; ++k)
+        {
+            uint o = outBase + k * HWout;
+            y[o] = acc[k].x;
+            if (ow0 + 1u < pc.OW) y[o + 1u] = acc[k].y;
+            if (ow0 + 2u < pc.OW) y[o + 2u] = acc[k].z;
+            if (ow0 + 3u < pc.OW) y[o + 3u] = acc[k].w;
+        }
+    }
+}

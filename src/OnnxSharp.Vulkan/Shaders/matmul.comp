@@ -1,0 +1,73 @@
+#version 450
+// 批量 GEMM：A [B, M, K] × B [B, K, N] → C [B, M, N]，三者都是紧凑行主序。
+//
+// attention 里两次调用：
+//   [1,2,400,32] × [1,2,32,400]   K=32
+//   [1,2,64,400] × [1,2,400,400]  K=400
+// 都很小（最大 2×64×400×400 = 20 MFLOP），所以这里选的是「简单且正确」而不是「快」：
+// 16×16 输出块 + shared memory 分块，够把这 20 MFLOP 压到 0.1 ms 以内，
+// 而更激进的方案（双缓冲、寄存器分块、向量化载入）在这张图上省不到 50 us。
+//
+// 派发是 1D 的（模板只提供 Dispatch1D），组内再按 tilesN / tilesM / batch 手工分解——
+// 三个维度都不大，除法开销可以忽略，换来的是不必给模板加一套 2D/3D 派发路径。
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform P {
+    uint M;
+    uint N;
+    uint K;
+    uint batch;
+} pc;
+
+layout(binding = 0) readonly  buffer A { float a[]; };
+layout(binding = 1) readonly  buffer B { float b[]; };
+layout(binding = 2) writeonly buffer C { float c[]; };
+
+shared float As[16][16];
+shared float Bs[16][16];
+
+void main()
+{
+    uint tilesN = (pc.N + 15u) / 16u;
+    uint tilesM = (pc.M + 15u) / 16u;
+
+    uint gid = gl_WorkGroupID.x;
+    uint tn = gid % tilesN;
+    uint t  = gid / tilesN;
+    uint tm = t % tilesM;
+    uint bb = t / tilesM;
+
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+
+    uint row = tm * 16u + ly;
+    uint col = tn * 16u + lx;
+
+    uint aBase = bb * pc.M * pc.K;
+    uint bBase = bb * pc.K * pc.N;
+    uint cBase = bb * pc.M * pc.N;
+
+    float acc = 0.0;
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += 16u)
+    {
+        // A 的 tile：As[ly][lx] 取 A[row][k0+lx]
+        uint ak = k0 + lx;
+        As[ly][lx] = (row < pc.M && ak < pc.K) ? a[aBase + row * pc.K + ak] : 0.0;
+
+        // B 的 tile：Bs[ly][lx] 取 B[k0+ly][col]
+        uint bk = k0 + ly;
+        Bs[ly][lx] = (bk < pc.K && col < pc.N) ? b[bBase + bk * pc.N + col] : 0.0;
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k)
+            acc += As[ly][k] * Bs[k][lx];
+
+        // 第二轮写入前必须等所有人都读完上一轮的 tile。
+        barrier();
+    }
+
+    if (row < pc.M && col < pc.N)
+        c[cBase + row * pc.N + col] = acc;
+}

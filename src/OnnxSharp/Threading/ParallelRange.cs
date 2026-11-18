@@ -225,6 +225,12 @@ public static class ParallelRange
         private readonly Thread[] _workers;
         private Region? _current;
 
+        /// <summary>
+        /// 慢路径的阻塞等待。用它而不是 <c>Thread.Yield</c>/<c>Sleep(1)</c> 序列：
+        /// 工作线程在**没有**并行区的时候必须真的睡下去，否则会一直烧 CPU。
+        /// </summary>
+        private readonly object _gate = new();
+
         public Pool(int workerCount)
         {
             _workers = new Thread[workerCount];
@@ -248,6 +254,10 @@ public static class ParallelRange
         {
             var region = new Region(task, count);
             Volatile.Write(ref _current, region);
+
+            // 先发布再唤醒。等待者会在锁内重新检查 _current，所以不存在「漏脉冲」：
+            // 即便它错过了这次 PulseAll，进入锁后仍然看得到刚发布的 region。
+            lock (_gate) Monitor.PulseAll(_gate);
 
             _insideRegion = true;
             try
@@ -312,16 +322,34 @@ public static class ParallelRange
                     continue;
                 }
 
-                idle = WaitOnce(idle);
+                // 快路径：并行区之间的间隔只有几十微秒，短自旋比任何阻塞都快。
+                if (idle < 2000)
+                {
+                    Thread.SpinWait(20);        // ~50 µs
+                    idle++;
+                    continue;
+                }
+
+                // 慢路径：真的没活了，必须睡下去。
+                // 不能像以前那样接一段 Thread.Yield()：SwitchToThread 在没有其他就绪线程时
+                // 立刻返回，所以那一档看起来「让出」了，实际是把 CPU 烧满。旧的 yield 预算
+                // 是 38000 次（约 1 ms），刚好填满帧内的空隙 —— 结果是 GPU 帧里 15 个工作线
+                // 程全程空转，实测进程 CPU 时间达墙钟的 15.3 倍，把功耗预算从 GPU 手里抢走。
+                lock (_gate)
+                {
+                    if (ReferenceEquals(Volatile.Read(ref _current), last))
+                        Monitor.Wait(_gate);
+                }
+
+                idle = 0;                       // 被唤醒后重新给一小段自旋
             }
         }
 
         /// <summary>
         /// 等所有工作线程报告完成。
         /// <para>
-        /// 不能用 <see cref="SpinWait"/>：它 ~10 次之后就开始 <c>Sleep(1)</c>，
-        /// 而这里每次前向有 200+ 个并行区、区间间隔只有几十微秒 —— 一睡就是 1 ms，
-        /// 实测把每次派发从 1 µs 拖到 1 ms 以上。改成「紧凑自旋 → Yield → 最后才 Sleep」。
+        /// 这里保留「自旋 → Yield」两档而不是直接阻塞：调用线程等的是**已经在跑**的工作线程，
+        /// 正常情况几微秒就结束了；一旦睡下去反而要等调度器，把一次派发从 1 µs 拖到 1 ms。
         /// </para>
         /// </summary>
         private void WaitForWorkers(Region region)
@@ -331,15 +359,13 @@ public static class ParallelRange
                 idle = WaitOnce(idle);
         }
 
-        /// <summary>自旋/让出/休眠三档等待，返回累计空闲计数。</summary>
+        /// <summary>调用线程的等待：短自旋 → Yield。不睡，因为等待对象正在别的核上跑。</summary>
         private static long WaitOnce(long idle)
         {
             if (idle < 2000)
                 Thread.SpinWait(20);            // ~50 µs 紧凑自旋
-            else if (idle < 40000)
-                Thread.Yield();                 // 让出时间片但不睡
             else
-                Thread.Sleep(1);                // 真的没活了（前向之间），别烧 CPU
+                Thread.Yield();                 // 让出时间片但不睡
 
             return idle + 1;
         }

@@ -24,7 +24,12 @@ public static class LayerRegistry
         EnsureBuiltins();
         if (!Factories.TryGetValue(type, out var factory))
             throw new OnnxSharpException($"op type '{type}' is not registered");
-        return factory(parameters);
+        LayerInfo op = factory(parameters);
+        // 属性集合是算子定义的一部分，不只是导入器的中间变量：GPU 发射器要靠它读
+        // stride/pad/group，融合 pass 要靠它读 perm/axis。导入器本来就会再赋一次（同一对象），
+        // 这里是让「手工建的图」（测试、探针）行为与导入的图一致。
+        op.Parameters ??= parameters;
+        return op;
     }
 
     public static void EnsureBuiltins()

@@ -42,11 +42,6 @@ internal static class Interpreter
         var inpShapes = new List<TensorShape>();
         var inpTypes = new List<DType>();
 
-        var outShapes = new List<TensorShape>();
-        var tempShapes = new List<TensorShape>();
-        var outTypes = new List<DType>();
-        var tempTypes = new List<DType>();
-
         var outMats = new List<Tensor>();
         var dynamicOut = new List<Tensor>();
 
@@ -73,60 +68,13 @@ internal static class Interpreter
             IReadOnlyList<Tensor> outs;
             IReadOnlyList<Tensor> temps;
 
-            // 签名（输入形状 + 类型）只比一次：缓存命中判定和 Finalize 判定用的是同一份数据，
-            // 之前这里比了两遍（2076 个节点的 decoder 上就是几千次多余的数组遍历）。
-            bool sameSignature = layer.ShapeCacheValid
-                && SameShapes(layer.CachedInShapes, inpShapes)
-                && SameTypes(layer.CachedInTypes, inpTypes);
+            // 输入签名（shape + type）只比一次：缓存复用与 Finalize 失效判定读同一个事实，
+            // 之前这里比了两遍，且两套签名分别维护（动态形状层那套永远对不上）。
+            var plan = layer.Plan;
+            bool sameSignature = plan.Matches(inpShapes, inpTypes);
+            bool dynamicOutShapes = op.DynamicOutputShapes();
 
-            if (!op.DynamicOutputShapes())
-            {
-                bool cacheHit = !DisableShapeCache && sameSignature;
-
-                if (cacheHit)
-                {
-                    outs = BindAll(net, op, layer.CachedOutShapes, layer.CachedOutTypes, ref outMats);
-                    temps = net.FitTemps(layer.CachedTempShapes, layer.CachedTempTypes);
-                }
-                else
-                {
-                    outShapes.Clear();
-                    tempShapes.Clear();
-                    op.GetMemoryShapes(inpShapes, op.Outputs.Count, outShapes, tempShapes);
-
-                    if (outShapes.Count != op.Outputs.Count)
-                        throw new OnnxSharpException(
-                            $"op '{op.Name}' ({op.Type}) produced {outShapes.Count} output shapes, {op.Outputs.Count} expected");
-
-                    outTypes.Clear();
-                    tempTypes.Clear();
-                    op.GetTypes(inpTypes, op.Outputs.Count, tempShapes.Count, outTypes, tempTypes);
-
-                    if (outTypes.Count != op.Outputs.Count || tempTypes.Count != tempShapes.Count)
-                        throw new OnnxSharpException(
-                            $"op '{op.Name}' ({op.Type}) produced mismatched types " +
-                            $"({outTypes.Count} outputs, {tempTypes.Count} temps)");
-
-                    // 存成缓存副本（形状推断第二次调用会改写 outShapes 等列表）
-                    layer.CachedInShapes.Clear();
-                    layer.CachedInShapes.AddRange(inpShapes);
-                    layer.CachedInTypes.Clear();
-                    layer.CachedInTypes.AddRange(inpTypes);
-                    layer.CachedOutShapes.Clear();
-                    layer.CachedOutShapes.AddRange(outShapes);
-                    layer.CachedTempShapes.Clear();
-                    layer.CachedTempShapes.AddRange(tempShapes);
-                    layer.CachedOutTypes.Clear();
-                    layer.CachedOutTypes.AddRange(outTypes);
-                    layer.CachedTempTypes.Clear();
-                    layer.CachedTempTypes.AddRange(tempTypes);
-                    layer.ShapeCacheValid = true;
-
-                    outs = BindAll(net, op, outShapes, outTypes, ref outMats);
-                    temps = net.FitTemps(tempShapes, tempTypes);
-                }
-            }
-            else
+            if (dynamicOutShapes)
             {
                 // 动态形状：输出**不预 fit**，由 layer 自己在 Forward 里 Fit（对齐 net_impl2.cpp:1891-1898）。
                 dynamicOut.Clear();
@@ -136,11 +84,42 @@ internal static class Interpreter
                 temps = NoTemps;
                 outs = dynamicOut;
             }
+            else if (!DisableShapeCache && plan.State >= PlanState.Shaped && sameSignature)
+            {
+                outs = BindAll(net, op, plan.OutShapes, plan.OutTypes, ref outMats);
+                temps = net.FitTemps(plan.TempShapes, plan.TempTypes);
+            }
+            else
+            {
+                plan.OutShapes.Clear();
+                plan.TempShapes.Clear();
+                op.GetMemoryShapes(inpShapes, op.Outputs.Count, plan.OutShapes, plan.TempShapes);
+
+                if (plan.OutShapes.Count != op.Outputs.Count)
+                    throw new OnnxSharpException(
+                        $"op '{op.Name}' ({op.Type}) produced {plan.OutShapes.Count} output shapes, {op.Outputs.Count} expected");
+
+                plan.OutTypes.Clear();
+                plan.TempTypes.Clear();
+                op.GetTypes(inpTypes, op.Outputs.Count, plan.TempShapes.Count, plan.OutTypes, plan.TempTypes);
+
+                if (plan.OutTypes.Count != op.Outputs.Count || plan.TempTypes.Count != plan.TempShapes.Count)
+                    throw new OnnxSharpException(
+                        $"op '{op.Name}' ({op.Type}) produced mismatched types " +
+                        $"({plan.OutTypes.Count} outputs, {plan.TempTypes.Count} temps)");
+
+                plan.WriteInputs(inpShapes, inpTypes);
+                if (plan.State < PlanState.Shaped)
+                    plan.State = PlanState.Shaped;
+
+                outs = BindAll(net, op, plan.OutShapes, plan.OutTypes, ref outMats);
+                temps = net.FitTemps(plan.TempShapes, plan.TempTypes);
+            }
 
             if (!executeLayers)
             {
                 // 形状对齐模式：动态 op 的形状无法在不执行的情况下推断
-                if (op.DynamicOutputShapes())
+                if (dynamicOutShapes)
                     throw new OnnxSharpException(
                         $"op '{op.Name}' ({op.Type}) has dynamic output shapes; " +
                         "shape-only mode cannot infer them");
@@ -150,24 +129,16 @@ internal static class Interpreter
                 continue;
             }
 
-            // Finalize 的失效判定必须用 LastInShapes/LastInTypes（上一次真正 Finalize 时的签名），
-            // 不能用上面那个 sameSignature —— 它依赖 ShapeCacheValid，而**动态形状层永远不写
-            // 这个标志**（只有缓存分支才写），于是动态层每帧都判定为「签名变了」，
-            // 每帧重跑 PrepackWeights + Finalize。rfdetr-small 上这等于每帧白分配 52 MB
-            // （attention 的 score 缓冲、Softmax、fc1 输出各重来一遍）。
-            bool signatureChanged = !layer.FinalizedOnce
-                || !SameShapes(layer.LastInShapes, inpShapes)
-                || !SameTypes(layer.LastInTypes, inpTypes);
-
-            if (signatureChanged)
+            // 第三段：Finalize。与形状缓存读**同一条签名**，动态形状层也在这里把签名写进去，
+            // 所以它下一帧就能判定「没变」—— 之前两套签名不同步，动态层每帧重跑
+            // PrepackWeights + Finalize，rfdetr-small 上等于每帧白分配 52 MB。
+            if (plan.State != PlanState.Finalized || !sameSignature)
             {
+                plan.WriteInputs(inpShapes, inpTypes);   // 动态层没走形状分支，签名在这里补写
+
                 layer.PrepackWeights();
                 layer.Finalize(inpMats, outs);
-                layer.LastInShapes.Clear();
-                layer.LastInShapes.AddRange(inpShapes);
-                layer.LastInTypes.Clear();
-                layer.LastInTypes.AddRange(inpTypes);
-                layer.FinalizedOnce = true;
+                plan.State = PlanState.Finalized;
             }
 
             if (timings is null && allocs is null)
@@ -200,7 +171,7 @@ internal static class Interpreter
             if (detectNaN)
                 CheckNaN(layer, outs);
 
-            if (op.DynamicOutputShapes())
+            if (dynamicOutShapes)
             {
                 // 动态 op 自己决定形状，回填 ArgData 供下游/输出读取。
                 for (int i = 0; i < op.Outputs.Count; i++)
@@ -251,29 +222,5 @@ internal static class Interpreter
             buffer.Add(net.BindArgTensor(op.Outputs[i], shapes[i], types[i]));
 
         return buffer;
-    }
-
-    private static bool SameShapes(List<TensorShape> a, List<TensorShape> b)
-    {
-        if (a.Count != b.Count)
-            return false;
-        for (int i = 0; i < a.Count; i++)
-        {
-            if (!a[i].Equals(b[i]))
-                return false;
-        }
-        return true;
-    }
-
-    private static bool SameTypes(List<DType> a, List<DType> b)
-    {
-        if (a.Count != b.Count)
-            return false;
-        for (int i = 0; i < a.Count; i++)
-        {
-            if (a[i] != b[i])
-                return false;
-        }
-        return true;
     }
 }

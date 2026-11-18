@@ -1,0 +1,43 @@
+#version 450
+// 任意维置换：output[d] 取 input[perm[d]]（perm 在 host 侧已折成步幅）。
+//
+// host 侧不算 perm 本身，而是直接传每个输出维在**输入**里的步幅 istr[d]，
+// 这样 shader 里只剩一次线性组合，不需要知道 rank 之外的任何东西。
+//
+// 为什么不用 copy_axis：那个核把坐标拆成 outer/axis/inner 三段，表达的是「沿一根轴移动」；
+// 而 attention 里的 Transpose 是 [1,2,32,400] → [1,2,400,32]，是交换最后两维，
+// 拆成三段后每段的 stride 仍然依赖另一段，套不进去。
+//
+// 代价是每个元素要算 rank 次除法和取模。这类算子在这张图上一帧只有 2 次、
+// 每次 12800 个元素，显式算坐标比为了它做一次转置布局更划算。
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform P {
+    uint n;         // 输出元素总数
+    uint rank;
+    uint od[8];     // 输出每一维的长度
+    uint istr[8];   // 输出第 d 维对应在输入里的步幅（元素为单位）
+} pc;
+
+layout(binding = 0) readonly  buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    // 必须**从最后一维往回**分解：输出是行主序，i 的最低有效位属于 od[rank-1]。
+    // （第一版写成从 d=0 开始取模，等于把维度顺序整个倒过来，err 直接到 8.8。）
+    uint idx = i;
+    uint src = 0u;
+    for (int d = int(pc.rank) - 1; d >= 0; --d)
+    {
+        uint dim = pc.od[d];
+        uint c = idx % dim;
+        idx /= dim;
+        src += c * pc.istr[d];
+    }
+
+    y[i] = x[src];
+}

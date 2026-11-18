@@ -1,0 +1,81 @@
+#version 450
+// 一次 dispatch 完成「多个源 → 一个目标」的沿轴拼接（Concat），最多 4 个源。
+//
+// 为什么值得合并：yolo11n 的 23 个 Concat 被拆成了 57 次 copy_axis dispatch，平均 2.5 个源。
+// 每次 dispatch 除了自身约 24 us 的搬运，还要付约 21 us 的 compute 屏障（实测 190 次屏障
+// 共 4.08 ms，占端到端 23%）。把同一次 Concat 的多源合成一个 dispatch，段结构、数值语义、
+// 访存总量都不变，只是把 57 个同步点降到 23 个。
+//
+// 为什么参数全用标量而不是数组：第一版把 SrcAxis[]/SrcDim[] 写成数组并用 k 动态索引，
+// 实测融合后总量反而没降——这个核是「每线程只搬 16 B」的占用率敏感核，动态索引会被编译成
+// 「读整组值再 select」，每线程几十条额外指令直接吃掉收益。Concat 有个现成的化简：
+// 各源在自身轴上都是满的（SrcAxis == Dim、SrcOff == 0），于是那 8 个字段全是冗余。
+// 现在每个分支用编译期常量下标算地址，没有任何动态索引。
+//
+// 前置条件（宿主保证）：所有源除拼接轴外逐维相等 ⇒ Outer / Inner 对全部源一致，
+// 内层维度可以统一按 vec4 切；Inner % 4 != 0、源数 > 4 或源数为 1 时宿主回退到 copy_axis。
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint N;       // 总元素数 = Outer * DimSum * Inner
+    uint Outer;   // 拼接轴之前的维度积（全源一致）
+    uint Inner;   // 拼接轴之后的维度积（全源一致）
+    uint NSrc;    // 源个数 2..4
+    uint DstAxis; // 目标在拼接轴上的总长
+    uint DstOff;  // 本次写入在目标轴上的起始下标
+    uint DimSum;  // Σ Dim，用来把线性下标拆成 (o, j, v)
+    uint Dim0;
+    uint Dim1;
+    uint Dim2;
+    uint Dim3;
+} pc;
+
+layout(binding = 0) readonly buffer S0 { vec4 s0[]; };
+layout(binding = 1) readonly buffer S1 { vec4 s1[]; };
+layout(binding = 2) readonly buffer S2 { vec4 s2[]; };
+layout(binding = 3) readonly buffer S3 { vec4 s3[]; };
+layout(binding = 4) writeonly buffer Dst { vec4 dst[]; };
+
+void main()
+{
+    uint inner4 = pc.Inner / 4u;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N / 4u) return;
+
+    uint v = i % inner4;
+    uint t = i / inner4;
+    uint j = t % pc.DimSum;   // 拼接轴上的位置
+    uint o = t / pc.DimSum;   // 轴之前的第几个「行」
+    if (o >= pc.Outer) return;
+
+    // 定位 j 落在哪个源：逐级下推前缀和，没有循环也没有数组下标。
+    // 后两级只在前面已命中时才有意义（未命中说明 j 比前缀和更小，不可能跳级）。
+    uint k = 0u;
+    uint base = 0u;   // 当前源在拼接轴上的起点
+    if (pc.NSrc > 1u && j >= pc.Dim0)
+    {
+        k = 1u;
+        base = pc.Dim0;
+    }
+    if (pc.NSrc > 2u && j >= base + pc.Dim1)
+    {
+        k = 2u;
+        base = pc.Dim0 + pc.Dim1;
+    }
+    if (pc.NSrc > 3u && j >= base + pc.Dim2)
+    {
+        k = 3u;
+        base = pc.Dim0 + pc.Dim1 + pc.Dim2;
+    }
+
+    uint d = (o * pc.DstAxis + pc.DstOff + j) * inner4 + v;
+
+    // 每个分支用自己的常量做地址运算，src 的轴长就是该源的 Dim、起始偏移恒为 0。
+    vec4 val;
+    if (k == 0u) val = s0[(o * pc.Dim0 + (j - base)) * inner4 + v];
+    else if (k == 1u) val = s1[(o * pc.Dim1 + (j - base)) * inner4 + v];
+    else if (k == 2u) val = s2[(o * pc.Dim2 + (j - base)) * inner4 + v];
+    else val = s3[(o * pc.Dim3 + (j - base)) * inner4 + v];
+
+    dst[d] = val;
+}

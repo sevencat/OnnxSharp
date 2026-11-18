@@ -42,6 +42,15 @@ public class LayerInfo
     public int InputCount => Inputs.Count;
 
     /// <summary>
+    /// 图融合进来的逐元素激活（yolo 里每个卷积后面都跟着 SiLU），<c>null</c> 表示没有。
+    /// <para>
+    /// 后端发射器**必须**在输出端补上它：融合后本算子的输出 Arg 已经换成激活的输出，
+    /// 少做一次激活不会报错、形状也全对，只会静默算出错的数（逐层放大的那种）。
+    /// </para>
+    /// </summary>
+    public UnaryOpKind? FusedActivationKind => (this as IActivationFusable)?.FusedActivation;
+
+    /// <summary>
     /// 取第 <paramref name="index"/> 个输入张量（含常量值）。
     /// 形状推断阶段用它读常量，例如 <c>Reshape</c> 的目标 shape、<c>Slice</c> 的 starts/ends。
     /// </summary>
@@ -174,25 +183,14 @@ internal interface IBiasAddable
 /// </summary>
 public class Layer : LayerInfo
 {
-    public bool FinalizedOnce;
-
-    /// <summary>上次 Finalize 时的输入形状签名（形状变化时重新 Finalize）。</summary>
-    public readonly List<TensorShape> LastInShapes = new();
-
-    /// <summary>上次 Finalize 时的输入类型签名（OpenCV 同时比较 shapes 与 types）。</summary>
-    public readonly List<DType> LastInTypes = new();
-
-    // ---- 形状/类型推断缓存 ----
-    // 推理时每帧都会对每个算子调用 GetMemoryShapes/GetTypes；而绝大多数图（YOLO/OCR/ASR）
-    // 每帧的输入 shape 完全一样，重算纯属浪费（还会分配一堆 TensorShape/int[]）。
-    // 这里按「输入 shape + type 签名」缓存结果，命中就直接复用。
-    internal readonly List<TensorShape> CachedInShapes = new();
-    internal readonly List<DType> CachedInTypes = new();
-    internal readonly List<TensorShape> CachedOutShapes = new();
-    internal readonly List<TensorShape> CachedTempShapes = new();
-    internal readonly List<DType> CachedOutTypes = new();
-    internal readonly List<DType> CachedTempTypes = new();
-    internal bool ShapeCacheValid;
+    /// <summary>
+    /// 形状/类型推断缓存与 <c>Finalize</c> 状态（内部只有一份输入签名）。
+    /// <para>
+    /// 0.6.0 起收敛成一个对象：原先的 <c>FinalizedOnce</c> / <c>LastInShapes</c> /
+    /// <c>LastInTypes</c> 是 <b>public 可写</b>的，属于实现细节泄漏，已一并收为 internal。
+    /// </para>
+    /// </summary>
+    internal readonly LayerPlan Plan = new();
 
     /// <summary>权重预处理（打包/重排）。权重变化时会被再次调用。</summary>
     public virtual void PrepackWeights()

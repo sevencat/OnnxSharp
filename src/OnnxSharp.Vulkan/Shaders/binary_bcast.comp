@@ -1,0 +1,65 @@
+#version 450
+// P2 首个真实算子：二元逐元素 + ONNX 右对齐广播（Add/Sub/Mul/Div/Max/Min）。
+//
+// 广播不用编译期特化，用**零步幅**表达：把两个输入的形状右对齐到输出 rank，
+// 某一维为 1 时该维步幅取 0，索引式就退化成「沿这一维重复取同一个值」。
+// 于是同一份 shader 覆盖 X+W[N,C,1,1]（BN/偏置）、X+scalar、X+X 三种最常见的形态，
+// 代价只是每个元素多做一次 rank 次的多维索引分解。
+//
+// rank 上限 8 由 push constant 预算决定：4(n)+4(rank)+3*32(od/sa/sb)+4(kind)=108 B，
+// 上限 128 B 还有余量，再加一维就要挪到 storage buffer 了。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 2)          buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint n;        // 输出元素数
+    uint rank;     // 输出维数
+    uint od[8];    // 输出各维尺寸（行优先，od[0] 是最外维）
+    uint sa[8];    // 输入 A 各维步幅（广播维为 0）
+    uint sb[8];    // 输入 B 各维步幅
+    uint kind;     // 0 add, 1 sub, 2 mul, 3 div, 4 max, 5 min, 6 sigmoid(忽略 b)
+} pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    // 线性下标 → 多维坐标 → 两个输入的偏移。从最内维往外分解，rem 一路除下去。
+    uint rem = i;
+    uint ia = 0u;
+    uint ib = 0u;
+    for (int d = int(pc.rank) - 1; d >= 0; --d)
+    {
+        uint dim = pc.od[d];
+        uint coord = rem % dim;
+        rem /= dim;
+        ia += coord * pc.sa[d];
+        ib += coord * pc.sb[d];
+    }
+
+    float x = a[ia];
+
+    // 一元算子是这条通道的顺带产物：Sigmoid 和 Add 一样是「一个元素进、一个元素出」，
+    // 差别只在于不读 b。为它单独开一份 shader + 一份 push constant 布局，
+    // 换来的是多一个要维护的核；而这里只多一个分支。
+    if (pc.kind == 6u)
+    {
+        y[i] = 1.0 / (1.0 + exp(-x));
+        return;
+    }
+
+    float w = b[ib];
+    float r;
+    if (pc.kind == 0u)      r = x + w;
+    else if (pc.kind == 1u) r = x - w;
+    else if (pc.kind == 2u) r = x * w;
+    else if (pc.kind == 3u) r = x / w;
+    else if (pc.kind == 4u) r = max(x, w);
+    else                    r = min(x, w);
+
+    y[i] = r;
+}

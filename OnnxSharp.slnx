@@ -1,6 +1,8 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/OnnxSharp/OnnxSharp.csproj" />
+    <Project Path="src/OnnxSharp.Vulkan/OnnxSharp.Vulkan.csproj" />
+    <Project Path="src/OnnxSharp.All/OnnxSharp.All.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/OnnxSharp.Tests/OnnxSharp.Tests.csproj" />

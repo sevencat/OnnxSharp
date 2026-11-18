@@ -1,0 +1,20 @@
+#version 450
+// P1-7 探针：验证「激活在段 arena + 权重在常驻 buffer」的混合绑定。
+// binding 0 是激活输入、binding 1 是外置权重、binding 2 是激活输出，三者来自不同的 VkBuffer。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer In  { float x[]; };
+layout(binding = 1) readonly buffer W   { float w[]; };
+layout(binding = 2)          buffer Out { float y[]; };
+
+layout(push_constant) uniform P {
+    uint n;    // 元素个数
+    uint wl;   // 权重长度（按元素取模复用）
+} pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    y[i] = x[i] * w[i % pc.wl];
+}

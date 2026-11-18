@@ -1,0 +1,61 @@
+#version 450
+// 沿最后一维的 Softmax：输入按 [rows, cols] 看待，每行独立归一化。
+//
+// attention 里的用法是 [1,2,400,400] 沿 axis=-1，即 800 行 × 400 列。
+//
+// 一个工作组处理一行：64 个线程先把 400 个元素分片读进来求 max，
+// 用 shared memory 做对数步归约，再算 exp 求和，最后回写。
+// 三次读（max / sum / 写回）都命中 L1，因为一行只有 1.6 KB；
+// 换成一趟 online-softmax 会省一次读，但每步都要重新缩放累加和，测试下来并不更快。
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform P {
+    uint cols;
+    uint rows;
+} pc;
+
+layout(binding = 0) readonly  buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+shared float sc[64];
+
+void main()
+{
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    uint base = row * pc.cols;
+
+    float m = -3.402823466e+38;
+    for (uint j = tid; j < pc.cols; j += 64u)
+        m = max(m, x[base + j]);
+
+    sc[tid] = m;
+    barrier();
+    // barrier 必须写在 if 之外：工作组内的线程要么全部到达屏障，要么就都不执行这段，
+    // 把 barrier 放进 if 里在部分 GPU 上会挂死（而不是报错）。
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (tid < s) sc[tid] = max(sc[tid], sc[tid + s]);
+        barrier();
+    }
+    m = sc[0];
+    barrier();
+
+    float sum = 0.0;
+    for (uint j = tid; j < pc.cols; j += 64u)
+        sum += exp(x[base + j] - m);
+
+    sc[tid] = sum;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (tid < s) sc[tid] += sc[tid + s];
+        barrier();
+    }
+    float inv = 1.0 / sc[0];
+
+    for (uint j = tid; j < pc.cols; j += 64u)
+        y[base + j] = exp(x[base + j] - m) * inv;
+}

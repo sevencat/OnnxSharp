@@ -50,6 +50,22 @@ public sealed class NetImpl
         return graph;
     }
 
+    /// <summary>
+    /// 把任意算子挂到本网络上（回填 <see cref="LayerInfo.Net"/>）。
+    /// <para>
+    /// <b>给后端用的接缝</b>：GPU 后端会把一段连续算子折叠成一个自建层，
+    /// 段内那些算子已经不是 <c>prog</c> 的成员，<see cref="PrepareForGraph"/> 不会绑定它们；
+    /// 但 <c>Reshape/Slice/Expand</c> 之类算子的形状推断要读常量输入的<b>值</b>，
+    /// 没有 <see cref="LayerInfo.Net"/> 就推不出来。
+    /// </para>
+    /// <para>主包自己不需要它（prog 成员由 PrepareForGraph 统一绑定）。</para>
+    /// </summary>
+    public void Attach(LayerInfo op)
+    {
+        ArgumentNullException.ThrowIfNull(op);
+        op.Net = this;
+    }
+
     // ---------------- Arg 表 ----------------
 
     /// <summary>
@@ -142,6 +158,18 @@ public sealed class NetImpl
             op.Net = this;
 
         var slotOf = BufferAllocator.Assign(graph.Prog, graph.Outputs, _args.Count, out int slotCount);
+
+        // 调试开关：每个 Arg 独占一个槽，关掉「生命周期区间复用」。
+        // 用来区分「算子算错」和「槽被提前复用、把还在用的张量覆盖掉」两类错误：
+        // 打开后若误差消失，就是后者。
+        string? noReuse = Environment.GetEnvironmentVariable("ONNXSHARP_NO_SLOT_REUSE");
+        if (!string.IsNullOrEmpty(noReuse) && noReuse != "0")
+        {
+            int next = 0;
+            for (int i = 0; i < slotOf.Length; i++)
+                if (slotOf[i] >= 0) slotOf[i] = next++;
+            slotCount = next;
+        }
 
         while (_slots.Count < slotCount)
             _slots.Add(new Tensor());

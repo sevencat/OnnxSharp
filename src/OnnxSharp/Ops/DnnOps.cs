@@ -185,7 +185,7 @@ internal static class DnnOps
             // 额外申请 blocked 输入/输出两块缓冲。判定条件与 Forward 里的 TryConv 同源（Dispatch）。
             if (input.Rank == 4 && input.Dims[0] == 1)
             {
-                Resolve(input, out var nchwcStrides, out var nchwcDilations, out var nchwcPads);
+                Resolve(input, weight, out var nchwcStrides, out var nchwcDilations, out var nchwcPads);
 
                 if (Kernels.NchwcConv.Dispatch(channels, dims[1], input.Dims[2], input.Dims[3], dims[2], dims[3],
                         weight.Dims[2], weight.Dims[3], _group,
@@ -367,9 +367,18 @@ internal static class DnnOps
             });
         }
 
-        /// <summary>解析 stride / dilation / pads（含 auto_pad），与 <see cref="GetMemoryShapes"/> 同源。</summary>
+        /// <summary>
+        /// 解析 stride / dilation / pads（含 auto_pad），与 <see cref="GetMemoryShapes"/> 同源。
+        /// <para>
+        /// <paramref name="weight"/> 不是可选项：<c>kernel_shape</c> 是 ONNX 的**可选**属性，
+        /// 缺省时核尺寸要从权重形状推。早先这里缺省成 1，于是「有 auto_pad、没有 kernel_shape」
+        /// 的模型（合法）会按 pad=0 计算，而形状推断按真实核尺寸算输出——
+        /// 结果不只是数值错，写到最后一圈还会读出输出行外（越界读）。
+        /// </para>
+        /// </summary>
         private void Resolve(
             TensorShape input,
+            TensorShape weight,
             out int[] strides,
             out int[] dilations,
             out int[] pads)
@@ -381,7 +390,7 @@ internal static class DnnOps
 
             for (int i = 0; i < spatial; i++)
             {
-                int kernel = _kernelShape.Length > i ? _kernelShape[i] : 1;
+                int kernel = _kernelShape.Length > i ? _kernelShape[i] : weight.Dims[2 + i];
                 strides[i] = _strides.Length > i ? _strides[i] : 1;
                 dilations[i] = _dilations.Length > i ? _dilations[i] : 1;
 
@@ -421,7 +430,7 @@ internal static class DnnOps
             if (input.Shape.Rank != 4)
                 throw new OnnxSharpException($"Conv '{Name}': only 2D convolution (NCHW) is implemented");
 
-            Resolve(input.Shape, out var strides, out var dilations, out var pads);
+            Resolve(input.Shape, weight.Shape, out var strides, out var dilations, out var pads);
 
             // depthwise（每组 1 个输出通道）先走专用直接卷积：GEMM 类实现在这种形状上会退化成
             // 「K×spatial 的 im2col」，MobileNet 系（YuNet）的 26 个 depthwise 全靠这条路径。

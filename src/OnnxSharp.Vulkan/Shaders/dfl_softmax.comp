@@ -1,0 +1,53 @@
+#version 450
+// DFL 解码：input [B, S*bins, N] → output [B, S, N]
+//
+// out[b, s, n] = Σ_k softmax_k(x[b, s*bins + k, n]) · k
+//
+// 这是在 CPU 侧叫 DflSoftmax 的那个融合层（原本是 Reshape → Transpose → Softmax →
+// Conv(权重=arange) → Reshape 五个算子）。这里直接按语义算，不物化 softmax 中间量，
+// 也不需要转置：每个输出元素把它的 bins 个输入串起来读一遍就完事。
+//
+// 访存形态：一个线程读 bins 个**跨像素**的值（步长 N），同一 warp 内相邻线程读相邻像素，
+// 所以每次循环迭代都是一次完全合并的读。bins=16 全部命中 L1/L2，实测不是瓶颈。
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform P {
+    uint n;       // 输出元素数 = B * S * N
+    uint bins;    // 每个侧的分箱数（yolo 是 16）
+    uint sides;   // 每个像素的侧数（通常是 4）
+    uint pixels;  // 空间像素数 N
+} pc;
+
+layout(binding = 0) readonly  buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    uint p = i % pc.pixels;
+    uint t = i / pc.pixels;
+    uint s = t % pc.sides;
+    uint b = t / pc.sides;
+
+    uint base = ((b * pc.sides + s) * pc.bins) * pc.pixels + p;
+
+    // 两遍扫描：先求 max，再算 exp 的加权和。分箱只有 16 个，寄存器里装得下，
+    // 不做 online-softmax 是因为那会让累加式变成「每步都要重新缩放」，比省下的
+    // 一遍读更贵。
+    float m = -3.402823466e+38;
+    for (uint k = 0u; k < pc.bins; ++k)
+        m = max(m, x[base + k * pc.pixels]);
+
+    float sum = 0.0;
+    float acc = 0.0;
+    for (uint k = 0u; k < pc.bins; ++k)
+    {
+        float e = exp(x[base + k * pc.pixels] - m);
+        sum += e;
+        acc += e * float(k);
+    }
+
+    y[i] = acc / sum;
+}

@@ -1,0 +1,53 @@
+#version 450
+// MaxPool（NCHW、无 dilation、单输出）。一个线程算一个输出元素。
+//
+// SPPF 里是 5×5 stride 1 pad 2：窗口互相重叠，每个输出要读 25 个输入。
+// 这类访存比卷积还密集，但 H×W 只有 20×20——算力可以忽略，价值在于它不切断段。
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint Total;   // N*C*OH*OW
+    uint C;       // N*C
+    uint H;
+    uint W;
+    uint OH;
+    uint OW;
+    uint KH;
+    uint KW;
+    uint SH;
+    uint SW;
+    uint PH;
+    uint PW;
+} pc;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.Total) return;
+
+    uint ow = i % pc.OW;
+    uint t = i / pc.OW;
+    uint oh = t % pc.OH;
+    uint c = t / pc.OH;          // N*C 合并，池化不跨通道
+
+    int ih0 = int(oh * pc.SH) - int(pc.PH);
+    int iw0 = int(ow * pc.SW) - int(pc.PW);
+
+    float m = -3.4e38;           // MaxPool 的空窗口语义：-inf（ONNX 允许 pad 区不参与）
+    for (uint kh = 0u; kh < pc.KH; ++kh)
+    {
+        int ih = ih0 + int(kh);
+        if (ih < 0 || ih >= int(pc.H)) continue;
+        for (uint kw = 0u; kw < pc.KW; ++kw)
+        {
+            int iw = iw0 + int(kw);
+            if (iw < 0 || iw >= int(pc.W)) continue;
+            float v = x[(c * pc.H + uint(ih)) * pc.W + uint(iw)];
+            m = max(m, v);
+        }
+    }
+    y[i] = m;
+}

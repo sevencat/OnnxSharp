@@ -1,0 +1,42 @@
+#version 450
+// 沿某一维的区间拷贝：Concat 与 Split 共用的唯一动作。
+//
+// 为什么两者共用一个核：Concat 是「多个源 → 一个目标的若干段轴区间」，
+// Split 是「一个源的若干段轴区间 → 多个目标」，把方向统一成
+// 「src 的 [SrcOff, SrcOff+Dim) 拷到 dst 的 [DstOff, DstOff+Dim)」之后，
+// 差别只剩下谁来发 dispatch、偏移怎么累加——那属于宿主，不该进 shader。
+//
+// 连续性前提：除 axis 外两边的维度一致（ONNX 对 Concat/Split 的要求），
+// 于是整件事就是 外层 × 轴长 × 内层 的三重索引重算，元素数量不限、形状不限。
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint N;        // 要拷贝的元素数 = Outer * Dim * Inner
+    uint Outer;    // axis 之前的维度乘积
+    uint Inner;    // axis 之后的维度乘积
+    uint Dim;      // 本次占据的轴长
+    uint SrcAxis;  // 源张量在该轴上的总长
+    uint SrcOff;   // 源在轴上的起始下标
+    uint DstAxis;  // 目标张量在该轴上的总长
+    uint DstOff;   // 目标在轴上的起始下标
+} pc;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
+
+    // 按内层最快展开，连续线程访问连续地址：这条 memcpy 路径几乎全程走合并访问
+    uint inner = i % pc.Inner;
+    uint t = i / pc.Inner;
+    uint j = t % pc.Dim;
+    uint o = t / pc.Dim;
+    if (o >= pc.Outer) return;
+
+    uint src = (o * pc.SrcAxis + pc.SrcOff + j) * pc.Inner + inner;
+    uint dst = (o * pc.DstAxis + pc.DstOff + j) * pc.Inner + inner;
+    y[dst] = x[src];
+}

@@ -1,0 +1,146 @@
+#version 450
+// 3×3 直接卷积特化（stride 2、dilation 1），也就是 yolo 每个 stage 的第一次降采样。
+//
+// 为什么要有这个文件：conv3x3.comp 的注释里写「stride≠1 时 TP 个像素在输入里不连续，
+// (TP+2) 的滑动窗口就不成立了」——那句话只对了一半。步长 2 时相邻输出像素的输入列
+// 相差 2 而不是 1，窗口**仍然是一段连续区间**，只是长度从 TP+2 变成 2·TP+1：
+//
+//   输出像素 ow0+j 用到输入列 [iwBase + 2j, iwBase + 2j + 2]，j = 0..TP-1
+//   ⇒ 并集是 [iwBase, iwBase + 2·TP]  ⇒ span = 2·TP + 1（TP=4 时是 9 个 float）
+//
+// 于是「一次载入、MT×TP×3 次复用」这个结构原封不动地保留了：9 个输入值被 96 次 MAC 复用，
+// 对比朴素核的「每个 MAC 各读 1 个 x 和 1 个 w」（0.5 MAC/载入），这里是 2.9 MAC/载入。
+// yolo11n 有 7 层属于这一类，合计 1.74 GFLOP，朴素核上按 0.6 TFLOP/s 要 2.9 ms。
+//
+// 只做 stride=2 / dilation=1 / 3×3：其它组合没有这个连续窗口，继续走朴素核。
+//
+// push constant 与 conv2d.comp **逐字段同布局**（宿主复用同一个 Conv2DParams）：
+// KH/KW/SH/SW/DH/DW 在这里是常量 3/3/2/2/1/1，但字段必须保留，否则两个核一起错位。
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A    { float a[];    };  // [N, C, H, W]
+layout(binding = 1) readonly buffer Wt   { float w[];    };  // [M, Cg, 3, 3]
+layout(binding = 2)          buffer Y    { float y[];    };  // [N, M, OH, OW]
+layout(binding = 3) readonly buffer Bias { float bias[]; };  // [M]；无 bias 时绑到权重上并用 HasBias=0 忽略
+
+layout(push_constant) uniform P {
+    uint Total;        // **像素组数 × M/MT**（不是输出元素数）
+    uint Cg;
+    uint M;
+    uint H;
+    uint W;
+    uint OH;
+    uint OW;
+    uint KH;           // 恒 3，保留布局
+    uint KW;           // 恒 3
+    uint SH;           // 恒 2
+    uint SW;           // 恒 2
+    uint DH;           // 恒 1
+    uint DW;           // 恒 1
+    uint PH;           // 起始 pad（3×3 s2 时通常是 1）
+    uint PW;
+    uint Group;
+    uint OutPerGroup;
+    uint HasBias;
+    uint Act;          // 融合激活：0 无 / 1 Relu / 2 Sigmoid / 3 SiLU / 4 Tanh
+} pc;
+
+// 图融合把 Conv 后面的 SiLU/Relu 挂到了卷积头上（宿主编码成 pc.Act）。
+// 这里在写出前就地过一遍：少这一步不会报错、形状也全对，只会静默算出错的数。
+// 未知编号一律按「不激活」，宁可少算也不要因为越界分支把整个核搞坏。
+float Activate(float v)
+{
+    if (pc.Act == 1u) return max(v, 0.0);
+    if (pc.Act == 2u) return 1.0 / (1.0 + exp(-v));
+    if (pc.Act == 3u) return v / (1.0 + exp(-v));   // SiLU = x·sigmoid(x)
+    if (pc.Act == 4u) return tanh(v);
+    return v;
+}
+
+const uint MT = 8u;        // 每线程输出通道块；必须整除 OutPerGroup（宿主常量 Conv3x3S2MT）
+const uint TP = 4u;        // 每线程连续输出像素块（宿主常量 Conv3x3S2TP）
+const uint STRIDE = 2u;
+const uint SPAN = STRIDE * (TP - 1u) + 3u;   // TP 个输出像素共用的连续输入跨度 = 9
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.Total) return;
+
+    // 分派布局与 conv3x3 一致：块号在外、像素组连续，保证 warp 内读 x / 写 y 都合并。
+    uint blocks = pc.M / MT;
+    uint pixGroups = pc.Total / blocks;
+    uint mb = idx / pixGroups;
+    uint pg = idx % pixGroups;
+
+    uint owGroups = (pc.OW + TP - 1u) / TP;
+    uint og = pg % owGroups;
+    uint t = pg / owGroups;
+    uint oh = t % pc.OH;
+    uint n = t / pc.OH;
+
+    uint ow0 = og * TP;
+    uint m0 = mb * MT;
+
+    uint HW = pc.H * pc.W;
+    uint HWout = pc.OH * pc.OW;
+
+    // 块内 MT 个输出通道同属一组（宿主保证 OutPerGroup % MT == 0），
+    // 所以输入通道基址在 k 上是常量，`v` 才能被 MT 个累加器复用。
+    uint g = m0 / pc.OutPerGroup;
+    uint inChBase = n * pc.Cg * pc.Group * HW + (g * pc.Cg) * HW;
+
+    int ih0 = int(oh) * int(STRIDE) - int(pc.PH);       // 第 kh 行 = oh*2 - PH + kh
+    int iwBase = int(ow0) * int(STRIDE) - int(pc.PW);   // 窗口起点（可能为负，负即 pad）
+
+    float acc[MT][TP];
+    for (uint k = 0u; k < MT; ++k)
+        for (uint j = 0u; j < TP; ++j)
+            acc[k][j] = pc.HasBias != 0u ? bias[m0 + k] : 0.0;
+
+    for (uint c = 0u; c < pc.Cg; ++c)
+    {
+        uint aChan = inChBase + c * HW;
+        uint wBase = (m0 * pc.Cg + c) * 9u;
+
+        for (uint kh = 0u; kh < 3u; ++kh)
+        {
+            int ih = ih0 + int(kh);
+            if (ih < 0 || ih >= int(pc.H)) continue;   // 越界跳过，不要 clamp
+
+            uint aRow = aChan + uint(ih) * pc.W;
+
+            // SPAN 个连续值一次取全：3 个 kw × TP 个像素的输入全在这段窗口里。
+            // 越界处补 0（等价于零填充），与朴素核的 continue 完全等价。
+            float v[SPAN];
+            for (uint j = 0u; j < SPAN; ++j)
+            {
+                int iw = iwBase + int(j);
+                v[j] = (iw >= 0 && iw < int(pc.W)) ? a[aRow + uint(iw)] : 0.0;
+            }
+
+            // 输出像素 ow0+j 的第 kw 个抽头落在 v[2j + kw] 上——步长 2 的唯一体现。
+            for (uint k = 0u; k < MT; ++k)
+            {
+                uint wk = wBase + k * pc.Cg * 9u + kh * 3u;
+                float w0 = w[wk];
+                float w1 = w[wk + 1u];
+                float w2 = w[wk + 2u];
+                for (uint j = 0u; j < TP; ++j)
+                {
+                    uint b = j * STRIDE;
+                    acc[k][j] += v[b] * w0 + v[b + 1u] * w1 + v[b + 2u] * w2;
+                }
+            }
+        }
+    }
+
+    // 尾组（本行不足 TP 个像素）逐像素判断，绝不越界写
+    uint outBase = (n * pc.M + m0) * HWout + oh * pc.OW + ow0;
+    for (uint k = 0u; k < MT; ++k)
+    {
+        uint o = outBase + k * HWout;
+        for (uint j = 0u; j < TP; ++j)
+            if (ow0 + j < pc.OW) y[o + j] = Activate(acc[k][j]);
+    }
+}

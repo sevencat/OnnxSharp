@@ -1,0 +1,46 @@
+#version 450
+// copy_axis 的向量化版本：一个线程搬 4 个 float。
+//
+// 为什么需要它：标量版每线程只搬一个 float，实测只有 48 GB/s（机器 ~300 GB/s），
+// 而 yolo11n 里 85 次 Split/Concat 合计要搬 120 MB —— 归因消融测得 1.9 ms，占端到端 10.7%。
+// 拷贝的 Inner（axis 之后的维度积 = 每一段的连续长度）在卷积网络里几乎总是 H*W
+// （25600/6400/1600/400/8400…），天然是 4 的倍数，于是「每线程一个 float4」压根不需要
+// 处理首尾残块：宿主只在 Inner % 4 == 0 时选这个核，其余情况回退到标量版。
+//
+// 索引与标量版逐字对应，只是内层维度换算成 vec4 计数：inner4 = Inner / 4。
+// 槽位起始偏移按 256 B 对齐（VkSegment.SlotAlign），且 Inner % 4 == 0 保证段内偏移也是
+// 4 的倍数，所以 vec4 的 16 B 对齐有保证。
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint N;        // 要拷贝的元素数 = Outer * Dim * Inner（与标量版同语义）
+    uint Outer;    // axis 之前的维度乘积
+    uint Inner;    // axis 之后的维度乘积
+    uint Dim;      // 本次占据的轴长
+    uint SrcAxis;  // 源张量在该轴上的总长
+    uint SrcOff;   // 源在轴上的起始下标
+    uint DstAxis;  // 目标张量在该轴上的总长
+    uint DstOff;   // 目标在轴上的起始下标
+} pc;
+
+layout(binding = 0) readonly buffer X { vec4 x[]; };
+layout(binding = 1) writeonly buffer Y { vec4 y[]; };
+
+void main()
+{
+    uint inner4 = pc.Inner / 4u;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N / 4u) return;
+
+    // 与标量版相同的「内层最快」展开，只是单位从 float 变成 float4：
+    // 连续线程访问连续 16 B，构成完全合并的 128-bit 访存。
+    uint v = i % inner4;
+    uint t = i / inner4;
+    uint j = t % pc.Dim;
+    uint o = t / pc.Dim;
+    if (o >= pc.Outer) return;
+
+    uint src = (o * pc.SrcAxis + pc.SrcOff + j) * inner4 + v;
+    uint dst = (o * pc.DstAxis + pc.DstOff + j) * inner4 + v;
+    y[dst] = x[src];
+}

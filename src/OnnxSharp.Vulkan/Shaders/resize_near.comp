@@ -1,0 +1,39 @@
+#version 450
+// Resize（NCHW、nearest、asymmetric、floor）——yolo 的两次 2× 上采样就是这一种。
+//
+// 坐标映射与 CPU 侧完全一致：源坐标 = dst * inSize / outSize（asymmetric），
+// 再 floor 并 clamp 到 [0, inSize-1]。整数乘除在这里不是近似：
+// asymmetric 的 scale 恰好是 out/in，所以 CPU 那个 double 除法取 floor 的结果
+// 与这里的整数除法逐位相同——这也是敢用整数、不用 double 的原因。
+//
+// 只覆盖这一种组合：half_pixel / align_corners / linear 的映射各不相同，
+// 猜错不会报错，只会让整幅图错位，所以那些组合在 CanEmit 里就被挡掉了。
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint Total;   // N*C*OH*OW
+    uint CN;      // N*C（上采样不跨通道，合并后索引更短）
+    uint H;
+    uint W;
+    uint OH;
+    uint OW;
+} pc;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.Total) return;
+
+    uint ow = i % pc.OW;
+    uint t = i / pc.OW;
+    uint oh = t % pc.OH;
+    uint p = t / pc.OH;          // N*C
+
+    uint ih = min(oh * pc.H / pc.OH, pc.H - 1u);
+    uint iw = min(ow * pc.W / pc.OW, pc.W - 1u);
+
+    y[i] = x[(p * pc.H + ih) * pc.W + iw];
+}

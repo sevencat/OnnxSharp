@@ -8,14 +8,14 @@
   <a href="https://github.com/sevencat/OnnxSharp"><img src="https://img.shields.io/github/stars/sevencat/OnnxSharp?color=181717&logo=github&logoColor=white" alt="GitHub"></a>
   <a href="https://www.nuget.org/packages/Sevencat.OnnxSharp"><img src="https://img.shields.io/nuget/v/Sevencat.OnnxSharp?color=004880" alt="NuGet version"></a>
   <a href="https://www.nuget.org/packages/Sevencat.OnnxSharp"><img src="https://img.shields.io/nuget/dt/Sevencat.OnnxSharp?color=004880" alt="NuGet downloads"></a>
-  <img src="https://img.shields.io/badge/backend-CPU%20only-2ea043" alt="CPU only">
-  <img src="https://img.shields.io/badge/GPU%20backends-none-critical" alt="No CUDA / Vulkan / OpenCL / DirectML">
+  <img src="https://img.shields.io/badge/backend-CPU%20now-2ea043" alt="CPU now">
+  <img src="https://img.shields.io/badge/GPU%20backends-Vulkan%20planned-orange" alt="Vulkan compute backend planned">
   <img src="https://img.shields.io/badge/dependencies-zero-blue" alt="Zero dependencies">
   <img src="https://img.shields.io/badge/code-AI--written-8b5cf6" alt="Code written by AI">
 </p>
 
 <p align="center">
-  纯 C# 实现的 ONNX 推理引擎 —— <b>只有 CPU</b>（FP32，零第三方依赖），<b>没有</b> CUDA / Vulkan / OpenCL / DirectML 后端。<br>
+  纯 C# 实现的 ONNX 推理引擎 —— <b>当前只有 CPU</b>（FP32，零第三方依赖），<b>没有</b> CUDA / OpenCL / DirectML 后端，<b>Vulkan 计算后端在规划中</b>（工控机 / 跨厂商 GPU）。<br>
   可直接跑 YOLO11 / YOLOv8 / RF-DETR / PP-OCRv6 的 ONNX 导出，并附带「一张图进、检测框出 / 文本行出」的可选门面。
 </p>
 
@@ -40,17 +40,18 @@
 > 所以**一定会有不少 bug** —— 少见算子、边缘 dtype、异常路径的覆盖都不完整，版本之间也可能有行为变化。
 > 拿它跑通模型、做对照实验没问题；上生产请优先用 ONNXRuntime、SimdYolo、SimdPaddleOCR（`Sdcb.SimdPaddleOCR`）、OpenCV 5 `dnn` 这类成熟实现。踩到问题欢迎开 [issue](https://github.com/sevencat/OnnxSharp/issues)。
 
-### 只做 CPU，且只用 4 个核
+### 以 CPU 为主，且只用 4 个核
 
 | | |
 |---|---|
 | **支持** | CPU，FP32，AVX2 / AVX-512 向量化 + 多线程（`ONNXSHARP_THREADS` 可调） |
-| **不支持** | CUDA、TensorRT、Vulkan、OpenCL、DirectML、WebGPU、ROCm —— **没有任何 GPU 后端，也不打算做** |
-| **不需要** | CUDA toolkit、cuDNN、显卡驱动、任何 native 库或 P/Invoke |
+| **规划中** | **Vulkan 计算后端**——面向工控机 / 跨厂商显卡（NVIDIA / AMD / Intel 核显），以独立可选包提供，主包保持纯托管 |
+| **不支持** | CUDA、TensorRT、OpenCL、DirectML、WebGPU、ROCm —— 这些不打算做 |
+| **不需要** | CUDA toolkit、cuDNN、任何 native 库或 P/Invoke（Vulkan 包只需系统自带的 Vulkan loader） |
 | **线程预算** | **所有基准与结论都限定在 4 线程**，不是「有多少核吃多少核」。真实服务器上这个进程只是众多服务之一，能拿到的常常就是 2~4 个核，而且要长期跑、不能把整机占满 |
-| **为什么** | 目标场景是「部署到没有 GPU、也不想带 native 依赖的环境」—— 很多服务器本来就**没有独显**，CPU 线程又是共享资源。所以优化目标是「**4 线程内的单帧延迟**」，而不是「跑分时的峰值吞吐」。GPU 后端必然引入 native 库与驱动版本矩阵，和「纯托管、零依赖」直接冲突 |
+| **为什么** | 目标场景是「部署环境没有 CUDA 栈、也不想带 vendor 原生依赖」—— 很多服务器和工控机本来就**没有独显**，CPU 线程又是共享资源。所以优化目标是「**4 线程内的单帧延迟**」，而不是「跑分时的峰值吞吐」。CUDA / OpenCL 后端必然引入 vendor 原生库与驱动版本矩阵，和「纯托管、零依赖」直接冲突；Vulkan 放在后置的可选包里，主包不受影响 |
 
-> 模型必须跑 GPU 的话，请直接用 ONNXRuntime 的 CUDA / TensorRT EP；本项目不会提供等价能力，也不做 half-baked 的 GPU 兼容层。
+> 模型必须跑 NVIDIA GPU 的话，请直接用 ONNXRuntime 的 CUDA / TensorRT EP；本项目只规划 Vulkan 计算后端（工控机 / 跨厂商 GPU），不做 CUDA 兼容层，也不做 half-baked 的 GPU 兼容层。
 
 > **口径**：下面所有表格（含 `733 GFLOPS`、`150 GMAC/s` 这类峰值）都是 **4 线程**下测的，
 > 单核数字会单独标注；只有明确写「16 线程」的历史对照数据是例外。
@@ -84,7 +85,7 @@
 
 | 项 | 说明 |
 |---|---|
-| **后端** | **只有 CPU**（FP32，AVX2 / AVX-512 + 多线程）；**没有** CUDA / TensorRT / Vulkan / OpenCL / DirectML 后端 |
+| **后端** | **当前只有 CPU**（FP32，AVX2 / AVX-512 + 多线程）；**没有** CUDA / TensorRT / OpenCL / DirectML 后端；**Vulkan 计算后端规划中**（工控机 / 跨厂商 GPU，独立可选包） |
 | 依赖 | 零第三方包（不引用 `Google.Protobuf`、`Microsoft.ML.OnnxRuntime`），全部手写 |
 | 目标框架 | `net8.0` / `net10.0` / `net11.0`，AOT 友好（不用反射、不用 `dynamic`）。**`net11.0` 才有 AVX-VNNI**（int8 内核快 2.3×），其它 TFM 自动回落 F32 路径 |
 | 算子 | 76 个注册算子，覆盖 YOLO11/v8、RF-DETR、PP-OCRv6 与 sherpa Paraformer 的 encoder 段导出图（清单见 [支持算子](#支持算子)） |
@@ -1106,7 +1107,7 @@ rec 4.4 → 2.9 ms，见 [bench.md](bench.md) §37.2）；剩下的量级是 det
 
 ### 限制
 
-- **只做 CPU**，没有 CUDA / DirectML / OpenVINO 等执行后端。
+- **当前只做 CPU**，没有 CUDA / DirectML / OpenVINO 等执行后端；Vulkan 计算后端在规划中，以独立可选包提供，不改变主包的零依赖。
 - **计算主体是 FP32**，但支持 ORT 旧式量化（QOperator）的 `DynamicQuantizeLinear` + `MatMulInteger`
   （含 s8 权重与 per-column 零点）；`QuantizeLinear` / `DequantizeLinear` / `QLinearConv`（QDQ 格式）未实现。
 - 动态维只做「最小可用」：全动态图（如 PaddleOCR）要用 `Net.ReadModel(path, 输入形状)` **特化**成静态图，
@@ -1193,7 +1194,7 @@ bench/                四引擎 × 6 模型的对照脚本与产物
 
 ### What it is
 
-`OnnxSharp` is a from-scratch ONNX inference engine in pure C# — **CPU only, FP32, zero third-party dependencies**. It runs ONNX exports of YOLO11 / YOLOv8 / RF-DETR, and ships an optional vision facade that turns an image into detections in source-image coordinates.
+`OnnxSharp` is a from-scratch ONNX inference engine in pure C# — **CPU first, FP32, zero third-party dependencies**, with a **Vulkan compute backend planned** as a separate package for industrial PCs and cross-vendor GPUs. It runs ONNX exports of YOLO11 / YOLOv8 / RF-DETR, and ships an optional vision facade that turns an image into detections in source-image coordinates.
 
 Semantics follow OpenCV 5 `dnn` and SimdYolo. Measured on four engines in the same session (see [Performance](#performance)) at 4 threads: **still 1.05–1.28× behind ONNXRuntime** on F32 graphs (1.67× on the int8 decoder), **on par with SimdYolo** (0.97–1.14×), and **ahead of OpenCV 5 `dnn`** across the board (0.59–0.70×). The default thread count is the physical core count.
 
@@ -1203,17 +1204,18 @@ This engine stands on the shoulders of **SimdYolo** and **OpenCV 5 `dnn`**: oper
 > So **it certainly has plenty of bugs**: rare operators, edge-case dtypes and error paths are not fully covered, and behaviour may change between versions.
 > Running models and comparison experiments is fine; for production, prefer mature implementations such as ONNXRuntime, SimdYolo, SimdPaddleOCR (`Sdcb.SimdPaddleOCR`) or OpenCV 5 `dnn`. Bug reports are welcome via [Issues](https://github.com/sevencat/OnnxSharp/issues).
 
-### CPU only, and only 4 cores
+### CPU first, and only 4 cores
 
 | | |
 |---|---|
 | **Supported** | CPU, FP32, AVX2 / AVX-512 vectorisation + multithreading (`ONNXSHARP_THREADS` to tune) |
-| **Not supported** | CUDA, TensorRT, Vulkan, OpenCL, DirectML, WebGPU, ROCm — **there is no GPU backend and none is planned** |
-| **Not required** | CUDA toolkit, cuDNN, GPU drivers, any native library or P/Invoke |
+| **Planned** | A **Vulkan compute backend** for industrial PCs and cross-vendor GPUs (NVIDIA / AMD / Intel iGPU), shipped as a separate optional package so the core stays managed-only |
+| **Not supported** | CUDA, TensorRT, OpenCL, DirectML, WebGPU, ROCm — these are not planned |
+| **Not required** | CUDA toolkit, cuDNN, any native library or P/Invoke (the Vulkan package only needs the system Vulkan loader) |
 | **Thread budget** | **Every benchmark and conclusion here is measured on 4 threads**, not "use every core you can find". On real servers this process is one of many services: it often gets 2–4 cores, runs for a long time, and must not hog the box |
-| **Why** | The target is deploying where there is no GPU and native dependencies are unwelcome — **most servers have no discrete GPU anyway**, and CPU threads are a shared resource. So the goal is **single-frame latency inside 4 threads**, not peak throughput on a benchmark run. A GPU backend would drag in native libraries and a driver version matrix, which contradicts "managed only, zero dependencies" outright |
+| **Why** | The target is deploying where no CUDA stack exists and vendor-native dependencies are unwelcome — **most servers and industrial PCs have no discrete GPU anyway**, and CPU threads are a shared resource. So the goal is **single-frame latency inside 4 threads**, not peak throughput on a benchmark run. A CUDA / OpenCL backend would drag in vendor native libraries and a driver version matrix, which contradicts "managed only, zero dependencies" outright; Vulkan goes into a later optional package instead |
 
-> If your model must run on a GPU, use the ONNXRuntime CUDA / TensorRT EPs. This project will not offer an equivalent, nor a half-baked GPU compatibility shim.
+> If your model must run on an NVIDIA GPU, use the ONNXRuntime CUDA / TensorRT EPs. This project only plans a Vulkan compute backend (industrial PCs / cross-vendor GPUs) — no CUDA shim, and no half-baked GPU compatibility layer.
 
 > **Caveat**: every table below (including peaks such as `733 GFLOPS` or `150 GMAC/s`) is measured on
 > **4 threads**; per-core figures are called out separately. Only the historical rows that explicitly say
@@ -1248,7 +1250,7 @@ The **requirements, reference material and acceptance criteria** come from the m
 
 | Item | Notes |
 |---|---|
-| **Backend** | **CPU only** (FP32, AVX2 / AVX-512 + threads); **no** CUDA / TensorRT / Vulkan / OpenCL / DirectML backend |
+| **Backend** | **CPU today** (FP32, AVX2 / AVX-512 + threads); **no** CUDA / TensorRT / OpenCL / DirectML backend; **Vulkan compute backend planned** (industrial PCs / cross-vendor GPUs, separate optional package) |
 | Dependencies | None — protobuf reader, kernels and runtime are all hand-written |
 | Targets | `net8.0` / `net10.0` / `net11.0`, AOT-friendly (no reflection, no `dynamic`). **`net11.0` is the one with AVX-VNNI** (int8 kernels 2.3× faster); other TFMs fall back to the F32 path automatically |
 | Operators | 76 registered ops, covering YOLO11/v8, RF-DETR, PP-OCRv6 and the encoder part of sherpa Paraformer exports |
@@ -1867,7 +1869,7 @@ Conversely, roughly **half of the "obviously optimisable here" intuitions were k
 
 ### Limitations
 
-- **CPU only** — no CUDA / DirectML / OpenVINO backends.
+- **CPU first** — no CUDA / DirectML / OpenVINO backends; a Vulkan compute backend is planned as a separate optional package.
 - **FP32 compute**, with support for the legacy QOperator pair `DynamicQuantizeLinear` + `MatMulInteger`
   (u8/i8 inputs, scalar or per-column zero points); `QuantizeLinear` / `DequantizeLinear` / `QLinearConv` (QDQ) are not implemented.
 - **Speech recognition works (Paraformer)**: `Speech/Paraformer/ParaformerRecognizer` runs

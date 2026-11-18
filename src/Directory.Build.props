@@ -1,0 +1,14 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- src/ 下所有包共用同一个版本号：发版只改这一处，避免主包与 Vulkan 包版本漂移
+         （聚合包 Sevencat.OnnxSharp.All 的依赖版本也由此自动跟随）。
+         注意本文件刻意放在 src/ 而不是仓库根：仓库根有 .tmp/ 下二十余个临时探测项目。 -->
+    <Version>0.6.0</Version>
+    <Authors>Sevencat</Authors>
+    <PackageProjectUrl>https://github.com/sevencat/OnnxSharp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/sevencat/OnnxSharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+</Project>
